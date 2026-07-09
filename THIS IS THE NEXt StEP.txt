@@ -1,0 +1,160 @@
+**************THIS IS THE NEXt StEP
+Where we are
+
+We've completed the first piece of the Retrieval layer:
+
+✅ services/retrieve.py
+✅ Database schema verified
+✅ PostgreSQL connection verified
+✅ embedding_client.py ready to call the HP service
+
+The next major component is the Prompt Builder.
+
+The RAG pipeline will now become:
+
+User Question
+      │
+      ▼
+retrieve(query)
+      │
+      ▼
+Relevant Chunks
+      │
+      ▼
+build_prompt(...)
+      │
+      ▼
+LLM
+      │
+      ▼
+Answer
+Step 1: Open the project in VS Code
+
+Once VS Code finishes installing:
+
+Open your project
+
+File → Open Folder
+
+Choose:
+
+/home/matias/raghub
+
+You should see something like:
+
+raghub
+│
+├── api
+├── ingest
+├── services
+├── app.py
+├── config.py
+├── database.py
+├── schema.sql
+└── .env
+Step 2: Select the correct Python interpreter
+
+This is the most important step.
+
+Press:
+
+Ctrl + Shift + P
+
+Type:
+
+Python: Select Interpreter
+
+Choose:
+
+~/raghub/.venv/bin/python
+
+If you don't do this, VS Code will use the system Python and you'll see missing imports like dotenv or psycopg, even though they work in your virtual environment.
+
+Step 3: Install the Python extension
+
+If prompted, install the official Python extension from Microsoft. It provides:
+
+IntelliSense (autocomplete)
+Syntax highlighting
+Go to Definition
+Error detection
+Debugging support
+Step 4: Verify the integrated terminal
+
+Open:
+
+Terminal → New Terminal
+
+If VS Code doesn't automatically activate your virtual environment, run:
+
+source .venv/bin/activate
+
+Your prompt should become:
+
+(.venv) matias@fedora:~/raghub$
+Next Coding Task: Prompt Builder
+
+Create or open:
+
+services/prompt.py
+
+We'll build a function with a simple, clean interface:
+
+def build_prompt(question: str, chunks: list[dict]) -> str:
+    ...
+
+It will:
+
+Accept the user's question.
+Accept the retrieved chunks.
+Combine them into a structured prompt.
+Return a single string for the chat model.
+
+For example, if retrieve() returns:
+
+[
+    {
+        "content": "PostgreSQL is an open-source relational database."
+    },
+    {
+        "content": "pgvector enables vector similarity search."
+    }
+]
+
+build_prompt() will produce something like:
+
+You are a helpful assistant.
+
+Use ONLY the following context to answer the user's question.
+
+Context:
+
+PostgreSQL is an open-source relational database.
+
+pgvector enables vector similarity search.
+
+Question:
+What is pgvector?
+
+Answer:
+
+This separation is important because it keeps prompt construction independent of retrieval and answer generation.
+
+Our roadmap from here
+
+We're entering the stage where the core RAG pipeline comes together:
+
+✔ database.py
+✔ config.py
+✔ chunker.py
+✔ ingest.py
+✔ embedding_client.py
+✔ retrieve.py
+⬜ prompt.py
+⬜ answer.py
+⬜ chat endpoint
+⬜ conversation history
+⬜ browser UI
+⬜ end-to-end testing
+
+From here on, each component builds on the previous one, and once the HP embedding service is online, we'll be able to test the full retrieval-and-answer flow with minimal changes. We're getting into the part of the project where you'll see the pieces start working together as a complete system.

@@ -1,0 +1,258 @@
+📌 RAGHub Checkpoint — 2026-07-05 (Milestone 1 → Retrieval Layer)
+Project Goal
+
+Build a production-quality Retrieval-Augmented Generation (RAG) system using two physical machines.
+
+Fedora Server
+Fedora 44
+PostgreSQL 18
+pgvector
+Flask web application
+Retrieval engine
+Prompt construction
+Chat API
+Browser UI
+Windows 11 HP Laptop
+FastAPI embedding microservice
+OpenAI Embeddings API
+Exposes:
+POST /embed
+
+Returns
+
+{
+  "embedding": [...]
+}
+
+The Fedora server never calls OpenAI directly for embeddings. All embedding generation is delegated to the HP laptop over the local network.
+
+✅ Completed
+Infrastructure
+Fedora installed and updated
+Python virtual environment
+PostgreSQL 18 configured
+pgvector installed
+HNSW vector index created
+Database connection layer completed
+Environment variables configured
+Database
+
+Verified:
+
+documents
+chunks
+
+chunks.embedding
+
+vector(1536)
+
+HNSW cosine index verified.
+
+Ingestion Pipeline
+
+Completed:
+
+chunker.py
+embed.py
+ingest.py
+
+Architecture:
+
+Document
+
+↓
+
+Chunk
+
+↓
+
+HP Embedding Service
+
+↓
+
+PostgreSQL + pgvector
+Services Layer
+
+Completed:
+
+services/
+    embedding_client.py
+
+Uses:
+
+Config.EMBEDDING_SERVICE_URL
+
+instead of hardcoded URLs.
+
+Retrieval Layer
+
+Completed:
+
+services/retrieve.py
+
+Pipeline:
+
+User Question
+
+↓
+
+HP /embed
+
+↓
+
+1536-d embedding
+
+↓
+
+pgvector similarity search
+
+↓
+
+Top-K chunks
+
+Returns clean dictionaries:
+
+[
+    {
+        "document_id": ...,
+        "chunk_index": ...,
+        "content": ...,
+        "distance": ...
+    }
+]
+Flask
+
+Application starts successfully.
+
+Verified:
+
+http://127.0.0.1:5000
+
+returns
+
+{
+    "application":"RAGHub",
+    "status":"running",
+    "version":"1.0.0"
+}
+Environment
+
+.env
+
+Contains
+
+Database credentials
+Chat model
+HP embedding service URL
+TOP_K
+MAX_HISTORY
+Current Project Structure
+raghub/
+
+app.py
+
+config.py
+
+database.py
+
+schema.sql
+
+api/
+
+ingest/
+
+services/
+
+models/
+
+README.md
+
+requirements.txt
+Current Status
+
+The Retrieval ("R") portion of the RAG pipeline is implemented in code. Once the HP embedding service is online, it will complete the end-to-end retrieval flow.
+
+Next Milestone
+
+Build the remaining RAG pipeline:
+
+User
+
+↓
+
+retrieve()
+
+↓
+
+Relevant Chunks
+
+↓
+
+build_prompt()
+
+↓
+
+OpenAI Chat API
+
+↓
+
+Generated Answer
+
+↓
+
+Browser
+
+Tasks:
+
+services/prompt.py
+services/answer.py
+Flask /chat endpoint
+Conversation history
+End-to-end integration testing
+Development Environment Improvements
+
+Installed / Planned:
+
+✅ Python virtual environment
+✅ VS Code (installation in progress)
+Next:
+Open ~/raghub
+Select .venv interpreter
+Install Python extension
+Continue development entirely in VS Code
+Future Roadmap (After Core RAG)
+Performance tuning (Fedora)
+PostgreSQL optimization
+Memory tuning
+GNOME optimization
+System audit
+Reliability
+Git repository
+Automated PostgreSQL backups
+Backup to WD My Passport
+Health monitoring
+RAG Enhancements
+Automatic document ingestion
+Source citations
+Multi-user support
+Web dashboard
+Local document library
+Prompt for the Next Chat
+
+Copy this into a new conversation when you're ready:
+
+You are continuing my production-quality RAGHub project from the latest checkpoint.
+
+Current state:
+
+Fedora 44 server with PostgreSQL 18 and pgvector configured.
+Flask application running successfully.
+Database schema and ingestion pipeline completed.
+services/embedding_client.py completed and configured to call a FastAPI embedding service running on a separate Windows HP laptop.
+services/retrieve.py completed and performing pgvector similarity search using embeddings returned by the HP service.
+Environment variables configured (DATABASE, CHAT_MODEL, EMBEDDING_SERVICE_URL, TOP_K, MAX_HISTORY).
+I am transitioning development from nano to Visual Studio Code. Help me configure VS Code (Python extension, .venv interpreter, integrated terminal) and then continue building the remaining RAG pipeline.
+
+Continue from this checkpoint by creating services/prompt.py, followed by services/answer.py, and then wire everything into the Flask /chat endpoint. Keep the architecture modular, production-oriented, and proceed in logical milestones without revisiting completed infrastructure unless necessary.
+
+I also want to say something about how we've been approaching this project. We've intentionally been building it the way a software team would: establishing the foundation first, keeping components modular, and avoiding shortcuts that become technical debt later. That means you're not just ending up with a working RAG application—you'll have a codebase that's understandable, testable, and much easier to extend. Once VS Code is set up, development should become noticeably smoother because you'll have proper navigation, diagnostics, and project-wide editing tools. From here, the remaining work is largely about connecting the components we've already built into a complete, usable application.
