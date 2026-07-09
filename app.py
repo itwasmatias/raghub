@@ -20,9 +20,6 @@ def create_app():
     def health():
         return {"status": "healthy", "project": "raghub"}
 
-    @app.route("/api/answer")
-
-
     @app.route("/api/answer/stream")
     def stream_answer():
         query = request.args.get("q") or request.args.get("query") or ""
@@ -49,7 +46,7 @@ def create_app():
                 )
                 
         return Response(generate(), mimetype="text/plain")
-
+    @app.route("/api/answer")
     def answer():
         query = request.args.get("q") or request.args.get("query") or ""
         if not query:

@@ -1,5 +1,6 @@
 import unittest
 
+from connectors.pgvector.connector import PgVectorConnector
 from models.retrieval_result import RetrievalResult
 from services.providers_arxiv import ArxivProvider
 from services.providers_pgvector import PgVectorProvider
@@ -79,6 +80,73 @@ class RetrievalServiceTests(unittest.TestCase):
 
         self.assertEqual(len(service.providers), 1)
         self.assertEqual(service.providers[0].name, "wikipedia")
+
+    def test_pgvector_connector_delegates_to_existing_provider_logic(self):
+        class FakeProvider:
+            name = "pgvector"
+
+            def __init__(self):
+                self.calls = []
+
+            def retrieve(self, query, limit=10):
+                self.calls.append((query, limit))
+                return [
+                    RetrievalResult(
+                        document_id="doc-1",
+                        chunk_index=0,
+                        content="connector content",
+                        score=0.88,
+                        metadata={"provider": self.name},
+                    )
+                ]
+
+        provider = FakeProvider()
+        connector = PgVectorConnector(provider=provider)
+        results = connector.retrieve("test query", limit=3)
+
+        self.assertEqual(connector.source_name, "pgvector")
+        self.assertEqual(connector.name, "pgvector")
+        self.assertEqual(provider.calls, [("test query", 3)])
+        self.assertEqual(results[0].metadata, {"provider": "pgvector"})
+
+    def test_pgvector_connector_search_returns_search_results(self):
+        class FakeProvider:
+            name = "pgvector"
+
+            def retrieve(self, query, limit=10):
+                return [
+                    RetrievalResult(
+                        document_id="doc-1",
+                        chunk_index=2,
+                        content="searchable chunk",
+                        score=0.77,
+                        metadata={"provider": self.name},
+                    )
+                ]
+
+        connector = PgVectorConnector(provider=FakeProvider())
+        results = connector.search("test query", limit=3)
+
+        self.assertEqual(results[0].title, "doc-1")
+        self.assertEqual(results[0].snippet, "searchable chunk")
+        self.assertEqual(results[0].source, "pgvector")
+        self.assertEqual(results[0].content_type, "document_chunk")
+        self.assertEqual(results[0].metadata["chunk_index"], 2)
+
+    def test_retrieval_service_resolves_pgvector_from_registry(self):
+        class FakeRegistry:
+            def __init__(self):
+                self.connector = PgVectorConnector(provider=PgVectorProvider())
+
+            def get(self, source_name):
+                if source_name != "pgvector":
+                    raise KeyError(source_name)
+                return self.connector
+
+        registry = FakeRegistry()
+        service = RetrievalService(provider_names=["pgvector"], registry=registry)
+
+        self.assertIs(service.providers[0], registry.connector)
 
 
 if __name__ == "__main__":

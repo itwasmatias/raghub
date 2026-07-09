@@ -2,11 +2,11 @@ import logging
 import os
 from time import time
 
+from connectors import create_registry
 from config import Config
 from models.retrieval_result import RetrievalResult
 from services.providers import RetrievalProvider
 from services.providers_arxiv import ArxivProvider
-from services.providers_pgvector import PgVectorProvider
 from services.providers_pubmed import PubMedProvider
 from services.providers_wikipedia import WikipediaProvider
 
@@ -23,7 +23,9 @@ class RetrievalService:
         provider_names: list[str] | None = None,
         ttl_seconds: int | None = None,
         logger: logging.Logger | None = None,
+        registry=None,
     ):
+        self.registry = registry or create_registry()
         configured = providers or []
         if provider_names:
             configured = provider_names
@@ -49,7 +51,7 @@ class RetrievalService:
             elif isinstance(provider, str):
                 provider_name = provider.lower()
                 if provider_name == "pgvector":
-                    built.append(PgVectorProvider())
+                    built.append(self.registry.get("pgvector"))
                 elif provider_name == "wikipedia":
                     built.append(WikipediaProvider())
                 elif provider_name == "pubmed":
@@ -62,7 +64,7 @@ class RetrievalService:
                 built.append(provider)
             else:
                 raise TypeError(f"Unsupported provider type: {type(provider)}")
-        return built or [PgVectorProvider()]
+        return built or [self.registry.get("pgvector")]
 
     def _deduplicate_results(self, results: list[RetrievalResult]) -> list[RetrievalResult]:
         seen: set[tuple[object, object, str]] = set()

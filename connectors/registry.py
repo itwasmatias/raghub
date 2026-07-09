@@ -14,7 +14,7 @@ class ConnectorRegistry:
     """
 
     def __init__(self):
-        self._connectors: dict[str, type[BaseConnector]] = {}
+        self._connectors: dict[str, BaseConnector] = {}
         self._plugin_paths: list[str] = []
 
     def register(self, connector_class: type[BaseConnector]) -> None:
@@ -22,13 +22,13 @@ class ConnectorRegistry:
         Register a connector class.
         """
         connector = connector_class()
-        self._connectors[connector.source_name] = connector_class
+        self.register_instance(connector)
 
     def register_instance(self, connector: BaseConnector) -> None:
         """
         Register an already-instantiated connector.
         """
-        self._connectors[connector.source_name] = type(connector)
+        self._connectors[connector.source_name] = connector
 
     def register_plugin_path(self, plugin_path: str) -> None:
         """
@@ -51,10 +51,9 @@ class ConnectorRegistry:
 
     def get(self, source_name: str) -> BaseConnector:
         """
-        Create and return a connector instance.
+        Return a registered connector instance.
         """
-        connector_class = self._connectors[source_name]
-        return connector_class()
+        return self._connectors[source_name]
     
     def search(
         self,

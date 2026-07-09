@@ -42,3 +42,5 @@ htmlcov/
 *.tmp
 *.bak
 pgvector/
+!connectors/pgvector/
+!connectors/pgvector/*.py

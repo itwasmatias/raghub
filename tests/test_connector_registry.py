@@ -22,6 +22,20 @@ class ConnectorRegistryTests(unittest.TestCase):
         self.assertTrue(registry.has("demo"))
         self.assertEqual(registry.list_sources(), ["demo"])
 
+    def test_registry_returns_registered_connector_instance(self):
+        registry = ConnectorRegistry()
+        registry.register(DemoConnector)
+
+        self.assertIs(registry.get("demo"), registry.get("demo"))
+
+    def test_registry_preserves_explicit_connector_instances(self):
+        registry = ConnectorRegistry()
+        connector = DemoConnector()
+
+        registry.register_instance(connector)
+
+        self.assertIs(registry.get("demo"), connector)
+
     def test_registry_supports_plugin_paths(self):
         registry = ConnectorRegistry()
         registry.register_plugin_path("tests.test_connector_registry")
