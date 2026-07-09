@@ -25,6 +25,7 @@ class SearchResult:
     identifier: str | None = None
     authors: list[str] = field(default_factory=list)
     published: str | None = None
+    content_type: str | None = None
 
     # Retrieval metadata
     score: float | None = None

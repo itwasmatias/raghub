@@ -1,5 +1,10 @@
 import os
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency
+    def load_dotenv() -> None:
+        return None
 
 load_dotenv()
 
@@ -37,6 +42,18 @@ class Config:
     TOP_K = int(
         os.getenv("TOP_K", "5")
     )
+
+    RETRIEVAL_PROVIDERS = os.getenv(
+        "RAGHUB_RETRIEVAL_PROVIDERS",
+        "pgvector,wikipedia",
+    )
+
+    RETRIEVAL_PROVIDER_LIST = [
+        provider.strip()
+        for provider in RETRIEVAL_PROVIDERS.split(",")
+        if provider.strip()
+    ]
+    
 
     MAX_HISTORY = int(
         os.getenv("MAX_HISTORY", "10")

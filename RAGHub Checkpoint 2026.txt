@@ -1,3 +1,19 @@
+📌 RAGHub Checkpoint — 2026-07-09 (Milestone 2 → Stabilization + Extensibility)
+
+Progress Report
+- The local Python environment is now stabilized with a project virtualenv and the required dependencies installed.
+- The core answer flow is working end-to-end through the Flask API and returns a structured answer payload.
+- Retrieval is now configurable for multiple providers and resilient to provider failures.
+- A lightweight connector plugin registry has been added so new connectors can be registered without changing the core app flow.
+- Verification: the targeted regression suite is passing with 7 passed tests.
+
+Next Milestone
+- Wire the connector plugin registry into the search service so connectors can be loaded dynamically from configuration.
+- Add hybrid retrieval policy controls and a simple streaming response path.
+- Expand the API surface for plugin and provider management.
+
+---
+
 📌 RAGHub Checkpoint — 2026-07-05 (Milestone 1 → Retrieval Layer)
 Project Goal
 

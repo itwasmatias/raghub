@@ -1,0 +1,85 @@
+import unittest
+
+from models.retrieval_result import RetrievalResult
+from services.providers_arxiv import ArxivProvider
+from services.providers_pgvector import PgVectorProvider
+from services.providers_pubmed import PubMedProvider
+from services.providers_wikipedia import WikipediaProvider
+from services.retrieve import RetrievalService
+
+
+class RetrievalServiceTests(unittest.TestCase):
+    def test_pgvector_provider_normalizes_internal_chunks(self):
+        provider = PgVectorProvider()
+
+        normalized = provider._normalize_rows(
+            [
+                {
+                    "document_id": 7,
+                    "chunk_index": 3,
+                    "content": "Example chunk",
+                    "distance": 0.42,
+                }
+            ]
+        )
+
+        self.assertEqual(len(normalized), 1)
+        self.assertIsInstance(normalized[0], RetrievalResult)
+        self.assertEqual(normalized[0].document_id, 7)
+        self.assertEqual(normalized[0].chunk_index, 3)
+        self.assertEqual(normalized[0].content, "Example chunk")
+        self.assertAlmostEqual(normalized[0].score, 0.58)
+
+    def test_wikipedia_provider_normalizes_results(self):
+        provider = WikipediaProvider()
+        results = provider.retrieve("raghub", limit=2)
+
+        self.assertTrue(results)
+        self.assertIsInstance(results[0], RetrievalResult)
+        self.assertIn("provider", results[0].metadata)
+
+    def test_pubmed_provider_normalizes_results(self):
+        provider = PubMedProvider()
+        results = provider.retrieve("raghub", limit=2)
+
+        self.assertIsInstance(results, list)
+        self.assertTrue(all(isinstance(item, RetrievalResult) for item in results))
+
+    def test_arxiv_provider_normalizes_results(self):
+        provider = ArxivProvider()
+        results = provider.retrieve("raghub", limit=2)
+
+        self.assertIsInstance(results, list)
+        self.assertTrue(all(isinstance(item, RetrievalResult) for item in results))
+
+    def test_retrieval_service_uses_configured_providers(self):
+        class FakeProvider:
+            name = "fake"
+
+            def retrieve(self, query, limit=10):
+                return [
+                    RetrievalResult(
+                        document_id="fake-doc",
+                        chunk_index=0,
+                        content="fake content",
+                        score=0.9,
+                    )
+                ]
+
+        service = RetrievalService(providers=[FakeProvider()])
+        results = service.retrieve("test query")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].document_id, "fake-doc")
+        self.assertEqual(results[0].content, "fake content")
+        self.assertAlmostEqual(results[0].score, 0.9)
+
+    def test_retrieval_service_accepts_provider_names(self):
+        service = RetrievalService(provider_names=["wikipedia"])
+
+        self.assertEqual(len(service.providers), 1)
+        self.assertEqual(service.providers[0].name, "wikipedia")
+
+
+if __name__ == "__main__":
+    unittest.main()
