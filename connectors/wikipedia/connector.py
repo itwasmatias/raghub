@@ -8,8 +8,8 @@ import re
 import requests
 
 from connectors.base import BaseConnector
+from models.retrieval_result import RetrievalResult
 from models.search_result import SearchResult
-
 
 class WikipediaConnector(BaseConnector):
     """Connector for Wikipedia."""
@@ -31,13 +31,13 @@ class WikipediaConnector(BaseConnector):
     def source_name(self) -> str:
         return "wikipedia"
 
-    def search(
+    def _fetch_results(
         self,
         query: str,
-        limit: int = 10,
-    ) -> list[SearchResult]:
+        limit: int,
+    ) -> list[dict]:
         """
-        Search Wikipedia and return normalized SearchResult objects.
+        Fetch raw search results from the Wikipedia API.
         """
 
         params = {
@@ -52,20 +52,36 @@ class WikipediaConnector(BaseConnector):
             "User-Agent": "RAGHub/2.0 (educational project)"
         }
 
-        response = requests.get(
-            "https://en.wikipedia.org/w/api.php",
-            params=params,
-            headers=headers,
-            timeout=10,
-        )
+        try:
+            response = requests.get(
+                "https://en.wikipedia.org/w/api.php",
+                params=params,
+                headers=headers,
+                timeout=10,
+            )
 
-        response.raise_for_status()
+            response.raise_for_status()
 
-        data = response.json()
+            data = response.json()
+
+            return data.get("query", {}).get("search", [])
+
+        except Exception:
+            return []
+
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+    ) -> list[SearchResult]:
+        """
+        Search Wikipedia and return normalized SearchResult objects.
+        """
+        raw_results = self._fetch_results(query, limit)
 
         results = []
-
-        for item in data.get("query", {}).get("search", []):
+        
+        for item in raw_results:
             title = item["title"]
 
             url = (
@@ -83,5 +99,62 @@ class WikipediaConnector(BaseConnector):
                     source=self.source_name,
                 )
             )
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+    ) -> list[SearchResult]:
+        """
+        Search Wikipedia and return normalized SearchResult objects.
+        """
+        raw_results = self._fetch_results(query, limit)
+        
+        results = []
 
+        for item in raw_results:
+            title = item["title"]
+
+            url = (
+                "https://en.wikipedia.org/wiki/"
+                + title.replace(" ", "_")
+            )
+
+            results.append(
+                SearchResult(
+                    title=title,
+                    url=url,
+                    snippet=self._clean_snippet(
+                        item.get("snippet", "")
+                    ),
+                    source=self.source_name,
+                )
+            )
         return results
+
+    def retrieve(
+        self,
+        query: str,
+        limit: int = 5,
+    ) -> list[RetrievalResult]:
+        """
+        Retrieve Wikipedia content formatted for LLM context.
+        """
+        results: list[RetrievalResult] = []
+        
+        search_results = self.search(query, limit=limit)
+        print(f"DEBUG: Found {len(search_results)} search results for query '{query}'.")
+        if search_results is None:
+            print("DEBUG: search() returned None!")
+            return[]
+
+        for item in search_results:
+            results.append(
+                RetrievalResult(
+                    content=item.snippet,
+                    source=item.source,
+                    metadata={"url": item.url, "title": item.title, "source":item.source, "provider": "wikipedia"}
+                )
+            )
+       
+        return results   
+ 

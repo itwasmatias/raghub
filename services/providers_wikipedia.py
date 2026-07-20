@@ -3,11 +3,7 @@ Wikipedia retrieval provider.
 """
 
 from __future__ import annotations
-
-import re
-
-import requests
-
+from connectors.wikipedia.connector import WikipediaConnector
 from models.retrieval_result import RetrievalResult
 from services.providers import RetrievalProvider
 
@@ -24,13 +20,10 @@ class WikipediaProvider(RetrievalProvider):
         return snippet.replace("</span>", "")
 
     def retrieve(self, query: str, limit: int = 10) -> list[RetrievalResult]:
-        params = {
-            "action": "query",
-            "list": "search",
-            "srsearch": query,
-            "format": "json",
-            "srlimit": limit,
-        }
+        """
+        DEPRECATED: Delegating to WikipediaConnector.
+        """
+        return WikipediaConnector().retrieve(query, limit=limit)
 
         headers = {"User-Agent": "RAGHub/2.0 (educational project)"}
         try:

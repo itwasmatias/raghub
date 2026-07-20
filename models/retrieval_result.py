@@ -11,9 +11,11 @@ class RetrievalResult:
     """
     Normalized representation of a retrieved chunk.
     """
-
-    document_id: int | str
-    chunk_index: int
     content: str
+
+    source: str = "unknown"
+    document_id: int | str | None = None
+    chunk_index: int = 0
     score: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    
