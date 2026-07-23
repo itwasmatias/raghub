@@ -11,8 +11,19 @@ class NbaApiSource:
     ) -> None:
         self._endpoint_factory = endpoint_factory or self._default_endpoint_factory
 
-    def fetch_player_game_logs(self, season: str) -> list[dict[str, Any]]:
-        endpoint = self._endpoint_factory(season_nullable=season)
+    def fetch_player_game_logs(
+        self,
+        season: str,
+        league_id: str | None = None,
+        season_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        endpoint_arguments: dict[str, Any] = {"season_nullable": season}
+        if league_id is not None:
+            endpoint_arguments["league_id_nullable"] = league_id
+        if season_type is not None:
+            endpoint_arguments["season_type_nullable"] = season_type
+
+        endpoint = self._endpoint_factory(**endpoint_arguments)
         response_dict = endpoint.get_dict()
         return self._normalize_player_game_logs(response_dict)
 

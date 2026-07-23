@@ -29,16 +29,25 @@ class RefreshStateRepository(Protocol):
     def save_last_processed_date(self, season: str, date: str) -> None: ...
 
 
+class PlayerGameLogRepository(Protocol):
+    def save_many(
+        self,
+        logs: list[Mapping[str, Any]],
+    ) -> None: ...
+
+
 class NbaRefreshService:
     def __init__(
         self,
         source: PlayerGameLogSource,
         repository: PlayerStatsRepository,
         state_repository: RefreshStateRepository | None = None,
+        game_log_repository: PlayerGameLogRepository | None = None,
     ) -> None:
         self.source = source
         self.repository = repository
         self.state_repository = state_repository
+        self.game_log_repository = game_log_repository
 
     def refresh_season(self, season: str) -> RefreshSummary:
         rows = self.source.fetch_player_game_logs(season)
@@ -93,6 +102,11 @@ class NbaRefreshService:
         add_to_existing: bool,
     ) -> RefreshSummary:
         rows_by_player: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+
+        if self.game_log_repository is not None:
+            self.game_log_repository.save_many(
+                [{**row, "season": season} for row in rows]
+            )
 
         for row in rows:
             rows_by_player[str(row["player_id"])].append(row)

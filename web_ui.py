@@ -6,43 +6,10 @@ from urllib.parse import parse_qs
 from typing import Any
 
 from models.sports.player import Player
+from sports.application.nba_demo_runtime import NbaDemoRuntime
 from sports.features.builders.trend_builder import TrendFeatureBuilder
 from sports.features.facade import FeatureFacade
 from sports.features.registry import FeatureRegistry
-
-
-DEMO_PLAYERS = [
-    {
-        "name": "Nova Carter",
-        "team": "Sky Rockets",
-        "badge": "rising",
-        "recent_five_average": 18.4,
-        "current_season_average": 16.9,
-        "previous_season_average": 11.2,
-        "weighted_two_season_average": 14.5,
-        "why": "She has been stacking stronger finishes and keeps lifting the team when the game gets close.",
-    },
-    {
-        "name": "Milo Grant",
-        "team": "River Owls",
-        "badge": "stable",
-        "recent_five_average": 12.1,
-        "current_season_average": 12.0,
-        "previous_season_average": 11.8,
-        "weighted_two_season_average": 11.9,
-        "why": "He has been steady like a metronome, which makes him easy for SIP to trust.",
-    },
-    {
-        "name": "Zuri Lane",
-        "team": "Comet Cubs",
-        "badge": "declining",
-        "recent_five_average": 8.6,
-        "current_season_average": 10.3,
-        "previous_season_average": 13.4,
-        "weighted_two_season_average": 11.7,
-        "why": "Her early spark has cooled a bit, so SIP notices the dip and flags it for a comeback watch.",
-    },
-]
 
 
 def _first_value(candidate: Any, *names: str, default: Any = None) -> Any:
@@ -86,6 +53,7 @@ def _normalize_trending_player(player: Any) -> dict[str, Any]:
         ),
         "team": _first_value(
             team_details,
+            "latest_team",
             "team_name",
             "name",
             "abbreviation",
@@ -94,6 +62,7 @@ def _normalize_trending_player(player: Any) -> dict[str, Any]:
         "badge": str(badge),
         "recent_five_average": _first_value(
             player,
+            "recent_five_ppg",
             "recent_five_average",
             "recent_5_game_average",
             "recent_average",
@@ -101,17 +70,20 @@ def _normalize_trending_player(player: Any) -> dict[str, Any]:
         ),
         "current_season_average": _first_value(
             player,
+            "current_season_ppg",
             "current_season_average",
             "season_average",
             default=0.0,
         ),
         "previous_season_average": _first_value(
             player,
+            "previous_season_ppg",
             "previous_season_average",
             default=0.0,
         ),
         "weighted_two_season_average": _first_value(
             player,
+            "weighted_two_season_ppg",
             "weighted_two_season_average",
             "weighted_average",
             "two_season_average",
@@ -142,9 +114,14 @@ def default_refresh_callback() -> None:
     return None
 
 
+def default_load_history_callback() -> None:
+    return None
+
+
 class FeatureUIHandler(BaseHTTPRequestHandler):
     trending_player_provider = staticmethod(default_trending_player_provider)
     refresh_callback = staticmethod(default_refresh_callback)
+    load_history_callback = staticmethod(default_load_history_callback)
 
     def do_GET(self) -> None:
         if self.path == "/":
@@ -157,6 +134,12 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
 
     def _handle_refresh(self) -> None:
         self.refresh_callback()
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.end_headers()
+
+    def _handle_load_history(self) -> None:
+        self.load_history_callback()
         self.send_response(303)
         self.send_header("Location", "/")
         self.end_headers()
@@ -206,6 +189,10 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
             self._handle_refresh()
             return
 
+        if self.path == "/load-history":
+            self._handle_load_history()
+            return
+
         self.send_response(404)
         self.end_headers()
         self.wfile.write(b"Not Found")
@@ -214,17 +201,61 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
         trending_players = list(self._get_trending_players())
         if trending_players:
             cards = [
-                self.render_trending_card(player, "Live Cached Data")
+                self.render_trending_card(player, "Historical Basketball Cache")
                 for player in trending_players
             ]
             cards_html = "".join(cards)
-            source_label = "Live Cached Data"
-        else:
-            cards_html = "".join(
-                self.render_trending_card(player, "Demo Data")
-                for player in DEMO_PLAYERS
+            source_label = "Historical Basketball Cache"
+            first_player = _normalize_trending_player(trending_players[0])
+            league = escape(
+                str(
+                    _first_value(
+                        trending_players[0],
+                        "league",
+                        default="Basketball",
+                    )
+                )
             )
-            source_label = "Demo Data"
+            competition = escape(
+                str(
+                    _first_value(
+                        trending_players[0],
+                        "competition",
+                        default="Professional",
+                    )
+                )
+            )
+            metadata_html = dedent(
+                f"""
+                <div class="refresh" style="margin-top: 12px;">
+                    League: {league} · Competition: {competition} · Last refresh: {escape(self._format_refresh_time(first_player["last_refreshed_at"]))}
+                </div>
+                """
+            )
+            action_form_html = dedent(
+                """
+                <form action="/refresh" method="post" style="margin-top: 16px;">
+                    <button type="submit">Refresh NBA Data</button>
+                </form>
+                """
+            )
+        else:
+            cards_html = ""
+            source_label = "Basketball data not loaded"
+            metadata_html = dedent(
+                """
+                <p class="section-note" style="margin-top: 12px;">
+                    Historical NBA/WNBA data must be loaded before trending players can be shown.
+                </p>
+                """
+            )
+            action_form_html = dedent(
+                """
+                <form action="/load-history" method="post" style="margin-top: 16px;">
+                    <button type="submit">Load Historical Data</button>
+                </form>
+                """
+            )
 
         refresh_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -410,17 +441,14 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
                             When cached live data is available, it appears here automatically.
                         </p>
                         <div class="demo-label">{escape(source_label)}</div>
-                        <div class="cards">
-                            {cards_html}
-                        </div>
+                        {metadata_html}
+                        <div class="cards">{cards_html}</div>
                         <div class="refresh">Last refreshed: {escape(refresh_time)}</div>
-                        <form action="/refresh" method="post" style="margin-top: 16px;">
-                            <button type="submit">Refresh NBA Data</button>
-                        </form>
+                        {action_form_html}
                     </section>
 
                     <section class="form-shell">
-                        <h2>Manual Player Feature Form</h2>
+                        <h2>Manual Sandbox — user-entered values</h2>
                         <p class="section-note">Keep trying your own player here after the demo cards.</p>
 
                         <form action="/build" method="post">
@@ -497,9 +525,6 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
 
         return str(value)
 
-    def render_demo_card(self, player: dict[str, object]) -> str:
-        return self.render_trending_card(player, "Demo Data")
-
     def render_result(self, player: Player, view: object) -> str:
         trend = getattr(view, "trend", None)
         trend_data = ""
@@ -540,7 +565,9 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    server = ThreadingHTTPServer(("0.0.0.0", 8000), FeatureUIHandler)
+    runtime = NbaDemoRuntime()
+    live_handler = runtime.build_feature_ui_handler(FeatureUIHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", 8000), live_handler)
     print("Serving at http://127.0.0.1:8000")
     server.serve_forever()
 
