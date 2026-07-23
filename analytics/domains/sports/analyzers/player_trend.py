@@ -1,5 +1,6 @@
 from analytics.base import BaseAnalyzer
 from models.analysis_result import AnalysisResult
+from models.sports.features.player_feature_view import PlayerFeatureView
 
 
 class PlayerTrendAnalyzer(BaseAnalyzer):
@@ -17,7 +18,29 @@ class PlayerTrendAnalyzer(BaseAnalyzer):
                 confidence=0.0,
                 metadata={}
             )
-        
+
+        if isinstance(research_result, PlayerFeatureView):
+            trend_features = research_result.trend
+            trend_score = trend_features.trend
+
+            if trend_score > 0:
+                trend = "rising"
+            elif trend_score < 0:
+                trend = "declining"
+            else:
+                trend = "stable"
+
+            return AnalysisResult(
+                analyzer=self.analyzer_name,
+                summary=f"Player performance trend: {trend}",
+                confidence=0.5,
+                metadata={
+                    "trend": trend,
+                    "trend_score": trend_score,
+                    "season_average": trend_features.season_average,
+                    "recent_average": trend_features.recent_average,
+                },
+            )
 
         history = research_result.performance_history
         season_average = sum(history) / len(history)
