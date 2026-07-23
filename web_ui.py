@@ -3,6 +3,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html import escape
 from textwrap import dedent
 from urllib.parse import parse_qs
+from typing import Any
 
 from models.sports.player import Player
 from sports.features.builders.trend_builder import TrendFeatureBuilder
@@ -44,7 +45,107 @@ DEMO_PLAYERS = [
 ]
 
 
+def _first_value(candidate: Any, *names: str, default: Any = None) -> Any:
+    if candidate is None:
+        return default
+
+    if isinstance(candidate, dict):
+        for name in names:
+            if name in candidate and candidate[name] is not None:
+                return candidate[name]
+
+    for name in names:
+        if hasattr(candidate, name):
+            value = getattr(candidate, name)
+            if value is not None:
+                return value
+
+    return default
+
+
+def _normalize_trending_player(player: Any) -> dict[str, Any]:
+    player_details = _first_value(player, "player", default=player)
+    team_details = _first_value(player, "team", default=player)
+
+    badge = _first_value(
+        player,
+        "badge",
+        "trend",
+        "trend_label",
+        "trend_state",
+        default="stable",
+    )
+
+    return {
+        "name": _first_value(
+            player_details,
+            "player_name",
+            "name",
+            "full_name",
+            default="Unknown Player",
+        ),
+        "team": _first_value(
+            team_details,
+            "team_name",
+            "name",
+            "abbreviation",
+            default="Unknown Team",
+        ),
+        "badge": str(badge),
+        "recent_five_average": _first_value(
+            player,
+            "recent_five_average",
+            "recent_5_game_average",
+            "recent_average",
+            default=0.0,
+        ),
+        "current_season_average": _first_value(
+            player,
+            "current_season_average",
+            "season_average",
+            default=0.0,
+        ),
+        "previous_season_average": _first_value(
+            player,
+            "previous_season_average",
+            default=0.0,
+        ),
+        "weighted_two_season_average": _first_value(
+            player,
+            "weighted_two_season_average",
+            "weighted_average",
+            "two_season_average",
+            default=0.0,
+        ),
+        "why": _first_value(
+            player,
+            "why",
+            "explanation",
+            "reason",
+            default="SIP noticed a strong pattern in this player's recent games.",
+        ),
+        "last_refreshed_at": _first_value(
+            player,
+            "last_refreshed_at",
+            "updated_at",
+            "last_refresh",
+            default=datetime.now(timezone.utc),
+        ),
+    }
+
+
+def default_trending_player_provider() -> list[Any]:
+    return []
+
+
+def default_refresh_callback() -> None:
+    return None
+
+
 class FeatureUIHandler(BaseHTTPRequestHandler):
+    trending_player_provider = staticmethod(default_trending_player_provider)
+    refresh_callback = staticmethod(default_refresh_callback)
+
     def do_GET(self) -> None:
         if self.path == "/":
             self.send_html(self.render_form())
@@ -54,41 +155,11 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Not Found")
 
-    def do_POST(self) -> None:
-        if self.path != "/build":
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b"Not Found")
-            return
-
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length).decode("utf-8")
-        form_data = parse_qs(body)
-
-        name = form_data.get("name", [""])[0].strip()
-        team = form_data.get("team", [""])[0].strip()
-        history_text = form_data.get("performance_history", [""])[0].strip()
-
-        try:
-            history = [
-                int(item.strip()) for item in history_text.split(",") if item.strip()
-            ]
-        except ValueError:
-            history = []
-
-        player = Player(
-            name=name or "Demo Player",
-            team=team or "Demo Team",
-            performance_history=history,
-        )
-
-        registry = FeatureRegistry()
-        registry.register_builder(TrendFeatureBuilder())
-
-        facade = FeatureFacade(registry)
-        view = facade.build(player, ["trend"])
-
-        self.send_html(self.render_result(player, view))
+    def _handle_refresh(self) -> None:
+        self.refresh_callback()
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.end_headers()
 
     def send_html(self, html: str) -> None:
         self.send_response(200)
@@ -97,8 +168,64 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(html.encode("utf-8"))
 
+    def do_POST(self) -> None:
+        if self.path == "/build":
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode("utf-8")
+            form_data = parse_qs(body)
+
+            name = form_data.get("name", [""])[0].strip()
+            team = form_data.get("team", [""])[0].strip()
+            history_text = form_data.get("performance_history", [""])[0].strip()
+
+            try:
+                history = [
+                    int(item.strip())
+                    for item in history_text.split(",")
+                    if item.strip()
+                ]
+            except ValueError:
+                history = []
+
+            player = Player(
+                name=name or "Demo Player",
+                team=team or "Demo Team",
+                performance_history=history,
+            )
+
+            registry = FeatureRegistry()
+            registry.register_builder(TrendFeatureBuilder())
+
+            facade = FeatureFacade(registry)
+            view = facade.build(player, ["trend"])
+
+            self.send_html(self.render_result(player, view))
+            return
+
+        if self.path == "/refresh":
+            self._handle_refresh()
+            return
+
+        self.send_response(404)
+        self.end_headers()
+        self.wfile.write(b"Not Found")
+
     def render_form(self) -> str:
-        cards_html = "".join(self.render_demo_card(player) for player in DEMO_PLAYERS)
+        trending_players = list(self._get_trending_players())
+        if trending_players:
+            cards = [
+                self.render_trending_card(player, "Live Cached Data")
+                for player in trending_players
+            ]
+            cards_html = "".join(cards)
+            source_label = "Live Cached Data"
+        else:
+            cards_html = "".join(
+                self.render_trending_card(player, "Demo Data")
+                for player in DEMO_PLAYERS
+            )
+            source_label = "Demo Data"
+
         refresh_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
         return dedent(
@@ -279,14 +406,17 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
                         <div class="eyebrow">SIP Trending Players</div>
                         <h1 class="title">Kid-friendly player radar for curious fans</h1>
                         <p class="subtitle">
-                            SIP turns player trends into a bright, easy-to-read story. These cards are demo data,
-                            so you can explore the idea safely before connecting live sports feeds.
+                            SIP turns player trends into a bright, easy-to-read story.
+                            When cached live data is available, it appears here automatically.
                         </p>
-                        <div class="demo-label">Demo Data</div>
+                        <div class="demo-label">{escape(source_label)}</div>
                         <div class="cards">
                             {cards_html}
                         </div>
                         <div class="refresh">Last refreshed: {escape(refresh_time)}</div>
+                        <form action="/refresh" method="post" style="margin-top: 16px;">
+                            <button type="submit">Refresh NBA Data</button>
+                        </form>
                     </section>
 
                     <section class="form-shell">
@@ -319,26 +449,56 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
             """
         )
 
-    def render_demo_card(self, player: dict[str, object]) -> str:
-        badge = str(player["badge"])
+    def _get_trending_players(self) -> list[Any]:
+        provider = self.trending_player_provider
+        if provider is None:
+            return []
+
+        try:
+            trending_players = provider()
+        except TypeError:
+            trending_players = provider(self)
+
+        if not trending_players:
+            return []
+
+        return list(trending_players)
+
+    def render_trending_card(self, player: Any, source_label: str) -> str:
+        details = _normalize_trending_player(player)
+        badge = str(details["badge"])
         return dedent(
             f"""
             <article class="player-card">
                 <div>
-                    <h2>{escape(str(player["name"]))}</h2>
-                    <div class="team">{escape(str(player["team"]))}</div>
+                    <h2>{escape(str(details["name"]))}</h2>
+                    <div class="team">{escape(str(details["team"]))}</div>
                 </div>
+                <div class="demo-label" style="margin-top: 0;">{escape(source_label)}</div>
                 <div class="badge {escape(badge)}">{escape(badge)}</div>
                 <div class="stat-grid">
-                    <div class="stat"><span>Recent 5-game average</span><span>{player["recent_five_average"]}</span></div>
-                    <div class="stat"><span>Current-season average</span><span>{player["current_season_average"]}</span></div>
-                    <div class="stat"><span>Previous-season average</span><span>{player["previous_season_average"]}</span></div>
-                    <div class="stat"><span>Weighted two-season average</span><span>{player["weighted_two_season_average"]}</span></div>
+                    <div class="stat"><span>Recent 5-game average</span><span>{details["recent_five_average"]}</span></div>
+                    <div class="stat"><span>Current-season average</span><span>{details["current_season_average"]}</span></div>
+                    <div class="stat"><span>Previous-season average</span><span>{details["previous_season_average"]}</span></div>
+                    <div class="stat"><span>Weighted two-season average</span><span>{details["weighted_two_season_average"]}</span></div>
                 </div>
-                <p class="why"><strong>Why SIP noticed him:</strong> {escape(str(player["why"]))}</p>
+                <p class="why"><strong>Why SIP noticed him:</strong> {escape(str(details["why"]))}</p>
+                <div class="refresh">Last refreshed: {escape(self._format_refresh_time(details["last_refreshed_at"]))}</div>
             </article>
             """
         )
+
+    def _format_refresh_time(self, value: Any) -> str:
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            value = value.astimezone(timezone.utc)
+            return value.strftime("%Y-%m-%d %H:%M UTC")
+
+        return str(value)
+
+    def render_demo_card(self, player: dict[str, object]) -> str:
+        return self.render_trending_card(player, "Demo Data")
 
     def render_result(self, player: Player, view: object) -> str:
         trend = getattr(view, "trend", None)
