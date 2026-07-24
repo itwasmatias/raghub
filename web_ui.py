@@ -1,12 +1,13 @@
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html import escape
+import re
 from textwrap import dedent
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 from typing import Any
 
 from models.sports.player import Player
-from sports.application.nba_demo_runtime import NbaDemoRuntime
+from sports.application.nba_demo_runtime import BasketballDemoRuntime
 from sports.features.builders.trend_builder import TrendFeatureBuilder
 from sports.features.facade import FeatureFacade
 from sports.features.registry import FeatureRegistry
@@ -44,6 +45,7 @@ def _normalize_trending_player(player: Any) -> dict[str, Any]:
     )
 
     return {
+        "player_id": _first_value(player_details, "player_id", "id", default=""),
         "name": _first_value(
             player_details,
             "player_name",
@@ -118,14 +120,65 @@ def default_load_history_callback() -> None:
     return None
 
 
+def default_historical_load_status_provider() -> str | None:
+    return None
+
+
+def default_historical_load_status_details_provider() -> dict[str, Any] | None:
+    return None
+
+
+def default_player_detail_provider(player_id: str) -> dict[str, Any] | None:
+    return None
+
+
+def default_data_health_provider() -> dict[str, Any] | None:
+    return None
+
+
+def default_learning_summary_provider() -> dict[str, Any] | None:
+    return None
+
+
+def default_calibration_detail_provider() -> dict[str, Any] | None:
+    return None
+
+
+def default_top_hypothesis_provider(player_id: str) -> dict[str, Any] | None:
+    return None
+
+
 class FeatureUIHandler(BaseHTTPRequestHandler):
     trending_player_provider = staticmethod(default_trending_player_provider)
     refresh_callback = staticmethod(default_refresh_callback)
+    historical_load_callback = staticmethod(default_load_history_callback)
     load_history_callback = staticmethod(default_load_history_callback)
+    historical_load_status_provider = staticmethod(
+        default_historical_load_status_provider
+    )
+    historical_load_status_details_provider = staticmethod(
+        default_historical_load_status_details_provider
+    )
+    player_detail_provider = staticmethod(default_player_detail_provider)
+    data_health_provider = staticmethod(default_data_health_provider)
+    learning_summary_provider = staticmethod(default_learning_summary_provider)
+    calibration_detail_provider = staticmethod(default_calibration_detail_provider)
+    top_hypothesis_provider = staticmethod(default_top_hypothesis_provider)
 
     def do_GET(self) -> None:
-        if self.path == "/":
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        self.selected_league = query.get("league", [""])[0]
+        self.selected_competition = query.get("competition", [""])[0]
+        self.explanation_mode = query.get("mode", ["adult"])[0]
+        if parsed.path == "/":
             self.send_html(self.render_form())
+            return
+        if parsed.path == "/player":
+            self.send_html(self.render_player_detail(query.get("player_id", [""])[0]))
+            return
+        if parsed.path == "/calibration":
+            self.send_html(self.render_calibration_detail())
             return
 
         self.send_response(404)
@@ -139,7 +192,13 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _handle_load_history(self) -> None:
-        self.load_history_callback()
+        callback = getattr(self, "load_history_callback", None)
+        if "load_history_callback" not in self.__dict__:
+            callback = getattr(self, "historical_load_callback", callback)
+
+        if callback is not None:
+            callback()
+
         self.send_response(303)
         self.send_header("Location", "/")
         self.end_headers()
@@ -198,14 +257,45 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Not Found")
 
     def render_form(self) -> str:
+        self._runtime_provider_error = None
+        load_status_message = self._get_historical_load_status_message()
+        load_status_details = self._get_historical_load_status_details()
         trending_players = list(self._get_trending_players())
+        if not load_status_message:
+            runtime_provider_error = getattr(self, "_runtime_provider_error", None)
+            if runtime_provider_error:
+                load_status_message = runtime_provider_error
+
+        status_html = ""
+        if load_status_message:
+            status_html = dedent(
+                f"""
+                <p class="why" style="margin-top: 12px; border-color: #f3b7b7; background: #fff1f1;">
+                    <strong>Load status:</strong> {escape(load_status_message)}
+                </p>
+                """
+            )
+
+        health_html = self._render_data_health()
+        learning_html = self._render_learning_summary()
         if trending_players:
+            games_loaded, players_loaded = self._extract_loaded_counts(
+                load_status_details,
+                load_status_message,
+                trending_players,
+            )
+            source_label = self._resolve_source_label(
+                load_status_details,
+                load_status_message,
+            )
             cards = [
-                self.render_trending_card(player, "Historical Basketball Cache")
+                self.render_trending_card(
+                    player,
+                    source_label,
+                )
                 for player in trending_players
             ]
             cards_html = "".join(cards)
-            source_label = "Historical Basketball Cache"
             first_player = _normalize_trending_player(trending_players[0])
             league = escape(
                 str(
@@ -230,6 +320,9 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
                 <div class="refresh" style="margin-top: 12px;">
                     League: {league} · Competition: {competition} · Last refresh: {escape(self._format_refresh_time(first_player["last_refreshed_at"]))}
                 </div>
+                <div class="refresh" style="margin-top: 6px;">
+                    Games loaded: {games_loaded} · Players loaded: {players_loaded}
+                </div>
                 """
             )
             action_form_html = dedent(
@@ -242,6 +335,9 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
         else:
             cards_html = ""
             source_label = "Basketball data not loaded"
+            cache_action_label = "Load Historical Data"
+            if self._is_legacy_schema_error(load_status_message):
+                cache_action_label = "Rebuild Historical Data Cache"
             metadata_html = dedent(
                 """
                 <p class="section-note" style="margin-top: 12px;">
@@ -250,9 +346,9 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
                 """
             )
             action_form_html = dedent(
-                """
+                f"""
                 <form action="/load-history" method="post" style="margin-top: 16px;">
-                    <button type="submit">Load Historical Data</button>
+                    <button type="submit">{escape(cache_action_label)}</button>
                 </form>
                 """
             )
@@ -414,6 +510,24 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
                         font: inherit;
                     }}
                     input {{ background: white; }}
+                    select {{
+                        width: 100%;
+                        padding: 0.75rem;
+                        border-radius: 12px;
+                        border: 1px solid #cfd8e3;
+                        background: white;
+                    }}
+                    .filter-bar {{
+                        max-width: none;
+                        grid-template-columns: repeat(4, minmax(0, 1fr));
+                        align-items: end;
+                    }}
+                    .health-grid {{
+                        display: grid;
+                        grid-template-columns: repeat(4, minmax(0, 1fr));
+                        gap: 8px;
+                        margin-top: 14px;
+                    }}
                     button {{
                         background: linear-gradient(135deg, #2563eb, #0ea5e9);
                         color: white;
@@ -428,6 +542,7 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
                     @media (max-width: 980px) {{
                         .cards {{ grid-template-columns: 1fr; }}
                         .two-col {{ grid-template-columns: 1fr; }}
+                        .filter-bar, .health-grid {{ grid-template-columns: 1fr; }}
                     }}
                 </style>
             </head>
@@ -441,7 +556,16 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
                             When cached live data is available, it appears here automatically.
                         </p>
                         <div class="demo-label">{escape(source_label)}</div>
+                        {status_html}
+                        {health_html}
+                        <form action="/" method="get" class="filter-bar" style="margin-top: 16px;">
+                            <label>League<select name="league"><option value="">All</option><option value="NBA">NBA</option><option value="WNBA">WNBA</option></select></label>
+                            <label>Competition<select name="competition"><option value="">All</option><option value="regular">Regular season</option><option value="playoffs">Playoffs</option><option value="summer_league">Summer League</option></select></label>
+                            <label>Explanation<select name="mode"><option value="adult">Standard</option><option value="kids">Explain for kids</option></select></label>
+                            <button type="submit">Apply filters</button>
+                        </form>
                         {metadata_html}
+                        {learning_html}
                         <div class="cards">{cards_html}</div>
                         <div class="refresh">Last refreshed: {escape(refresh_time)}</div>
                         {action_form_html}
@@ -483,23 +607,182 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
             return []
 
         try:
-            trending_players = provider()
+            trending_players = provider(
+                league=getattr(self, "selected_league", "") or None,
+                competition=getattr(
+                    self,
+                    "selected_competition",
+                    "",
+                )
+                or None,
+            )
         except TypeError:
-            trending_players = provider(self)
+            try:
+                trending_players = provider()
+            except Exception as error:  # pragma: no cover - integration guard
+                self._runtime_provider_error = (
+                    f"Could not load historical basketball data. Details: {error}"
+                )
+                return []
+            except TypeError:
+                try:
+                    trending_players = provider(self)
+                except Exception as error:  # pragma: no cover - integration guard
+                    self._runtime_provider_error = (
+                        f"Could not load historical basketball data. Details: {error}"
+                    )
+                    return []
+        except Exception as error:  # pragma: no cover - integration guard
+            self._runtime_provider_error = (
+                f"Could not load historical basketball data. Details: {error}"
+            )
+            return []
 
         if not trending_players:
             return []
 
         return list(trending_players)
 
+    @staticmethod
+    def _is_legacy_schema_error(message: str | None) -> bool:
+        if not message:
+            return False
+        lowered = message.lower()
+        return "no such column: league" in lowered
+
+    def _get_historical_load_status_message(self) -> str | None:
+        provider = self.historical_load_status_provider
+        if provider is None:
+            return None
+
+        try:
+            message = provider()
+        except TypeError:
+            message = provider(self)
+
+        if message is None:
+            return None
+
+        text = str(message).strip()
+        return text or None
+
+    def _get_historical_load_status_details(self) -> dict[str, Any] | None:
+        provider = self.historical_load_status_details_provider
+        if provider is None:
+            return None
+
+        try:
+            details = provider()
+        except TypeError:
+            details = provider(self)
+
+        if not isinstance(details, dict):
+            return None
+
+        return details
+
+    @staticmethod
+    def _resolve_source_label(
+        load_status_details: dict[str, Any] | None,
+        load_status_message: str | None,
+    ) -> str:
+        if load_status_details and load_status_details.get("success"):
+            source_label = str(load_status_details.get("source_label") or "").strip()
+            if source_label:
+                return source_label
+
+        if load_status_message:
+            if "official nba cdn" in load_status_message.lower():
+                return "Official NBA CDN"
+            if "espn" in load_status_message.lower():
+                return "ESPN public web data"
+
+        return "Basketball data loaded"
+
+    def _extract_loaded_counts(
+        self,
+        load_status_details: dict[str, Any] | None,
+        load_status_message: str | None,
+        trending_players: list[Any],
+    ) -> tuple[int, int]:
+        if load_status_details:
+            try:
+                parsed_games = int(load_status_details.get("games_loaded") or 0)
+            except (TypeError, ValueError):
+                parsed_games = 0
+            try:
+                parsed_players = int(
+                    load_status_details.get("players_loaded") or len(trending_players)
+                )
+            except (TypeError, ValueError):
+                parsed_players = len(trending_players)
+
+            return parsed_games, parsed_players
+
+        players_loaded = _first_value(
+            trending_players[0],
+            "players_loaded",
+            "loaded_players",
+            "player_count",
+            default=len(trending_players),
+        )
+        games_loaded = _first_value(
+            trending_players[0],
+            "games_loaded",
+            "loaded_games",
+            "game_count",
+            "games_count",
+            default=None,
+        )
+
+        if games_loaded is None and load_status_message:
+            games_match = re.search(
+                r"(\d+)\s+games?",
+                load_status_message,
+                flags=re.IGNORECASE,
+            )
+            if games_match is not None:
+                games_loaded = games_match.group(1)
+
+        if load_status_message:
+            players_match = re.search(
+                r"(\d+)\s+players?",
+                load_status_message,
+                flags=re.IGNORECASE,
+            )
+            if players_match is not None:
+                players_loaded = players_match.group(1)
+
+        try:
+            parsed_games = int(games_loaded) if games_loaded is not None else 0
+        except (TypeError, ValueError):
+            parsed_games = 0
+
+        try:
+            parsed_players = int(players_loaded)
+        except (TypeError, ValueError):
+            parsed_players = len(trending_players)
+
+        return parsed_games, parsed_players
+
     def render_trending_card(self, player: Any, source_label: str) -> str:
         details = _normalize_trending_player(player)
         badge = str(details["badge"])
+        player_id = str(details["player_id"])
+        title = escape(str(details["name"]))
+        if player_id:
+            title = f'<a href="/player?player_id={escape(player_id)}">{title}</a>'
+        explanation = str(details["why"])
+        if getattr(self, "explanation_mode", "adult") == "kids":
+            explanation = (
+                "SIP compared the newest games with the player's usual "
+                f"games. {explanation}"
+            )
         return dedent(
             f"""
             <article class="player-card">
                 <div>
-                    <h2>{escape(str(details["name"]))}</h2>
+                    <h2>{title}</h2>
                     <div class="team">{escape(str(details["team"]))}</div>
                 </div>
                 <div class="demo-label" style="margin-top: 0;">{escape(source_label)}</div>
@@ -510,9 +793,345 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
                     <div class="stat"><span>Previous-season average</span><span>{details["previous_season_average"]}</span></div>
                     <div class="stat"><span>Weighted two-season average</span><span>{details["weighted_two_season_average"]}</span></div>
                 </div>
-                <p class="why"><strong>Why SIP noticed him:</strong> {escape(str(details["why"]))}</p>
+                <p class="why"><strong>What SIP discovered:</strong> {escape(explanation)}</p>
                 <div class="refresh">Last refreshed: {escape(self._format_refresh_time(details["last_refreshed_at"]))}</div>
             </article>
+            """
+        )
+
+    def _render_data_health(self) -> str:
+        provider = self.data_health_provider
+        try:
+            health = provider()
+        except TypeError:
+            health = provider(self)
+        if not isinstance(health, dict):
+            return ""
+        missing = health.get("missing_datasets") or []
+        failures = len(health.get("failed_sources") or []) + len(
+            health.get("timed_out_sources") or []
+        )
+        missing_labels = (
+            ", ".join(
+                f"{item.get('league', '')} {item.get('season', '')} "
+                f"{item.get('competition', '')}".strip()
+                for item in missing
+                if isinstance(item, dict)
+            )
+            or "None"
+        )
+        source_issues = (
+            ", ".join(
+                [
+                    *[str(value) for value in health.get("failed_sources") or []],
+                    *[
+                        f"{value} timed out"
+                        for value in health.get("timed_out_sources") or []
+                    ],
+                ]
+            )
+            or "None"
+        )
+        loaded_count = int(health.get("loaded_datasets") or 0)
+        expected_count = loaded_count + len(missing)
+        readiness = (
+            "Complete enough for confident comparisons"
+            if health.get("confidence_ready")
+            else "Incomplete — conclusions are provisional"
+        )
+        sources = ", ".join(health.get("sources") or []) or "None"
+        return dedent(
+            f"""
+            <section aria-label="Data health" class="why" style="margin-top: 14px;">
+                <strong>Data health: {escape(readiness)}</strong>
+                <div class="health-grid">
+                    <div class="stat"><span>Datasets loaded</span><span>{loaded_count}</span></div>
+                    <div class="stat"><span>Missing datasets</span><span>{len(missing)}</span></div>
+                    <div class="stat"><span>Games / Players</span><span>{int(health.get("games") or 0)} / {int(health.get("players") or 0)}</span></div>
+                    <div class="stat"><span>Source failures</span><span>{failures}</span></div>
+                </div>
+                <progress value="{loaded_count}" max="{max(1, expected_count)}" style="width: 100%; margin-top: 10px;">{loaded_count}/{expected_count}</progress>
+                <p>Sources: {escape(sources)} · Last successful refresh: {escape(str(health.get("last_successful_refresh") or "Never"))}</p>
+                <p>Missing: {escape(missing_labels)}</p>
+                <p>Failed or timed-out sources: {escape(source_issues)}</p>
+            </section>
+            """
+        )
+
+    def _render_learning_summary(self) -> str:
+        provider = self.learning_summary_provider
+        try:
+            summary = provider()
+        except TypeError:
+            summary = provider(self)
+
+        if not isinstance(summary, dict):
+            return ""
+
+        evaluated = int(summary.get("evaluated_alerts") or 0)
+        if evaluated <= 0:
+            return ""
+
+        accuracy = float(summary.get("accuracy") or 0.0) * 100
+        avg_confidence = float(summary.get("avg_confidence") or 0.0) * 100
+        conf_error = float(summary.get("avg_confidence_error") or 0.0) * 100
+        calibration_error = float(summary.get("calibration_error") or 0.0)
+
+        recommendation = "No active recommendation."
+        updates = summary.get("hypothesis_updates") or []
+        if updates and isinstance(updates[0], dict):
+            recommendation = str(
+                updates[0].get("recommendation")
+                or updates[0].get("status")
+                or recommendation
+            )
+
+        top_knowledge = ""
+        knowledge = summary.get("reusable_knowledge") or []
+        if knowledge:
+            top_knowledge = str(knowledge[0])
+
+        return dedent(
+            f"""
+            <section aria-label="Learning intelligence" class="why" style="margin-top: 14px;">
+                <strong>Learning intelligence:</strong>
+                <div class="health-grid">
+                    <div class="stat"><span>Evaluated alerts</span><span>{evaluated}</span></div>
+                    <div class="stat"><span>Outcome accuracy</span><span>{accuracy:.0f}%</span></div>
+                    <div class="stat"><span>Avg confidence</span><span>{avg_confidence:.0f}%</span></div>
+                    <div class="stat"><span>Avg confidence error</span><span>{conf_error:.0f}%</span></div>
+                </div>
+                <p>Calibration error: {calibration_error:.3f}</p>
+                <p><a href="/calibration">View full calibration bucket details →</a></p>
+                <p>Top recommendation: {escape(recommendation)}</p>
+                <p>Top reusable insight: {escape(top_knowledge or "None yet")}</p>
+            </section>
+            """
+        )
+
+    def render_calibration_detail(self) -> str:
+        provider = getattr(
+            self,
+            "calibration_detail_provider",
+            default_calibration_detail_provider,
+        )
+        try:
+            calibration = provider()
+        except TypeError:
+            calibration = provider(self)
+        except Exception:
+            calibration = None
+
+        buckets = (
+            calibration.get("buckets")
+            or calibration.get("calibration_buckets")
+            or []
+            if isinstance(calibration, dict)
+            else []
+        )
+        bucket_rows = ""
+        for bucket in buckets:
+            if not isinstance(bucket, dict):
+                continue
+            predicted = _first_value(
+                bucket,
+                "predicted",
+                "avg_predicted_confidence",
+                default=0.0,
+            )
+            observed = _first_value(
+                bucket,
+                "observed",
+                "empirical_accuracy",
+                default=0.0,
+            )
+            error = _first_value(
+                bucket,
+                "error",
+                "calibration_error",
+                default=abs(float(predicted or 0.0) - float(observed or 0.0)),
+            )
+            details = _first_value(
+                bucket,
+                "details",
+                "description",
+                default="",
+            )
+            bucket_rows += dedent(
+                f"""
+                <tr>
+                    <td>{escape(str(bucket.get("range") or "Unlabelled"))}</td>
+                    <td>{escape(str(bucket.get("count") or 0))}</td>
+                    <td>{float(predicted or 0.0):.1%}</td>
+                    <td>{float(observed or 0.0):.1%}</td>
+                    <td>{float(error or 0.0):.3f}</td>
+                    <td>{escape(str(details))}</td>
+                </tr>
+                """
+            )
+
+        if bucket_rows:
+            overall_error = float(
+                _first_value(
+                    calibration,
+                    "calibration_error",
+                    "overall_calibration_error",
+                    default=0.0,
+                )
+                or 0.0
+            )
+            content = dedent(
+                f"""
+                <h1>Confidence calibration drill-down</h1>
+                <p class="summary">
+                    Overall calibration error: <strong>{overall_error:.3f}</strong>.
+                    Each bucket compares SIP's predicted confidence with what
+                    happened later.
+                </p>
+                <div class="table-shell">
+                    <table>
+                        <thead><tr><th>Confidence range</th><th>Count</th><th>Predicted</th><th>Observed</th><th>Error</th><th>Details</th></tr></thead>
+                        <tbody>{bucket_rows}</tbody>
+                    </table>
+                </div>
+                """
+            )
+        else:
+            content = dedent(
+                """
+                <h1>Confidence calibration drill-down</h1>
+                <div class="empty">
+                    <h2>No calibration buckets yet</h2>
+                    <p>SIP needs evaluated alerts before it can compare predicted confidence with real outcomes.</p>
+                </div>
+                """
+            )
+
+        return dedent(
+            f"""
+            <!doctype html><html lang="en"><head>
+            <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>SIP Calibration Details</title>
+            <style>
+            body{{font-family:Arial,sans-serif;margin:auto;max-width:1100px;padding:24px;background:#f7fbff;color:#1f2937}}
+            table{{width:100%;border-collapse:collapse;background:white}}td,th{{padding:12px;border-bottom:1px solid #ddd;text-align:left}}
+            .table-shell{{overflow-x:auto;border-radius:14px;border:1px solid #d7e3ef}}.summary,.empty{{padding:16px;background:#fff9e8;border-radius:14px}}
+            </style></head><body><a href="/">← Back to players</a>{content}</body></html>
+            """
+        )
+
+    def render_player_detail(self, player_id: str) -> str:
+        provider = self.player_detail_provider
+        try:
+            detail = provider(player_id)
+        except TypeError:
+            detail = provider(self, player_id)
+        if not detail:
+            content = (
+                "<h1>Player details are not available yet</h1>"
+                "<p>Load real game data, then try this player again.</p>"
+            )
+        else:
+            hypothesis = self._get_top_hypothesis(player_id, detail)
+            intelligence = detail.get("intelligence")
+            profiles = getattr(intelligence, "profiles", {})
+            comparisons = "".join(
+                f"<li>{escape(name)}: {profile.baseline.points:.1f} PPG, "
+                f"{profile.baseline.minutes:.1f} minutes, consistency "
+                f"{profile.volatility.consistency_score:.0f}/100</li>"
+                for name, profile in profiles.items()
+            )
+            history = "".join(
+                f"<tr><td>{escape(str(game.get('game_date') or ''))}</td>"
+                f"<td>{escape(str(game.get('team_abbreviation') or ''))}</td>"
+                f"<td>{escape(str(game.get('pts') or 0))}</td>"
+                f"<td>{escape(str(game.get('minutes') or 0))}</td></tr>"
+                for game in detail.get("games") or []
+            )
+            hypothesis_html = self._render_top_hypothesis(hypothesis)
+            content = dedent(
+                f"""
+                <h1>{escape(str(detail.get("player_name") or "Player"))}</h1>
+                <p class="why"><strong>SIP explanation:</strong> {escape(str(detail.get("explanation") or ""))}</p>
+                {hypothesis_html}
+                <h2>Current, previous, and three-season comparisons</h2>
+                <ul>{comparisons}</ul>
+                <h2>Game-by-game history and trend evidence</h2>
+                <table><tr><th>Date</th><th>Team</th><th>Points</th><th>Minutes</th></tr>{history}</table>
+                """
+            )
+        return dedent(
+            f"""
+            <!doctype html><html lang="en"><head>
+            <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>SIP Player Detail</title>
+            <style>body{{font-family:Arial,sans-serif;margin:auto;max-width:900px;padding:24px;background:#f7fbff}}table{{width:100%;border-collapse:collapse}}td,th{{padding:8px;border-bottom:1px solid #ddd;text-align:left}}.why{{padding:14px;background:#fff9e8;border-radius:14px}}</style>
+            </head><body><a href="/">← Back to players</a>{content}</body></html>
+            """
+        )
+
+    def _get_top_hypothesis(
+        self,
+        player_id: str,
+        detail: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        embedded = (
+            detail.get("top_hypothesis_update")
+            or detail.get("hypothesis_update")
+            or detail.get("top_hypothesis")
+        )
+        if isinstance(embedded, dict):
+            return embedded
+
+        provider = getattr(
+            self,
+            "top_hypothesis_provider",
+            default_top_hypothesis_provider,
+        )
+        try:
+            hypothesis = provider(player_id)
+        except TypeError:
+            hypothesis = provider(self, player_id)
+        except Exception:
+            return None
+        return hypothesis if isinstance(hypothesis, dict) else None
+
+    @staticmethod
+    def _render_top_hypothesis(hypothesis: dict[str, Any] | None) -> str:
+        if not hypothesis:
+            return ""
+
+        title = _first_value(
+            hypothesis,
+            "hypothesis",
+            "title",
+            default="Current player hypothesis",
+        )
+        status = _first_value(hypothesis, "status", default="pending")
+        support = _first_value(
+            hypothesis,
+            "support_rate",
+            "support",
+            default=None,
+        )
+        recommendation = _first_value(
+            hypothesis,
+            "recommendation",
+            default="Keep collecting evidence.",
+        )
+        if isinstance(support, (int, float)):
+            support_text = f"{float(support):.0%}"
+        else:
+            support_text = str(support) if support is not None else "Not measured yet"
+
+        return dedent(
+            f"""
+            <section class="why" aria-label="Top hypothesis update">
+                <h2 style="margin-top:0">Top Hypothesis update</h2>
+                <p><strong>{escape(str(title))}</strong></p>
+                <p>Status: {escape(str(status))} · Evidence support: {escape(support_text)}</p>
+                <p>Recommendation: {escape(str(recommendation))}</p>
+            </section>
             """
         )
 
@@ -565,9 +1184,67 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    runtime = NbaDemoRuntime()
-    live_handler = runtime.build_feature_ui_handler(FeatureUIHandler)
-    server = ThreadingHTTPServer(("0.0.0.0", 8000), live_handler)
+    runtime = BasketballDemoRuntime()
+
+    class ConfiguredFeatureUIHandler(FeatureUIHandler):
+        pass
+
+    ConfiguredFeatureUIHandler.trending_player_provider = staticmethod(
+        runtime.get_trending_players
+    )
+    ConfiguredFeatureUIHandler.historical_load_callback = staticmethod(
+        runtime.load_history
+    )
+    ConfiguredFeatureUIHandler.load_history_callback = staticmethod(
+        runtime.load_history
+    )
+    ConfiguredFeatureUIHandler.historical_load_status_provider = staticmethod(
+        runtime.get_load_status_message
+    )
+    ConfiguredFeatureUIHandler.historical_load_status_details_provider = staticmethod(
+        runtime.get_load_status_details
+    )
+    ConfiguredFeatureUIHandler.player_detail_provider = staticmethod(
+        getattr(
+            runtime,
+            "get_player_detail",
+            default_player_detail_provider,
+        )
+    )
+    ConfiguredFeatureUIHandler.data_health_provider = staticmethod(
+        getattr(
+            runtime,
+            "get_data_health",
+            default_data_health_provider,
+        )
+    )
+    ConfiguredFeatureUIHandler.learning_summary_provider = staticmethod(
+        getattr(
+            runtime,
+            "get_learning_summary",
+            default_learning_summary_provider,
+        )
+    )
+    ConfiguredFeatureUIHandler.calibration_detail_provider = staticmethod(
+        getattr(
+            runtime,
+            "get_calibration_details",
+            default_calibration_detail_provider,
+        )
+    )
+    ConfiguredFeatureUIHandler.top_hypothesis_provider = staticmethod(
+        getattr(
+            runtime,
+            "get_top_hypothesis_update",
+            default_top_hypothesis_provider,
+        )
+    )
+    ConfiguredFeatureUIHandler.refresh_callback = staticmethod(runtime.refresh)
+
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", 8000),
+        ConfiguredFeatureUIHandler,
+    )
     print("Serving at http://127.0.0.1:8000")
     server.serve_forever()
 
