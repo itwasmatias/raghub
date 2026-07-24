@@ -238,6 +238,32 @@ def test_build_feature_ui_handler_returns_configured_subclass():
     # These callbacks are class-level runtime bindings consumed by FeatureUIHandler.
     assert callable(configured.trending_player_provider)
     assert callable(configured.refresh_callback)
+    assert callable(configured.learning_summary_provider)
+
+
+def test_get_learning_summary_returns_default_zero_metrics(tmp_path: Path):
+    runtime = BasketballDemoRuntime(
+        current_season="2025-26",
+        previous_season="2024-25",
+        database_path=tmp_path / "learning_summary.db",
+        source=object(),
+        stats_repository=FakeStatsRepository(),
+        game_log_repository=FakeGameLogRepository(),
+        state_repository=object(),
+        refresh_service=FakeRefreshService(),
+        trending_service=FakeTrendingPlayerService(),
+    )
+
+    summary = runtime.get_learning_summary()
+
+    assert summary["evaluated_alerts"] == 0
+    assert summary["accuracy"] == 0.0
+    assert summary["avg_confidence"] == 0.0
+    assert summary["avg_confidence_error"] == 0.0
+    assert summary["calibration_error"] == 0.0
+    assert summary["calibration_buckets"] == []
+    assert summary["hypothesis_updates"] == []
+    assert summary["reusable_knowledge"] == []
 
 
 class FakeSource:

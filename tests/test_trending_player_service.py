@@ -54,6 +54,7 @@ def test_rank_calculates_rates_from_totals_and_latest_games(
     repository = SQLitePlayerStatsRepository(tmp_path / "stats.db")
     repository.save(season_stats("p1", "Player One", "2024-25", 10, 100))
     repository.save(season_stats("p1", "Player One", "2023-24", 30, 600))
+    repository.save(season_stats("p1", "Player One", "2022-23", 20, 240))
     logs = [
         game_log("p1", "2025-01-06", 20, "New Team"),
         game_log("p1", "2025-01-01", 1, "Old Team"),
@@ -75,9 +76,14 @@ def test_rank_calculates_rates_from_totals_and_latest_games(
     assert result.current_season_ppg == 10.0
     assert result.previous_season_ppg == 20.0
     assert result.weighted_two_season_ppg == 17.5
+    assert result.weighted_three_season_ppg == pytest.approx(15.6666666667)
     assert result.trend_score == pytest.approx(23.6)
     assert result.badge == "rising"
     assert result.explanation
+    assert result.playoff_ppg is None
+    assert result.playoff_delta_ppg is None
+    assert result.volatility_score is not None
+    assert result.consistency_score is not None
 
 
 def test_rank_orders_by_score_applies_badges_and_limit(
@@ -104,3 +110,37 @@ def test_rank_orders_by_score_applies_badges_and_limit(
     assert [item.badge for item in results] == ["rising", "stable"]
     assert results[0].previous_season_ppg is None
     assert results[0].weighted_two_season_ppg == 10.0
+
+
+def test_rank_includes_playoff_delta_volatility_and_consistency(
+    tmp_path: Path,
+) -> None:
+    repository = SQLitePlayerStatsRepository(tmp_path / "stats.db")
+    repository.save(season_stats("p1", "Player One", "2024-25", 5, 75))
+    logs = [
+        {
+            **game_log("p1", "2025-01-01", 10, "Team"),
+            "competition": "regular",
+        },
+        {
+            **game_log("p1", "2025-01-02", 30, "Team"),
+            "competition": "playoffs",
+        },
+        {
+            **game_log("p1", "2025-01-03", 20, "Team"),
+            "season_type": "Playoffs",
+        },
+    ]
+
+    result = TrendingPlayerService(repository).rank(
+        "2024-25",
+        "2023-24",
+        logs,
+    )[0]
+
+    assert result.playoff_ppg == pytest.approx(25.0)
+    assert result.playoff_delta_ppg == pytest.approx(10.0)
+    assert result.volatility_score is not None
+    assert result.volatility_score > 0
+    assert result.consistency_score is not None
+    assert 0 < result.consistency_score <= 100
