@@ -15,8 +15,14 @@ class SQLiteRefreshStateRepository:
         self.database_path = database_path
         self._create_table()
 
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path, timeout=30.0)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=30000")
+        return connection
+
     def _create_table(self) -> None:
-        with closing(sqlite3.connect(self.database_path)) as connection:
+        with closing(self._connect()) as connection:
             with connection:
                 connection.execute(
                     """
@@ -32,7 +38,7 @@ class SQLiteRefreshStateRepository:
         return state.last_processed_date if state is not None else None
 
     def get(self, season: str) -> RefreshState | None:
-        with closing(sqlite3.connect(self.database_path)) as connection:
+        with closing(self._connect()) as connection:
             cursor = connection.execute(
                 """
                 SELECT season, last_processed_date
@@ -51,7 +57,7 @@ class SQLiteRefreshStateRepository:
         )
 
     def save_last_processed_date(self, season: str, date: str) -> None:
-        with closing(sqlite3.connect(self.database_path)) as connection:
+        with closing(self._connect()) as connection:
             with connection:
                 connection.execute(
                     """

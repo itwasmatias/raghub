@@ -10,8 +10,14 @@ class SQLitePlayerStatsRepository:
         self.database_path = database_path
         self._create_table()
 
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path, timeout=30.0)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=30000")
+        return connection
+
     def _create_table(self) -> None:
-        with closing(sqlite3.connect(self.database_path)) as connection:
+        with closing(self._connect()) as connection:
             with connection:
                 connection.execute(
                     """
@@ -36,7 +42,7 @@ class SQLitePlayerStatsRepository:
                 )
 
     def save(self, stats: PlayerSeasonStats) -> None:
-        with closing(sqlite3.connect(self.database_path)) as connection:
+        with closing(self._connect()) as connection:
             with connection:
                 connection.execute(
                     """
@@ -96,7 +102,7 @@ class SQLitePlayerStatsRepository:
         player_id: str,
         season: str,
     ) -> PlayerSeasonStats | None:
-        with closing(sqlite3.connect(self.database_path)) as connection:
+        with closing(self._connect()) as connection:
             cursor = connection.execute(
                 """
                 SELECT
@@ -124,7 +130,7 @@ class SQLitePlayerStatsRepository:
         return self._from_row(row) if row is not None else None
 
     def list_by_season(self, season: str) -> list[PlayerSeasonStats]:
-        with closing(sqlite3.connect(self.database_path)) as connection:
+        with closing(self._connect()) as connection:
             cursor = connection.execute(
                 """
                 SELECT

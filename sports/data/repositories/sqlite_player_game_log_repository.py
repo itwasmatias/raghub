@@ -16,8 +16,14 @@ class SQLitePlayerGameLogRepository:
         self.database_path = database_path
         self._create_table()
 
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path, timeout=30.0)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=30000")
+        return connection
+
     def _create_table(self) -> None:
-        with closing(sqlite3.connect(self.database_path)) as connection:
+        with closing(self._connect()) as connection:
             with connection:
                 connection.execute(
                     """
@@ -61,7 +67,7 @@ class SQLitePlayerGameLogRepository:
         if not values:
             return
 
-        with closing(sqlite3.connect(self.database_path)) as connection:
+        with closing(self._connect()) as connection:
             with connection:
                 connection.executemany(
                     f"""
@@ -126,7 +132,7 @@ class SQLitePlayerGameLogRepository:
         query: str,
         parameters: tuple[str, ...],
     ) -> list[dict[str, Any]]:
-        with closing(sqlite3.connect(self.database_path)) as connection:
+        with closing(self._connect()) as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [self._from_row(row) for row in rows]
 
