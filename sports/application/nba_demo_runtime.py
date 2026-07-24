@@ -12,6 +12,9 @@ from typing import Any, Protocol
 import requests
 
 from sports.data.models.player_season_stats import PlayerSeasonStats
+from sports.data.repositories.sqlite_autonomy_repository import (
+    SQLiteAutonomyRepository,
+)
 from sports.data.repositories.sqlite_player_game_log_repository import (
     SQLitePlayerGameLogRepository,
 )
@@ -22,10 +25,25 @@ from sports.data.repositories.sqlite_refresh_state_repository import (
     SQLiteRefreshStateRepository,
 )
 from sports.data.services.nba_refresh_service import NbaRefreshService
+from sports.data.services.historical_basketball_loader import (
+    HistoricalBasketballLoader,
+)
 from sports.data.sources.nba_cdn_source import NbaCdnSource
 from sports.data.sources.espn_basketball_source import EspnBasketballSource
 from sports.data.sources.nba_stats_http_source import NbaStatsHttpSource
 from sports.intelligence.trending_player_service import TrendingPlayerService
+from sports.intelligence.autonomy_service import AutonomyService
+from sports.intelligence.data_health_service import DataHealthService
+from sports.intelligence.player_detail_service import PlayerDetailService
+from sports.intelligence.player_intelligence_service import (
+    PlayerIntelligenceService,
+)
+from sports.intelligence.learning_intelligence_service import (
+    LearningIntelligenceService,
+)
+from sports.intelligence.calibration_drilldown_service import (
+    CalibrationDrilldownService,
+)
 
 
 class PlayerGameLogSource(Protocol):
@@ -96,6 +114,7 @@ class BasketballDemoRuntime:
         state_repository: SQLiteRefreshStateRepository | None = None,
         refresh_service: NbaRefreshService | None = None,
         trending_service: TrendingPlayerService | None = None,
+        autonomy_repository: SQLiteAutonomyRepository | None = None,
     ) -> None:
         self.current_season = current_season or self._get_env_value(
             ["SIP_NBA_CURRENT_SEASON", "NBA_CURRENT_SEASON"],
@@ -155,6 +174,23 @@ class BasketballDemoRuntime:
         self.trending_service = trending_service or TrendingPlayerService(
             self.stats_repository
         )
+        self.player_intelligence_service = PlayerIntelligenceService()
+        self.player_detail_service = PlayerDetailService(
+            self.game_log_repository,
+            self.player_intelligence_service,
+        )
+        self.data_health_service = DataHealthService(
+            self.game_log_repository,
+            HistoricalBasketballLoader.DATASETS,
+        )
+        self.autonomy_repository = autonomy_repository or SQLiteAutonomyRepository(
+            self.database_path
+        )
+        self.autonomy_service = AutonomyService(self.autonomy_repository)
+        self.learning_service = LearningIntelligenceService(self.autonomy_repository)
+        self.calibration_drilldown_service = CalibrationDrilldownService(
+            self.autonomy_repository
+        )
         self.last_load_error_message: str | None = None
         self.last_load_status_message: str | None = None
         self.last_load_status_details: dict[str, Any] | None = None
@@ -172,7 +208,12 @@ class BasketballDemoRuntime:
             lambda: self.refresh_service.refresh_incremental(self.current_season)
         )
 
-    def get_trending_players(self, limit: int = 10) -> list[Any]:
+    def get_trending_players(
+        self,
+        limit: int = 10,
+        league: str | None = None,
+        competition: str | None = None,
+    ) -> list[Any]:
         try:
             game_logs = self._run_with_lock_retry(
                 lambda: self.game_log_repository.list_by_season(self.current_season)
@@ -187,6 +228,14 @@ class BasketballDemoRuntime:
 
         if not game_logs:
             return []
+        if league is not None:
+            game_logs = [row for row in game_logs if row.get("league") == league]
+        if competition is not None:
+            game_logs = [
+                row for row in game_logs if row.get("competition") == competition
+            ]
+        if not game_logs:
+            return []
 
         return self.trending_service.rank(
             current_season=self.current_season,
@@ -194,6 +243,200 @@ class BasketballDemoRuntime:
             game_logs=game_logs,
             limit=limit,
         )
+
+    def get_data_health(self) -> dict[str, Any]:
+        failed: list[str] = []
+        timed_out: list[str] = []
+        message = self.get_load_status_message() or ""
+        if self.last_load_error_message:
+            failed.append(self.last_load_error_message)
+        if "timed out" in message.lower():
+            timed_out.append("NBA Stats")
+        report = self.data_health_service.inspect(failed, timed_out)
+        return {
+            "confidence_ready": report.confidence_ready,
+            "loaded_datasets": len(report.loaded_datasets),
+            "missing_datasets": [
+                {
+                    "league": item.dataset.league,
+                    "competition": item.dataset.competition,
+                    "season": item.dataset.season,
+                }
+                for item in report.missing_datasets
+            ],
+            "games": report.games,
+            "players": report.players,
+            "sources": sorted(
+                {item.source for item in report.loaded_datasets if item.source}
+            ),
+            "last_successful_refresh": report.last_successful_refresh,
+            "failed_sources": failed,
+            "timed_out_sources": timed_out,
+        }
+
+    def get_player_detail(self, player_id: str) -> dict[str, Any] | None:
+        return self.player_detail_service.get(
+            player_id,
+            [
+                self._prior_season(self.previous_season),
+                self.previous_season,
+                self.current_season,
+            ],
+        )
+
+    def get_learning_summary(self) -> dict[str, Any]:
+        summary = self.learning_service.evaluate_past_alerts()
+        calibration = self.learning_service.calibrate_confidence(bucket_count=5)
+        updates = self.learning_service.propose_hypothesis_updates()
+        knowledge = self.learning_service.build_reusable_knowledge(limit=5)
+        return {
+            "evaluated_alerts": int(summary.get("evaluated_alerts") or 0),
+            "accuracy": float(summary.get("accuracy") or 0.0),
+            "avg_confidence": float(summary.get("avg_confidence") or 0.0),
+            "avg_confidence_error": float(summary.get("avg_confidence_error") or 0.0),
+            "calibration_error": self.learning_service.confidence_calibration_error(
+                bucket_count=5
+            ),
+            "calibration_buckets": [
+                {
+                    "range": f"{bucket.lower:.2f}-{bucket.upper:.2f}",
+                    "count": bucket.count,
+                    "predicted": bucket.avg_predicted_confidence,
+                    "observed": bucket.empirical_accuracy,
+                }
+                for bucket in calibration
+            ],
+            "hypothesis_updates": [
+                {
+                    "lifecycle_id": update.lifecycle_id,
+                    "hypothesis": update.hypothesis,
+                    "status": update.status,
+                    "support_rate": update.support_rate,
+                    "recommendation": update.recommendation,
+                }
+                for update in updates[:5]
+            ],
+            "reusable_knowledge": knowledge,
+        }
+
+    def get_reusable_knowledge(self, limit: int = 10) -> list[str]:
+        return self.learning_service.build_reusable_knowledge(limit=limit)
+
+    def get_calibration_details(
+        self,
+        bucket_count: int = 10,
+        bucket_index: int | None = None,
+    ) -> dict[str, Any]:
+        report = self.calibration_drilldown_service.build(
+            bucket_count=bucket_count,
+            bucket_index=bucket_index,
+        )
+        return {
+            "bucket_count": report.bucket_count,
+            "evaluated_alerts": report.evaluated_alerts,
+            "correct_alerts": report.correct_alerts,
+            "accuracy": report.accuracy,
+            "average_confidence": report.average_confidence,
+            "calibration_error": report.calibration_error,
+            "buckets": [
+                {
+                    "index": bucket.index,
+                    "range": f"{bucket.lower:.2f}-{bucket.upper:.2f}",
+                    "lower": bucket.lower,
+                    "upper": bucket.upper,
+                    "count": bucket.count,
+                    "correct_count": bucket.correct_count,
+                    "predicted": bucket.average_confidence,
+                    "observed": bucket.accuracy,
+                    "error": bucket.calibration_error,
+                    "alerts": [
+                        {
+                            "alert_id": alert.alert_id,
+                            "player_id": alert.player_id,
+                            "signal": alert.signal,
+                            "created_at": alert.created_at,
+                            "confidence": alert.confidence,
+                            "correct": alert.correct,
+                            "confidence_error": alert.confidence_error,
+                            "baseline_value": alert.baseline_value,
+                            "observed_value": alert.observed_value,
+                            "continued": alert.continued,
+                            "role_grew": alert.role_grew,
+                            "evaluated_at": alert.evaluated_at,
+                            "evidence": list(alert.evidence),
+                            "outcome_notes": alert.outcome_notes,
+                        }
+                        for alert in bucket.alerts
+                    ],
+                }
+                for bucket in report.buckets
+            ],
+        }
+
+    def get_top_hypothesis_update(
+        self,
+        player_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the strongest research update available for a detail view.
+
+        Research lifecycles are currently global, so ``player_id`` is accepted as
+        a forward-compatible filter but does not alter selection.
+        """
+        del player_id
+        updates = self.learning_service.propose_hypothesis_updates()
+        if not updates:
+            return None
+        priority = {"strengthen": 3, "revise": 2, "monitor": 1, "pending": 0}
+        update = max(
+            updates,
+            key=lambda item: (
+                priority.get(item.status, 0),
+                item.support_rate,
+                int(item.lifecycle_id or 0),
+            ),
+        )
+        return {
+            "lifecycle_id": update.lifecycle_id,
+            "hypothesis": update.hypothesis,
+            "status": update.status,
+            "support_rate": update.support_rate,
+            "recommendation": update.recommendation,
+        }
+
+    def add_watch(
+        self,
+        target_type: str,
+        target_value: str,
+        condition: str,
+    ):
+        return self.autonomy_service.add_watch(
+            target_type,
+            target_value,
+            condition,
+        )
+
+    def run_watchlists(self):
+        def candidates():
+            logs = self.game_log_repository.list_by_season(self.current_season)
+            player_ids = {
+                str(row["player_id"])
+                for row in logs
+                if row.get("player_id") is not None
+            }
+            profiles = [self.get_player_detail(player_id) for player_id in player_ids]
+            return [detail["intelligence"] for detail in profiles if detail is not None]
+
+        return self.autonomy_service.run_once(self.refresh, candidates)
+
+    @staticmethod
+    def _prior_season(season: str) -> str:
+        if "-" not in season:
+            try:
+                return str(int(season) - 1)
+            except ValueError:
+                return season
+        start, end = season.split("-", maxsplit=1)
+        return f"{int(start) - 1}-{int(end) - 1:02d}"
 
     def load_history(self) -> None:
         had_error = self.last_load_error_message is not None
@@ -474,6 +717,15 @@ class BasketballDemoRuntime:
         class LiveNbaFeatureUIHandler(base_handler_class):
             trending_player_provider = staticmethod(runtime.get_trending_players)
             refresh_callback = staticmethod(runtime.refresh)
+            player_detail_provider = staticmethod(runtime.get_player_detail)
+            data_health_provider = staticmethod(runtime.get_data_health)
+            learning_summary_provider = staticmethod(runtime.get_learning_summary)
+            calibration_detail_provider = staticmethod(
+                runtime.get_calibration_details
+            )
+            top_hypothesis_provider = staticmethod(
+                runtime.get_top_hypothesis_update
+            )
 
         LiveNbaFeatureUIHandler.__name__ = "LiveNbaFeatureUIHandler"
         return LiveNbaFeatureUIHandler

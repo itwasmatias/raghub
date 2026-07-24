@@ -13,3 +13,8 @@ class TrendingPlayer:
     trend_score: float
     badge: str
     explanation: str
+    weighted_three_season_ppg: float | None = None
+    playoff_ppg: float | None = None
+    playoff_delta_ppg: float | None = None
+    volatility_score: float | None = None
+    consistency_score: float | None = None

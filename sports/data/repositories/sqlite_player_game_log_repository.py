@@ -16,6 +16,14 @@ class SQLitePlayerGameLogRepository:
         self.database_path = database_path
         self._create_table()
 
+    _required_columns: dict[str, str] = {
+        "league": "TEXT NOT NULL DEFAULT ''",
+        "competition": "TEXT NOT NULL DEFAULT ''",
+        "season_type": "TEXT NOT NULL DEFAULT ''",
+        "source": "TEXT",
+        "loaded_at": "TEXT",
+    }
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=30.0)
         connection.execute("PRAGMA journal_mode=WAL")
@@ -58,6 +66,43 @@ class SQLitePlayerGameLogRepository:
                     )
                     """
                 )
+                self._ensure_legacy_columns(connection)
+                self._ensure_identity_index(connection)
+
+    def _ensure_legacy_columns(self, connection: sqlite3.Connection) -> None:
+        existing = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(player_game_logs)")
+        }
+        for column, definition in self._required_columns.items():
+            if column in existing:
+                continue
+            connection.execute(
+                f"ALTER TABLE player_game_logs ADD COLUMN {column} {definition}"
+            )
+
+    def _ensure_identity_index(self, connection: sqlite3.Connection) -> None:
+        index_sql = """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_player_game_logs_identity
+        ON player_game_logs (
+            league, competition, season, season_type, player_id, game_id
+        )
+        """
+        try:
+            connection.execute(index_sql)
+        except sqlite3.IntegrityError:
+            # Legacy tables can contain duplicate rows for the expanded identity.
+            connection.execute(
+                """
+                DELETE FROM player_game_logs
+                WHERE rowid NOT IN (
+                    SELECT MIN(rowid)
+                    FROM player_game_logs
+                    GROUP BY league, competition, season, season_type, player_id, game_id
+                )
+                """
+            )
+            connection.execute(index_sql)
 
     def save_many(
         self,
