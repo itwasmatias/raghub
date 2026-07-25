@@ -21,6 +21,17 @@ def test_web_ui_imports_in_fresh_interpreter():
     assert result.returncode == 0, result.stderr
 
 
+def test_app_imports_in_fresh_interpreter():
+    result = subprocess.run(
+        [sys.executable, "-c", "import app"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_production_runtime_is_not_a_demo_runtime():
     from sports.application.nba_demo_runtime import BasketballDemoRuntime
 

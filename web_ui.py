@@ -172,94 +172,6 @@ def default_betting_replay_provider() -> dict[str, Any] | None:
     return None
 
 
-def build_configured_feature_ui_handler(
-    runtime: ApplicationRuntime,
-) -> type[FeatureUIHandler]:
-    class ConfiguredFeatureUIHandler(FeatureUIHandler):
-        pass
-
-    ConfiguredFeatureUIHandler.trending_player_provider = staticmethod(
-        runtime.get_trending_players
-    )
-    ConfiguredFeatureUIHandler.historical_load_callback = staticmethod(
-        runtime.load_history
-    )
-    ConfiguredFeatureUIHandler.load_history_callback = staticmethod(
-        runtime.load_history
-    )
-    ConfiguredFeatureUIHandler.historical_load_status_provider = staticmethod(
-        runtime.get_load_status_message
-    )
-    ConfiguredFeatureUIHandler.historical_load_status_details_provider = staticmethod(
-        runtime.get_load_status_details
-    )
-    ConfiguredFeatureUIHandler.player_detail_provider = staticmethod(
-        getattr(runtime, "get_player_detail", default_player_detail_provider)
-    )
-    ConfiguredFeatureUIHandler.data_health_provider = staticmethod(
-        getattr(runtime, "get_data_health", default_data_health_provider)
-    )
-    ConfiguredFeatureUIHandler.learning_summary_provider = staticmethod(
-        getattr(runtime, "get_learning_summary", default_learning_summary_provider)
-    )
-    ConfiguredFeatureUIHandler.calibration_detail_provider = staticmethod(
-        getattr(runtime, "get_calibration_details", default_calibration_detail_provider)
-    )
-    ConfiguredFeatureUIHandler.top_hypothesis_provider = staticmethod(
-        getattr(runtime, "get_top_hypothesis_update", default_top_hypothesis_provider)
-    )
-    ConfiguredFeatureUIHandler.dashboard_snapshot_provider = staticmethod(
-        getattr(runtime, "get_dashboard_snapshot", default_dashboard_snapshot_provider)
-    )
-    ConfiguredFeatureUIHandler.betting_assessment_provider = staticmethod(
-        getattr(
-            runtime,
-            "get_betting_assessments",
-            default_betting_assessment_provider,
-        )
-    )
-    ConfiguredFeatureUIHandler.betting_board_provider = staticmethod(
-        getattr(
-            runtime,
-            "get_betting_board",
-            default_betting_board_provider,
-        )
-    )
-    ConfiguredFeatureUIHandler.betting_replay_provider = staticmethod(
-        getattr(
-            runtime,
-            "get_betting_replay_board",
-            default_betting_replay_provider,
-        )
-    )
-    ConfiguredFeatureUIHandler.refresh_callback = staticmethod(runtime.refresh)
-    return ConfiguredFeatureUIHandler
-
-
-def create_feature_ui_instance(
-    runtime: ApplicationRuntime,
-    *,
-    query_params: dict[str, Any] | None = None,
-) -> FeatureUIHandler:
-    handler_class = build_configured_feature_ui_handler(runtime)
-    handler = object.__new__(handler_class)
-    query_params = query_params or {}
-    handler.selected_league = str(query_params.get("league") or "")
-    handler.selected_competition = str(query_params.get("competition") or "")
-    handler.explanation_mode = str(query_params.get("mode") or "adult")
-    handler.research_query = str(query_params.get("research_q") or "").strip()
-    providers_value = query_params.get("providers") or ""
-    providers_text = (
-        ",".join(str(item) for item in providers_value)
-        if isinstance(providers_value, (list, tuple))
-        else str(providers_value)
-    )
-    handler.selected_research_providers = [
-        value.strip().lower() for value in providers_text.split(",") if value.strip()
-    ]
-    return handler
-
-
 class FeatureUIHandler(BaseHTTPRequestHandler):
     trending_player_provider = staticmethod(default_trending_player_provider)
     refresh_callback = staticmethod(default_refresh_callback)
@@ -2386,7 +2298,9 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
         )
         generated_at = str(board.get("generated_at") or "Not retrieved")
         source_health = dict(board.get("source_health") or {})
-        source_status = str(source_health.get("status") or board.get("status") or "unknown")
+        source_status = str(
+            source_health.get("status") or board.get("status") or "unknown"
+        )
         exclusions = list(board.get("exclusions") or [])
         exclusion_panel = (
             "<details class='diagnostics'><summary>Why markets were not ranked</summary>"
@@ -2506,9 +2420,7 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
         quote = self._betting_value(assessment, "best_quote")
         qualified = bool(self._betting_value(assessment, "qualified", False))
         probability_value = self._betting_value(prediction, "probability")
-        probability = (
-            float(probability_value) if probability_value is not None else 0.0
-        )
+        probability = float(probability_value) if probability_value is not None else 0.0
         probability_text = self._format_optional_percent(probability_value)
         consensus = self._betting_value(assessment, "consensus_probability")
         edge = self._betting_value(assessment, "probability_edge")
@@ -2519,9 +2431,7 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
         )
         interval = self._betting_value(assessment, "confidence_interval", (0.0, 0.0))
         agreement_value = self._betting_value(assessment, "model_agreement")
-        agreement = (
-            float(agreement_value) if agreement_value is not None else 0.0
-        )
+        agreement = float(agreement_value) if agreement_value is not None else 0.0
         interval_low = interval[0] if interval and len(interval) > 0 else None
         interval_high = interval[1] if interval and len(interval) > 1 else None
         interval_text = (
@@ -2565,13 +2475,9 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
             f"{int(best_price):+d}" if best_price is not None else "Unavailable"
         )
         market_probability = float(consensus or 0.0)
-        rank_label = (
-            f" · rank #{rank}" if rank is not None and qualified else ""
-        )
+        rank_label = f" · rank #{rank}" if rank is not None and qualified else ""
         replay_score = (
-            self._betting_value(ranking, "score")
-            if ranking is not None
-            else None
+            self._betting_value(ranking, "score") if ranking is not None else None
         )
 
         return dedent(
@@ -2791,6 +2697,94 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
         </body>
         </html>
         """
+
+
+def build_configured_feature_ui_handler(
+    runtime: ApplicationRuntime,
+) -> type[FeatureUIHandler]:
+    class ConfiguredFeatureUIHandler(FeatureUIHandler):
+        pass
+
+    ConfiguredFeatureUIHandler.trending_player_provider = staticmethod(
+        runtime.get_trending_players
+    )
+    ConfiguredFeatureUIHandler.historical_load_callback = staticmethod(
+        runtime.load_history
+    )
+    ConfiguredFeatureUIHandler.load_history_callback = staticmethod(
+        runtime.load_history
+    )
+    ConfiguredFeatureUIHandler.historical_load_status_provider = staticmethod(
+        runtime.get_load_status_message
+    )
+    ConfiguredFeatureUIHandler.historical_load_status_details_provider = staticmethod(
+        runtime.get_load_status_details
+    )
+    ConfiguredFeatureUIHandler.player_detail_provider = staticmethod(
+        getattr(runtime, "get_player_detail", default_player_detail_provider)
+    )
+    ConfiguredFeatureUIHandler.data_health_provider = staticmethod(
+        getattr(runtime, "get_data_health", default_data_health_provider)
+    )
+    ConfiguredFeatureUIHandler.learning_summary_provider = staticmethod(
+        getattr(runtime, "get_learning_summary", default_learning_summary_provider)
+    )
+    ConfiguredFeatureUIHandler.calibration_detail_provider = staticmethod(
+        getattr(runtime, "get_calibration_details", default_calibration_detail_provider)
+    )
+    ConfiguredFeatureUIHandler.top_hypothesis_provider = staticmethod(
+        getattr(runtime, "get_top_hypothesis_update", default_top_hypothesis_provider)
+    )
+    ConfiguredFeatureUIHandler.dashboard_snapshot_provider = staticmethod(
+        getattr(runtime, "get_dashboard_snapshot", default_dashboard_snapshot_provider)
+    )
+    ConfiguredFeatureUIHandler.betting_assessment_provider = staticmethod(
+        getattr(
+            runtime,
+            "get_betting_assessments",
+            default_betting_assessment_provider,
+        )
+    )
+    ConfiguredFeatureUIHandler.betting_board_provider = staticmethod(
+        getattr(
+            runtime,
+            "get_betting_board",
+            default_betting_board_provider,
+        )
+    )
+    ConfiguredFeatureUIHandler.betting_replay_provider = staticmethod(
+        getattr(
+            runtime,
+            "get_betting_replay_board",
+            default_betting_replay_provider,
+        )
+    )
+    ConfiguredFeatureUIHandler.refresh_callback = staticmethod(runtime.refresh)
+    return ConfiguredFeatureUIHandler
+
+
+def create_feature_ui_instance(
+    runtime: ApplicationRuntime,
+    *,
+    query_params: dict[str, Any] | None = None,
+) -> FeatureUIHandler:
+    handler_class = build_configured_feature_ui_handler(runtime)
+    handler = object.__new__(handler_class)
+    query_params = query_params or {}
+    handler.selected_league = str(query_params.get("league") or "")
+    handler.selected_competition = str(query_params.get("competition") or "")
+    handler.explanation_mode = str(query_params.get("mode") or "adult")
+    handler.research_query = str(query_params.get("research_q") or "").strip()
+    providers_value = query_params.get("providers") or ""
+    providers_text = (
+        ",".join(str(item) for item in providers_value)
+        if isinstance(providers_value, (list, tuple))
+        else str(providers_value)
+    )
+    handler.selected_research_providers = [
+        value.strip().lower() for value in providers_text.split(",") if value.strip()
+    ]
+    return handler
 
 
 def main() -> None:
