@@ -67,7 +67,7 @@ def test_main_wires_basketball_runtime_callbacks(monkeypatch):
     FakeRuntime.latest_instance = None
     FakeServer.latest = None
 
-    monkeypatch.setattr(web_ui, "BasketballDemoRuntime", FakeRuntime)
+    monkeypatch.setattr(web_ui, "build_production_runtime", FakeRuntime)
     monkeypatch.setattr(web_ui, "ThreadingHTTPServer", FakeServer)
 
     web_ui.main()

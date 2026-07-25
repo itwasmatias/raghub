@@ -59,6 +59,7 @@ def test_moneyline_source_loads_wnba_and_mlb_and_preserves_books():
     session = Session(payload())
     source = TheOddsApiMoneylineSource(
         api_key="secret",
+        sports=("basketball_wnba", "baseball_mlb"),
         session=session,
         clock=lambda: NOW,
     )

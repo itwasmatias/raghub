@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html import escape
@@ -11,13 +13,9 @@ from services.retrieve import RetrievalService
 from services.search import SearchService
 from sports.application.production_runtime import (
     ApplicationRuntime,
-    ProductionBasketballRuntime,
     build_production_runtime,
 )
 
-# Compatibility seam for existing launch wrappers and tests. Production paths
-# construct the runtime through build_production_runtime().
-BasketballDemoRuntime = ProductionBasketballRuntime
 from sports.features.builders.trend_builder import TrendFeatureBuilder
 from sports.features.facade import FeatureFacade
 from sports.features.registry import FeatureRegistry
@@ -2796,7 +2794,7 @@ class FeatureUIHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    runtime = BasketballDemoRuntime()
+    runtime = build_production_runtime()
     ConfiguredFeatureUIHandler = build_configured_feature_ui_handler(runtime)
 
     server = ThreadingHTTPServer(

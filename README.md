@@ -1,7 +1,8 @@
 # SIP v1.0.0 Personal Edition
 
-SIP is a local sports intelligence and discovery application for personal
-WNBA and MLB research. Version 1 supports **pregame, full-game moneylines**.
+SIP is a local sports intelligence and discovery application. NBA is the
+flagship league and Version 1 supports **pregame, full-game NBA moneylines**.
+WNBA and MLB remain optional league plugins.
 It compares real sportsbook observations with an exact-event calibrated
 forecast and returns either:
 
@@ -23,7 +24,7 @@ production spine:
 
 ```text
 The Odds API
-  -> WNBA / MLB event retrieval
+  -> NBA event retrieval (optional WNBA / MLB plugins)
   -> canonical event and team normalization
   -> complete per-book home/away moneyline pairing
   -> chronological baseline forecast
@@ -82,7 +83,8 @@ Available inspection endpoints include `/api/forecasts`,
 
 ## Supported scope
 
-- Leagues: WNBA and MLB
+- Flagship league: NBA
+- Optional league plugins: WNBA and MLB
 - Timing: pregame
 - Market: full-game moneyline
 - Sportsbooks: DraftKings, FanDuel, and BetMGM when returned by the configured provider
@@ -99,7 +101,7 @@ Requirements:
 
 - Fedora Linux with Python 3.11 or newer
 - Network access for live refreshes
-- A SportsGameOdds or The Odds API key for WNBA/MLB sportsbook data
+- A SportsGameOdds or The Odds API key with NBA sportsbook coverage
 
 ```bash
 cd /home/matias/raghub
@@ -127,7 +129,7 @@ ODDS_PROVIDER=sportsgameodds
 ODDS_API_KEY=
 ODDS_BASE_URL=https://api.sportsgameodds.com/v2
 ODDS_REGIONS=us
-ODDS_SPORTS=basketball_wnba,baseball_mlb
+ODDS_SPORTS=basketball_nba
 ODDS_MARKETS=h2h
 ODDS_REQUEST_TIMEOUT_SECONDS=15
 ODDS_MAX_EVENTS_PER_REQUEST=10
@@ -144,7 +146,7 @@ Obtain the credential from SportsGameOdds or The Odds API and place it only in
 your local `.env` as `ODDS_API_KEY`. Never commit `.env`; it is ignored.
 SportsGameOdds authentication uses the `x-api-key` header. The key is used only
 by the backend and is never returned to the browser or system-status APIs.
-Subscription coverage is reported independently for WNBA and MLB.
+Subscription coverage is reported independently for each configured league.
 
 ### Situation Room data credentials
 
@@ -196,18 +198,18 @@ The same operation is available through the dashboard’s **Refresh data and
 qualification** button. Provider timeout retries are bounded. A failed refresh
 records an unavailable/stale status and never inserts fixture data.
 
-## Train and evaluate the baseline models
+## Optional league-plugin model utilities
 
-Retrieve completed regular-season histories from the public WNBA scoreboard
-and MLB Stats API:
+The current history command supports only the optional WNBA and MLB plugins.
+It does not train an NBA production model. NBA history/model completion is
+deferred until a later recovery phase:
 
 ```bash
 make prepare-history
 ```
 
-SIP stores normalized source records in `data/training/`, computes each
-training feature using only games completed before the target game, and keeps
-WNBA and MLB separate. Train both league models:
+SIP stores those optional normalized source records in `data/training/` and
+keeps the leagues separate. Train the optional plugin models:
 
 ```bash
 make train-model
@@ -221,7 +223,7 @@ make evaluate-model
 
 Training sorts games chronologically, trains on the earlier 80% partition,
 fits Platt calibration only on the later 20% validation partition, and saves
-separate WNBA and MLB artifacts with:
+separate optional WNBA and MLB artifacts with:
 
 - training and validation periods
 - feature and model versions
@@ -233,8 +235,9 @@ Fewer than 50 usable chronological examples, fewer than 10 validation games,
 or a validation set without both outcomes returns
 `INSUFFICIENT_CALIBRATION_DATA`. A missing model returns
 `MODEL_NOT_TRAINED`. Neither state is labeled calibrated. Each odds refresh
-loads the matching league artifact and cached team history, creates forecasts
-for the exact canonical events, persists them, and then runs qualification.
+loads a matching artifact only when one genuinely exists. With no validated
+NBA artifact, NBA events return an explicit no-bet result instead of using a
+WNBA/MLB model or replay fixture.
 
 ## Start the application
 

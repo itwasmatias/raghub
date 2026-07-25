@@ -62,11 +62,15 @@ class PersonalEditionSettings:
         sports = tuple(
             item.strip().lower()
             for item in values.get(
-                "ODDS_SPORTS", "basketball_wnba,baseball_mlb"
+                "ODDS_SPORTS", "basketball_nba"
             ).split(",")
             if item.strip()
         )
-        unsupported = set(sports) - {"basketball_wnba", "baseball_mlb"}
+        unsupported = set(sports) - {
+            "basketball_nba",
+            "basketball_wnba",
+            "baseball_mlb",
+        }
         if unsupported:
             raise ValueError(
                 f"ODDS_SPORTS contains unsupported values: {', '.join(sorted(unsupported))}"

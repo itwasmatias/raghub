@@ -16,7 +16,7 @@ class SportsGameOddsMoneylineSource:
     name = "sports-game-odds"
     default_base_url = "https://api.sportsgameodds.com/v2"
     supported_books = ("draftkings", "fanduel", "betmgm")
-    supported_leagues = ("WNBA", "MLB")
+    supported_leagues = ("NBA", "WNBA", "MLB")
     moneyline_ids = {
         "home": "points-home-game-ml-home",
         "away": "points-away-game-ml-away",
@@ -61,7 +61,7 @@ class SportsGameOddsMoneylineSource:
         response = self.session.get(
             self.base_url,
             headers={"x-api-key": self.api_key, "Accept": "application/json"},
-            params={"leagueID": "MLB", "oddsAvailable": "true", "limit": 1},
+            params={"leagueID": self.leagues[0], "oddsAvailable": "true", "limit": 1},
             timeout=self.timeout,
         )
         response.raise_for_status()

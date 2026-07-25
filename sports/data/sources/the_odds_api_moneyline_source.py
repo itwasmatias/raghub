@@ -11,7 +11,7 @@ LOGGER = logging.getLogger("sip.odds")
 
 
 class TheOddsApiMoneylineSource:
-    """The Odds API adapter for WNBA and MLB pregame full-game moneylines."""
+    """The Odds API adapter for NBA, WNBA, and MLB full-game moneylines."""
 
     name = "the-odds-api"
     base_url = "https://api.the-odds-api.com/v4/sports"
@@ -21,7 +21,7 @@ class TheOddsApiMoneylineSource:
         self,
         *,
         api_key: str,
-        sports: tuple[str, ...] = ("basketball_wnba", "baseball_mlb"),
+        sports: tuple[str, ...] = ("basketball_nba",),
         regions: str = "us",
         session: Any | None = None,
         timeout: float = 20,
@@ -77,7 +77,13 @@ class TheOddsApiMoneylineSource:
     def _normalize_payload(
         self, sport: str, events: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        league = "WNBA" if sport == "basketball_wnba" else "MLB"
+        league = {
+            "basketball_nba": "NBA",
+            "basketball_wnba": "WNBA",
+            "baseball_mlb": "MLB",
+        }.get(sport)
+        if league is None:
+            raise ValueError(f"unsupported odds sport: {sport}")
         now = self.clock().astimezone(timezone.utc).isoformat()
         rows = []
         for event in events:

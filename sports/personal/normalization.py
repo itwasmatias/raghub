@@ -15,6 +15,8 @@ from sports.personal.models import (
 
 class MoneylineNormalizer:
     LEAGUES = {
+        "nba": "NBA",
+        "basketball_nba": "NBA",
         "wnba": "WNBA",
         "basketball_wnba": "WNBA",
         "mlb": "MLB",

@@ -68,10 +68,12 @@ class PersonalEditionService:
             and settings.odds_api_key
         ):
             if settings.odds_provider == "sportsgameodds":
-                leagues = tuple(
-                    "WNBA" if sport == "basketball_wnba" else "MLB"
-                    for sport in settings.odds_sports
-                )
+                league_names = {
+                    "basketball_nba": "NBA",
+                    "basketball_wnba": "WNBA",
+                    "baseball_mlb": "MLB",
+                }
+                leagues = tuple(league_names[sport] for sport in settings.odds_sports)
                 self.source = SportsGameOddsMoneylineSource(
                     api_key=settings.odds_api_key,
                     leagues=leagues,
@@ -352,7 +354,7 @@ class PersonalEditionService:
         evaluations = self.repository.latest_evaluations()
         forecasts = self.repository.list_forecasts()
         league_models = {}
-        for league in ("WNBA", "MLB"):
+        for league in ("NBA", "WNBA", "MLB"):
             try:
                 model = BaselineMoneylineModel.load(
                     self.model_path_for_league(league)
@@ -402,7 +404,7 @@ class PersonalEditionService:
             item for item in evaluations if not item["qualified"]
         ]
         league_summary = {}
-        for league in ("MLB", "WNBA"):
+        for league in ("NBA", "WNBA", "MLB"):
             prefix = f"{league.lower()}:"
             league_evaluations = [
                 item
@@ -469,7 +471,7 @@ class PersonalEditionService:
             "version": "1.0.0",
             "edition": "Personal Edition",
             "mode": self.settings.mode.value,
-            "supported_leagues": ["WNBA", "MLB"],
+            "supported_leagues": ["NBA", "WNBA", "MLB"],
             "supported_market": "pregame full-game moneyline",
             "feed": asdict(health),
             "model": model_status,
@@ -488,7 +490,7 @@ class PersonalEditionService:
             "scheduler": self.scheduler.status(),
             "research": {
                 "player_intelligence_route": "/player",
-                "availability": "Existing WNBA player intelligence is retained; MLB player research requires a configured statistics provider.",
+                "availability": "NBA player intelligence is the primary research path; WNBA and MLB remain optional plugins.",
             },
             "generated_at": now.isoformat(),
         }
@@ -619,7 +621,7 @@ class PersonalEditionService:
             "provider": self.settings.odds_provider,
             "generated_at": now.isoformat(),
             "message": (
-                f"{len(assessments)} canonical WNBA/MLB moneyline assessment(s); "
+                f"{len(assessments)} canonical NBA/WNBA/MLB moneyline assessment(s); "
                 f"model status: {model_status}."
                 if assessments
                 else feed.get("error")

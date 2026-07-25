@@ -36,7 +36,7 @@ def test_personal_dashboard_and_core_apis_have_honest_empty_states(tmp_path):
 
     assert dashboard.status_code == 200
     assert b"SIP v1.0" in dashboard.data
-    assert b"WNBA & MLB" in dashboard.data
+    assert b"NBA flagship" in dashboard.data
     assert b"No genuine upcoming events are stored" in dashboard.data
     assert games.get_json() == {"events": []}
     assert choices.get_json() == {
@@ -47,12 +47,12 @@ def test_personal_dashboard_and_core_apis_have_honest_empty_states(tmp_path):
     assert status.get_json()["model"]["status"] == "MODEL_NOT_TRAINED"
     assert dashboard.headers["Cache-Control"] == "no-store, max-age=0"
     assert dashboard.headers["X-SIP-Frontend-Version"]
-    assert b"MLB Moneyline Command Center" in dashboard.data
-    assert b'data-league-filter="MLB"' in dashboard.data
-    assert b'MLB model' in dashboard.data
-    assert b"Starting pitcher and confirmed lineup context" in dashboard.data
+    assert b"NBA Moneyline Command Center" in dashboard.data
+    assert b'data-league-filter="NBA"' in dashboard.data
+    assert b'NBA model' in dashboard.data
+    assert b"preserves the no-bet result instead of guessing" in dashboard.data
     summary = client.get("/api/sip/dashboard").get_json()["league_summary"]
-    assert summary["MLB"] == {
+    assert summary["NBA"] == {
         "upcoming_events": 0,
         "evaluations": 0,
         "qualified_choices": 0,

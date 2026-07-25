@@ -110,7 +110,8 @@ task to a user-owned log directory.
   remain inspectable but the normal SIP freshness gate decides whether they
   may qualify.
 
-The initial allow-listed cross-computer operation is
-`RUN_HEAVY_FEATURE_PIPELINE`. Additional training, calibration, and forecast
-handlers must validate their structured input and output schemas before being
+The only allow-listed cross-computer operation is the experimental
+`RUN_HEAVY_FEATURE_PIPELINE` summary-statistics scaffold. It is not distributed
+model training or forecasting. Additional jobs belong to a later recovery
+phase and must validate their structured input and output schemas before being
 enabled.
