@@ -1,9 +1,10 @@
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
-from math import sqrt
+from math import sqrt, tanh
 from typing import Any
 
 from sports.intelligence.models.player_intelligence import (
+    AdvancedPlayerFeatures,
     CompetitionProfile,
     PlayerIntelligence,
     RoleChangeProfile,
@@ -67,6 +68,7 @@ class PlayerIntelligenceService:
                 or rows[-1].get("team_abbreviation")
                 or ""
             ),
+            qualitative_evidence=self._qualitative_evidence(rows),
         )
 
     def _profile(
@@ -95,10 +97,148 @@ class PlayerIntelligenceService:
             baseline=self._averages(ordered),
             current=self._averages(current_rows),
             previous=self._averages(previous_rows) if previous_rows else None,
+            recent_three=self._averages(ordered[-3:]),
             recent_five=self._averages(ordered[-5:]),
             recent_ten=self._averages(ordered[-10:]),
+            splits=self._splits(ordered),
+            advanced=self._advanced(ordered),
             volatility=self._volatility(ordered),
             role_change=self._role_change(ordered),
+        )
+
+    @classmethod
+    def _splits(
+        cls, rows: list[Mapping[str, Any]]
+    ) -> dict[str, WeightedAverages]:
+        groups: dict[str, list[Mapping[str, Any]]] = {
+            "home": [row for row in rows if bool(row.get("home"))],
+            "away": [row for row in rows if not bool(row.get("home"))],
+            "starter": [row for row in rows if bool(row.get("starter"))],
+            "bench": [row for row in rows if not bool(row.get("starter"))],
+            "wins": [row for row in rows if bool(row.get("win"))],
+            "losses": [row for row in rows if not bool(row.get("win"))],
+            "rest_0_days": [
+                row for row in rows if cls._number(row.get("rest_days")) == 0
+            ],
+            "rest_1_day": [
+                row for row in rows if cls._number(row.get("rest_days")) == 1
+            ],
+            "rest_2_plus_days": [
+                row for row in rows if cls._number(row.get("rest_days")) >= 2
+            ],
+        }
+        opponents = {
+            str(row.get("opponent_id"))
+            for row in rows
+            if row.get("opponent_id") not in (None, "")
+        }
+        for opponent in opponents:
+            groups[f"opponent:{opponent}"] = [
+                row for row in rows if str(row.get("opponent_id")) == opponent
+            ]
+        return {name: cls._averages(values) for name, values in groups.items()}
+
+    @classmethod
+    def _advanced(
+        cls, rows: list[Mapping[str, Any]]
+    ) -> AdvancedPlayerFeatures:
+        baseline = cls._averages(rows)
+        recent_three = cls._averages(rows[-3:])
+        recent_five = cls._averages(rows[-5:])
+        totals = {
+            key: sum(cls._number(row.get(key)) for row in rows)
+            for key in (
+                "pts",
+                "fgm",
+                "fga",
+                "fg3m",
+                "fta",
+                "turnovers",
+                "team_field_goal_attempts",
+                "team_free_throw_attempts",
+                "team_turnovers",
+            )
+        }
+        effective = (
+            (totals["fgm"] + 0.5 * totals["fg3m"]) / totals["fga"]
+            if totals["fga"]
+            else 0.0
+        )
+        true_shooting_denominator = 2 * (
+            totals["fga"] + 0.44 * totals["fta"]
+        )
+        true_shooting = (
+            totals["pts"] / true_shooting_denominator
+            if true_shooting_denominator
+            else 0.0
+        )
+        player_possessions = (
+            totals["fga"] + 0.44 * totals["fta"] + totals["turnovers"]
+        )
+        team_possessions = (
+            totals["team_field_goal_attempts"]
+            + 0.44 * totals["team_free_throw_attempts"]
+            + totals["team_turnovers"]
+        )
+        usage = player_possessions / team_possessions if team_possessions else 0.0
+        points = [cls._number(row.get("pts")) for row in rows]
+        ewma = points[0] if points else 0.0
+        for value in points[1:]:
+            ewma = 0.4 * value + 0.6 * ewma
+        volatility = cls._volatility(rows)
+        trend_delta = recent_three.points - baseline.points
+        normalized_trend = 0.5 + 0.5 * tanh(
+            trend_delta / (volatility.standard_deviation + 1.0)
+        )
+        minutes_trend = recent_three.minutes - baseline.minutes
+        recent_attempts = cls._mean(rows[-3:], "fga")
+        baseline_attempts = cls._mean(rows, "fga")
+        shot_trend = recent_attempts - baseline_attempts
+        expected_minutes = 0.6 * recent_three.minutes + 0.4 * recent_five.minutes
+        expected_usage = max(0.0, usage + max(0.0, shot_trend) / 100)
+        role_stability = max(
+            0.0,
+            min(1.0, volatility.consistency_score / 100),
+        )
+        replacement = max(
+            0.0,
+            min(
+                1.0,
+                0.5 * max(0.0, minutes_trend) / 10
+                + 0.3 * max(0.0, shot_trend) / 5
+                + 0.2 * role_stability,
+            ),
+        )
+        bench_rows = [row for row in rows if not bool(row.get("starter"))]
+        bench_success = sum(
+            cls._number(row.get("minutes")) < 24
+            and cls._number(row.get("pts")) >= 10
+            for row in bench_rows
+        )
+        bench_score = bench_success / len(bench_rows) if bench_rows else 0.0
+        total_minutes = sum(cls._number(row.get("minutes")) for row in rows)
+        return AdvancedPlayerFeatures(
+            ewma_points=ewma,
+            normalized_trend_score=max(0.0, min(1.0, normalized_trend)),
+            effective_field_goal_percentage=effective,
+            true_shooting_percentage=true_shooting,
+            usage_rate=usage,
+            minutes_trend=minutes_trend,
+            shot_volume_trend=shot_trend,
+            assist_opportunity=recent_three.assists - baseline.assists,
+            rebound_opportunity=recent_three.rebounds - baseline.rebounds,
+            turnover_pressure=(
+                totals["turnovers"] / total_minutes if total_minutes else 0.0
+            ),
+            opponent_defensive_adjustment=cls._mean_optional(
+                rows, "opponent_defensive_adjustment", 1.0
+            ),
+            pace_adjustment=cls._mean_optional(rows, "pace_adjustment", 1.0),
+            role_stability=role_stability,
+            expected_minutes=expected_minutes,
+            expected_usage=expected_usage,
+            replacement_opportunity=replacement,
+            bench_opportunity_score=bench_score,
         )
 
     @classmethod
@@ -205,7 +345,50 @@ class PlayerIntelligenceService:
 
     @classmethod
     def _mean(cls, rows: list[Mapping[str, Any]], key: str) -> float:
+        if not rows:
+            return 0.0
         return sum(cls._number(row.get(key)) for row in rows) / len(rows)
+
+    @classmethod
+    def _mean_optional(
+        cls,
+        rows: list[Mapping[str, Any]],
+        key: str,
+        neutral: float,
+    ) -> float:
+        values = [
+            cls._number(row.get(key))
+            for row in rows
+            if row.get(key) not in (None, "")
+        ]
+        return sum(values) / len(values) if values else neutral
+
+    @staticmethod
+    def _qualitative_evidence(
+        rows: list[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        evidence = []
+        seen = set()
+        for row in rows:
+            claim = str(row.get("qualitative_context") or "").strip()
+            source = str(row.get("qualitative_source") or "").strip()
+            url = str(row.get("qualitative_url") or "").strip()
+            if not claim or not source or not url:
+                continue
+            key = (claim, source, url)
+            if key in seen:
+                continue
+            seen.add(key)
+            evidence.append(
+                {
+                    "claim": claim,
+                    "source": source,
+                    "url": url,
+                    "evidence_type": "qualitative",
+                    "confirmed_statistical_fact": False,
+                }
+            )
+        return evidence
 
     @staticmethod
     def _tail_streak(

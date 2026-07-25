@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from connectors.pgvector.connector import PgVectorConnector
 from models.retrieval_result import RetrievalResult
@@ -32,8 +33,25 @@ class RetrievalServiceTests(unittest.TestCase):
         self.assertAlmostEqual(normalized[0].score, 0.58)
 
     def test_wikipedia_provider_normalizes_results(self):
-        provider = WikipediaProvider()
-        results = provider.retrieve("raghub", limit=2)
+        class FakeWikipediaConnector:
+            def retrieve(self, query, limit=10):
+                self.query = query
+                self.limit = limit
+                return [
+                    RetrievalResult(
+                        document_id="raghub",
+                        chunk_index=0,
+                        content="RAGHub retrieval fixture",
+                        score=0.8,
+                        metadata={"provider": "wikipedia"},
+                    )
+                ]
+
+        with patch(
+            "services.providers_wikipedia.WikipediaConnector",
+            FakeWikipediaConnector,
+        ):
+            results = WikipediaProvider().retrieve("raghub", limit=2)
 
         self.assertTrue(results)
         self.assertIsInstance(results[0], RetrievalResult)

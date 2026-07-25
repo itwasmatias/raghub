@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,14 +37,38 @@ class RoleChangeProfile:
 
 
 @dataclass(frozen=True, slots=True)
+class AdvancedPlayerFeatures:
+    ewma_points: float
+    normalized_trend_score: float
+    effective_field_goal_percentage: float
+    true_shooting_percentage: float
+    usage_rate: float
+    minutes_trend: float
+    shot_volume_trend: float
+    assist_opportunity: float
+    rebound_opportunity: float
+    turnover_pressure: float
+    opponent_defensive_adjustment: float
+    pace_adjustment: float
+    role_stability: float
+    expected_minutes: float
+    expected_usage: float
+    replacement_opportunity: float
+    bench_opportunity_score: float
+
+
+@dataclass(frozen=True, slots=True)
 class CompetitionProfile:
     league: str
     competition: str
     baseline: WeightedAverages
     current: WeightedAverages
     previous: WeightedAverages | None
+    recent_three: WeightedAverages
     recent_five: WeightedAverages
     recent_ten: WeightedAverages
+    splits: dict[str, WeightedAverages]
+    advanced: AdvancedPlayerFeatures
     volatility: VolatilityProfile
     role_change: RoleChangeProfile
 
@@ -57,3 +82,4 @@ class PlayerIntelligence:
     explanation: str
     evidence: list[str]
     latest_team: str = ""
+    qualitative_evidence: list[dict[str, Any]] = field(default_factory=list)

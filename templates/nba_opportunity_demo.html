@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>RAGHub NBA Opportunity Replay</title>
+    <style>
+        :root { color-scheme: light; --ink:#14213d; --muted:#5c667a; --paper:#f5f1e8; --card:#fffdf8; --accent:#0d6b70; --line:#d8d0c2; }
+        * { box-sizing:border-box; }
+        body { margin:0; background:var(--paper); color:var(--ink); font:16px/1.45 system-ui,sans-serif; }
+        main { width:min(1180px,94vw); margin:auto; padding:1.25rem 0 3rem; }
+        header,.card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:1rem 1.2rem; }
+        header { display:flex; justify-content:space-between; gap:1rem; align-items:start; }
+        h1,h2,h3,p { margin-top:0; }
+        h1 { font-size:clamp(1.7rem,3vw,2.4rem); margin-bottom:.35rem; }
+        h2 { font-size:1.15rem; }
+        .label { display:inline-block; padding:.3rem .55rem; border-radius:999px; background:#fff0c2; font-weight:800; font-size:.75rem; letter-spacing:.05em; }
+        .grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.8rem; margin-top:.8rem; }
+        .wide { grid-column:span 2; }
+        .metric { font-size:1.5rem; font-weight:800; color:var(--accent); }
+        .muted { color:var(--muted); }
+        ol.timeline { padding-left:1.4rem; }
+        .timeline li { margin:.55rem 0; }
+        table { width:100%; border-collapse:collapse; }
+        th,td { padding:.5rem; text-align:left; border-bottom:1px solid var(--line); }
+        @media (max-width:800px) { .grid { grid-template-columns:1fr; } .wide { grid-column:auto; } header { display:block; } }
+    </style>
+</head>
+<body>
+<main>
+    <header>
+        <div>
+            <span class="label">HISTORICAL REPLAY</span>
+            <h1>NBA Player Opportunity Intelligence</h1>
+            <p>{{ demo.scenario_notice }}</p>
+        </div>
+        <a href="/">Return to Command Center</a>
+    </header>
+
+    <section class="grid">
+        <article class="card wide">
+            <h2>Executive assessment</h2>
+            <h3>{{ demo.situation.title }}</h3>
+            <p>{{ demo.situation.intelligence_objective }}</p>
+            <p><strong>Current stage:</strong> {{ demo.situation.current_stage|title }}</p>
+        </article>
+        <article class="card">
+            <h2>Opportunity ranking</h2>
+            <div class="metric">#{{ demo.ranking.rank }} · {{ demo.ranking.score }}</div>
+            <p class="muted">Evidence-weighted score, not a profit guarantee.</p>
+        </article>
+        <article class="card">
+            <h2>Forecast</h2>
+            <div class="metric">{{ (demo.situation.forecasts[0].probability * 100)|round|int }}%</div>
+            <p>{{ demo.situation.forecasts[0].predicted_event }}</p>
+        </article>
+        <article class="card">
+            <h2>Sportsbooks compared</h2>
+            <p>{{ demo.sportsbooks|join(", ") }}</p>
+            <p><strong>Best available:</strong> {{ demo.assessment.best_sportsbook }}</p>
+        </article>
+        <article class="card">
+            <h2>Final outcome</h2>
+            <div class="metric">{{ demo.situation.final_outcome.actual_points }} points</div>
+            <p>{{ demo.situation.final_outcome.notes }}</p>
+        </article>
+        <article class="card wide">
+            <h2>Why it ranked</h2>
+            <ul>{% for item in demo.ranking.explanation %}<li>{{ item }}</li>{% endfor %}</ul>
+            <h3>Risks</h3>
+            <ul>{% for item in demo.ranking.risks %}<li>{{ item }}</li>{% endfor %}</ul>
+        </article>
+        <article class="card">
+            <h2>What RAGHub learned</h2>
+            <p>{{ demo.situation.lessons_learned[0] }}</p>
+            <p class="muted">Brier score: {{ demo.forecast_evaluation.brier_score|round(3) }}</p>
+        </article>
+        <article class="card wide">
+            <h2>Observe → Retrieve → Analyze → Forecast → Monitor → Learn</h2>
+            <ol class="timeline">
+                {% for event in demo.reasoning_trace %}
+                <li><strong>{{ event.stage|title }}</strong> — {{ event.description }} <span class="muted">{{ event.occurred_at }}</span></li>
+                {% endfor %}
+            </ol>
+        </article>
+        <article class="card">
+            <h2>Evidence trace</h2>
+            <p>{{ demo.claim_graph.nodes|length }} nodes · {{ demo.claim_graph.edges|length }} relationships</p>
+            <p class="muted">Every recommendation is connected backward through forecast, hypothesis, claim, evidence, and source.</p>
+        </article>
+    </section>
+</main>
+</body>
+</html>

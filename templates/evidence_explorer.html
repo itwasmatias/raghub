@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>RAGHub Evidence Explorer</title>
+    <link rel="stylesheet" href="/static/situation_room_app.css">
+</head>
+<body>
+<main class="app" id="evidenceExplorer" data-focus="{{ focus }}" data-query="{{ query }}">
+    <header class="topbar">
+        <div>
+            <p class="eyebrow">Supporting infrastructure</p>
+            <h1>Evidence Explorer</h1>
+            <p class="subtitle">Inspect source, evidence, claim, entity, and forecast relationships. Zero-value nodes are hidden by default.</p>
+        </div>
+        <a class="ghost-button" href="/situation-room">Back to Situation Room</a>
+    </header>
+    <section class="panel">
+        <div class="control-grid">
+            <label>Search graph<input id="nodeFilterInput" placeholder="FRED, inflation, company"></label>
+            <button type="button" id="graphReloadButton">Refresh evidence graph</button>
+        </div>
+        <p id="graphStats" class="muted">Loading graph…</p>
+    </section>
+    <section class="workspace-grid">
+        <article class="panel"><h2>Nodes</h2><div id="nodeList" class="node-list"></div></article>
+        <article class="panel"><h2>Relationships</h2><div id="edgeList" class="edge-list"></div></article>
+    </section>
+</main>
+<script src="/static/evidence_explorer.js"></script>
+</body>
+</html>

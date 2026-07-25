@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>RAGHub Situation Room</title>
+    <link rel="stylesheet" href="/static/situation_room_app.css">
+</head>
+<body>
+<main class="app" id="appRoot" data-focus="{{ focus }}" data-query="{{ query }}">
+    <header class="topbar">
+        <div>
+            <p class="eyebrow">Decision workspace</p>
+            <h1>RAGHub Situation Room</h1>
+            <p class="subtitle">What changed, why it matters, what the evidence says, and what is likely to happen next.</p>
+        </div>
+        <nav class="topbar-actions" aria-label="Situation Room navigation">
+            <a class="ghost-button" href="/">Sports Dashboard</a>
+            <a class="ghost-button" href="/situation-room/evidence">Evidence Explorer</a>
+        </nav>
+    </header>
+
+    <section class="controls panel">
+        <form id="controlForm" class="control-grid">
+            <label>Focus
+                <select id="focusSelect" name="focus">
+                    <option value="global">Global</option>
+                    <option value="macro">Macro</option>
+                    <option value="policy">Policy</option>
+                    <option value="corporate">Corporate</option>
+                    <option value="supply-chain">Supply Chain</option>
+                </select>
+            </label>
+            <label>Question or entity
+                <input id="queryInput" name="query" placeholder="inflation, tariffs, semiconductor policy">
+            </label>
+            <label>Auto refresh
+                <select id="refreshSelect" name="refresh">
+                    <option value="off">Off</option>
+                    <option value="60">Every minute</option>
+                    <option value="300">Every five minutes</option>
+                </select>
+            </label>
+            <div class="control-buttons"><button type="submit">Run verified scan</button></div>
+        </form>
+        <p id="statusLine" class="status-line">Loading verified records…</p>
+    </section>
+
+    <section class="panel intelligence-brief" id="intelligenceBriefSection">
+        <div class="section-heading">
+            <div><p class="eyebrow">1 · What changed</p><h2>Intelligence Brief</h2></div>
+            <p class="muted">Up to five deduplicated developments backed by inspectable evidence.</p>
+        </div>
+        <div id="intelligenceBrief" class="stack"></div>
+        <div id="plainLanguageSummary" class="plain-summary"></div>
+        <div id="suggestionPrompts" class="suggestion-prompts"></div>
+    </section>
+
+    <section class="panel" id="activeForecastsSection">
+        <div class="section-heading">
+            <div><p class="eyebrow">2 · What happens next</p><h2>Active Forecasts</h2></div>
+            <div id="forecastCount" class="record-count"></div>
+        </div>
+        <div id="forecastList" class="forecast-grid"></div>
+    </section>
+
+    <section class="panel" id="watchlistSection">
+        <div class="section-heading">
+            <div><p class="eyebrow">3 · Material entity changes</p><h2>Watchlist Changes</h2></div>
+        </div>
+        <div id="watchlistChangesList" class="stack"></div>
+    </section>
+
+    <section class="panel" id="investigationsSection">
+        <div class="section-heading">
+            <div><p class="eyebrow">4 · Questions being tested</p><h2>Active Investigations</h2></div>
+        </div>
+        <div id="investigationList" class="stack"></div>
+    </section>
+
+    <section class="panel" id="upcomingEventsSection">
+        <div class="section-heading">
+            <div><p class="eyebrow">5 · Scheduled catalysts</p><h2>Upcoming Events</h2></div>
+        </div>
+        <div id="upcomingEventsList" class="stack"></div>
+    </section>
+
+    <section class="panel" id="autonomySection">
+        <div class="section-heading">
+            <div><p class="eyebrow">Research trace</p><h2>Latest Autonomous Cycle</h2></div>
+        </div>
+        <form id="autonomyForm" class="autonomy-grid">
+            <label>Monitoring objective
+                <input id="autonomyObjectiveInput" value="Monitor verified evidence for material changes and explain decision impact.">
+            </label>
+            <label>Review interval
+                <select id="autonomyIntervalSelect">
+                    <option value="300">Every five minutes</option>
+                    <option value="600">Every ten minutes</option>
+                </select>
+            </label>
+            <div class="control-buttons">
+                <button type="button" id="autonomyStartButton">Start</button>
+                <button type="button" id="autonomyRunButton" class="secondary">Run cycle now</button>
+                <button type="button" id="autonomyStopButton" class="secondary">Stop</button>
+            </div>
+        </form>
+        <div id="autonomyStatusPanel" class="stack"></div>
+        <div id="autonomyActionsPanel" class="stack"></div>
+    </section>
+
+    <section class="panel" id="predictionLabSection">
+        <details>
+            <summary><strong>Scenario lab</strong> — simulated exploration, separate from stored forecasts</summary>
+            <form id="predictionForm" class="prediction-grid">
+                <label>Scenario<input id="predictionScenarioInput" placeholder="Energy sanctions expand"></label>
+                <label>Horizon
+                    <select id="predictionHorizonSelect"><option value="30">30 days</option><option value="90">90 days</option></select>
+                </label>
+                <label>Mode
+                    <select id="predictionModeSelect"><option value="balanced">Balanced</option><option value="conservative">Conservative</option></select>
+                </label>
+                <button type="submit">Run simulated scenario</button>
+            </form>
+            <div id="predictionSummaryPanel" class="stack"></div>
+            <div id="forecastProbabilityChart" class="forecast-chart"></div>
+            <div id="predictionPathPanel"></div>
+            <div id="predictionDriversPanel" class="stack"></div>
+            <div id="predictionActionsPanel" class="stack"></div>
+        </details>
+    </section>
+
+    <section class="panel compact-health" id="systemHealthSection">
+        <div class="section-heading">
+            <div><p class="eyebrow">6 · Compact diagnostics</p><h2>System Health</h2></div>
+        </div>
+        <div id="systemHealthPanel" class="health-grid"></div>
+        <details><summary>Connector details</summary><div id="sourceStatusList" class="stack source-stack"></div></details>
+    </section>
+</main>
+<script src="/static/situation_room_app.js"></script>
+</body>
+</html>

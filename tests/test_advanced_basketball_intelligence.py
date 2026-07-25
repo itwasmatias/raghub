@@ -113,3 +113,54 @@ def test_three_season_profiles_never_mix_competitions() -> None:
     assert regular.volatility.consistency_score < 100
     assert regular.role_change.minutes_change > 0
     assert regular.role_change.usage_change > 0
+
+
+def test_player_intelligence_includes_release_candidate_splits_and_features() -> None:
+    rows = []
+    for index in range(1, 11):
+        row = log(
+            "2025-26",
+            index,
+            10 + index,
+            minutes=20 + index,
+            attempts=8 + index,
+        )
+        row.update(
+            {
+                "starter": index >= 6,
+                "home": index % 2 == 0,
+                "win": index % 3 != 0,
+                "rest_days": index % 4,
+                "opponent_id": f"opp-{index % 2}",
+                "turnovers": 2,
+                "team_field_goal_attempts": 88,
+                "team_free_throw_attempts": 20,
+                "team_turnovers": 12,
+                "qualitative_context": (
+                    "Coach said the player may receive a larger role."
+                    if index == 10
+                    else ""
+                ),
+                "qualitative_source": "postgame interview",
+                "qualitative_url": "https://example.com/interview",
+            }
+        )
+        rows.append(row)
+
+    result = PlayerIntelligenceService().analyze("p1", rows, ["2025-26"])
+
+    assert result is not None
+    regular = result.profiles["NBA:regular"]
+    assert regular.recent_three.games == 3
+    assert regular.splits["home"].games == 5
+    assert regular.splits["away"].games == 5
+    assert regular.splits["starter"].games == 5
+    assert regular.splits["bench"].games == 5
+    assert regular.splits["wins"].games + regular.splits["losses"].games == 10
+    assert regular.advanced.effective_field_goal_percentage > 0
+    assert regular.advanced.true_shooting_percentage > 0
+    assert 0 <= regular.advanced.normalized_trend_score <= 1
+    assert regular.advanced.expected_minutes > regular.baseline.minutes
+    assert regular.advanced.role_stability >= 0
+    assert result.qualitative_evidence[0]["evidence_type"] == "qualitative"
+    assert result.qualitative_evidence[0]["url"]

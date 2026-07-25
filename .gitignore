@@ -38,6 +38,21 @@ dist/
 .coverage
 htmlcov/
 
+# SIP Personal Edition runtime state
+data/*.db
+data/*.db-*
+data/models/
+data/training/
+data/cache/
+logs/
+*.pid
+
+# Local archives and generated inventories
+*.zip
+project_tree.txt
+python_files.txt
+requirements_snapshot.txt
+
 # Temporary files
 *.tmp
 *.bak

@@ -264,3 +264,53 @@ Before implementing a change, ask:
 If yes, continue.
 
 If not, redesign first.
+# RAGHub/SIP v1.0 Architecture
+
+```text
+NBA and sportsbook providers
+            |
+            v
+Ingestion, canonical identity normalization, and local snapshots
+            |
+            v
+SQLite intelligence store and source-health ledger
+            |
+            v
+Evidence + canonical Situation lifecycle kernel
+            |
+            v
+Player features + hypothesis evaluation
+            |
+            v
+Forecast + evidence-weighted opportunity ranking
+            |
+            v
+Bounded autonomous planner
+            |
+            v
+Flask APIs and decision-focused Situation Room
+            |
+            v
+Outcome evaluation, calibration, and research memory
+```
+
+## Primary contracts
+
+- `SQLiteIntelligenceStore`: normalized provider records, provenance, freshness,
+  incremental state, and cached-snapshot preservation.
+- `IntelligenceLifecycleService`: append-only lifecycle events and reconstructed
+  Situation state.
+- `MarketNormalizer`: canonical games, teams, players, books, markets, outcomes,
+  lines, and timestamps.
+- `NBAPlayerOpportunityLoop`: evidence-gated NBA observation through monitoring.
+- `OpportunityRankingEngine`: explained score using value, completeness,
+  evidence, freshness, stability, uncertainty, and historical reliability.
+- `BoundedIntelligencePlanner`: permission, budget, retry, approval, and audit
+  guardrails.
+- `NBAReplayDemo`: deterministic Observe-to-Learn release demonstration.
+
+## Data classification
+
+Observed source facts, derived analytical claims, model forecasts, qualitative
+context, and historical replay data retain distinct labels. Empty live sources
+remain empty; they are never replaced with fictional production rows.
