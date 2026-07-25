@@ -70,7 +70,7 @@ MINIMAL_OPERATIONS: dict[str, str] = {
     "pydantic_core": "import pydantic_core; pydantic_core.SchemaValidator({'type': 'int'}).validate_python('1')",
     "tiktoken": "import tiktoken; tiktoken.get_encoding('cl100k_base').encode('probe text')",
     "psycopg": "import psycopg; psycopg.adapt.AdaptersMap()",
-    "psycopg_binary": "import psycopg, psycopg_binary",
+    "psycopg_binary": "import psycopg; psycopg.adapt.AdaptersMap()",
     "psycopg2": "import psycopg2; psycopg2.extensions.adapt('probe').getquoted()",
     "psycopg2_binary": "import psycopg2; psycopg2.extensions.adapt('probe').getquoted()",
     "regex": "import regex; regex.compile(r'probe').match('probe')",
@@ -79,6 +79,13 @@ MINIMAL_OPERATIONS: dict[str, str] = {
     "orjson": "import orjson; orjson.dumps({'probe': True})",
     "PIL": "from PIL import Image; Image.new('RGB', (1, 1)).tobytes()",
     "tokenizers": "from tokenizers import Tokenizer; from tokenizers.models import WordLevel; Tokenizer(WordLevel({'[UNK]': 0}, unk_token='[UNK]'))",
+}
+
+IMPORT_TARGETS: dict[str, str] = {
+    # psycopg-binary ships the native backend for psycopg but does not expose
+    # a stable standalone import contract as "psycopg_binary".
+    "psycopg_binary": "psycopg",
+    "psycopg2_binary": "psycopg2",
 }
 
 DEFAULT_CANDIDATE_MODULES = {
@@ -247,17 +254,21 @@ def _safe_stderr(stderr: str) -> str:
     return compact[:500]
 
 
-def _child_probe_command(package: str, operation: str | None) -> list[str]:
+def _child_probe_command(
+    package: str, operation: str | None, *, import_target: str | None = None
+) -> list[str]:
     operation_json = json.dumps(operation or "")
+    module_to_import = import_target or package
     code = "\n".join(
         [
             "import importlib",
             "import json",
             "package = " + json.dumps(package),
+            "module_to_import = " + json.dumps(module_to_import),
             "operation = " + operation_json,
             "payload = {'import_success': False, 'minimal_operation_success': False, 'import_error': '', 'operation_error': ''}",
             "try:",
-            "    importlib.import_module(package)",
+            "    importlib.import_module(module_to_import)",
             "    payload['import_success'] = True",
             "except Exception as exc:",
             "    payload['import_error'] = f'{type(exc).__name__}: {exc}'",
@@ -276,6 +287,9 @@ def _child_probe_command(package: str, operation: str | None) -> list[str]:
 
 
 def _resolve_classification(package: str) -> tuple[str, str]:
+    stdlib_names = getattr(sys, "stdlib_module_names", set())
+    if package in stdlib_names:
+        return ("Python standard library module", "fedora-core")
     return CLASSIFICATIONS.get(package, ("optional dependency", "windows-worker"))
 
 
@@ -324,8 +338,10 @@ def diagnose_module(
     except importlib.metadata.PackageNotFoundError:
         version = None
     operation = MINIMAL_OPERATIONS.get(package)
+    import_target = IMPORT_TARGETS.get(package, package)
     process = subprocess.run(
-        command or _child_probe_command(package, operation),
+        command
+        or _child_probe_command(package, operation, import_target=import_target),
         capture_output=True,
         text=True,
         timeout=20,
