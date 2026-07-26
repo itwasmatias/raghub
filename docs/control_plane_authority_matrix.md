@@ -1,0 +1,19 @@
+# Control Plane Authority Matrix
+
+This matrix defines the sole authority for each financial or execution decision.
+No other service should independently own the same decision.
+
+| Decision | Sole authority | Inputs | Forbidden outside callers | Notes |
+| --- | --- | --- | --- | --- |
+| Probability reconciliation | `sports.execution.contracts.ProbabilityReconciliationResultV1` and the future reconciliation service | Raw implied probability, no-vig probability, consensus probability, raw SIP probability, calibrated SIP probability, quote freshness, data quality, strategy performance, historical prior | UI, repository, qualification, direct wager routes | Only reconciled execution probability may advance to sizing |
+| Strategy eligibility | `sports.execution.contracts.StrategyDecisionV1` | Reconciled probability, market type, book count, data quality, unresolved blockers, model version | Direct wager endpoints, qualification helpers, portfolio views | Edge scanner output is advisory until it becomes a strategy decision |
+| Exposure calculation | `sports.execution.contracts.ExposureSnapshotV1` and the future exposure service | Current positions, open stake, correlated groups, strategy/model/version metadata | Ledger updates, position creation, settlement code | Exposure must be computed before approval, not only after opening |
+| Risk approval | `sports.execution.contracts.RiskDecisionV1` and the future risk service | Exposure snapshot, policy, strategy decision, model status, bankroll | Position creation, execution confirmation, ledger mutation | Risk approval is the gate before order-intent creation |
+| Position sizing | `sports.execution.contracts.SizingDecisionV1` and the future sizing service | Reconciled probability, decimal profit multiple, bankroll, caps, risk decision | Qualification, practice calculator, direct wager creation | Zero or negative Kelly means no position |
+| Order-intent state transitions | `sports.execution.statuses.order_intent_transition_allowed` and the future state-machine service | Thesis, forecast, reconciliation, strategy, risk, sizing, confirmation evidence | UI helpers, repository methods, settlement code | The state machine is append-only and idempotent |
+| Execution confirmation | `sports.execution.contracts.ExecutionReceiptV1` and the future execution adapter layer | Confirmation payload, execution id, receipt payload, provider reference | Direct position creation, risk, sizing, qualification | Acceptance receipt is required before a real position opens |
+| Position creation | `sports.execution.contracts.PositionV1` and the future position service | Accepted execution receipt, approved stake, reconciled probability, exposure and policy versions | Order-intent shortcuts, repository saves, settlement handlers | Position creation is not allowed to skip receipt evidence |
+| Ledger changes | Dedicated ledger service, not repository callers | Idempotency key, account, transaction type, balance, reservation, available cash | Position service, settlement service, UI actions | Bankroll mutation must remain ledger-backed |
+| Settlement | `sports.execution.contracts.SettlementResultV1` and the future settlement service | Position state, idempotency key, resolution source, payout and profit | Position creation, portfolio summaries, direct repository writes | Settlement records must be idempotent |
+| Event logging | `sports.execution.contracts.DomainEventV1` and the future event-log writer | Correlation id, causation id, payload, hash chain, versions | Direct UI writes, silent repository shortcuts | Overrides and corrections must generate explicit audit events |
+| Feedback calculation | The future feedback service using model, strategy, and policy versions | Settlement result, closing-line value, calibration by bucket, drawdown, performance | Direct model updates, execution endpoints | Feedback may influence future trust only through versioned policy changes |
