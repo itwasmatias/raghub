@@ -94,6 +94,11 @@ The contract package is frozen in `sports/execution/contracts.py` and `sports/ex
 
 Contracts are frozen dataclasses with explicit version fields, UTC timestamp fields, and stable JSON serialization rules.
 
+This freeze is amended by **Probability Contract V1 Amendment 0.1**.
+See `docs/control_plane_contract_amendment_0_1.md` for added identity fields,
+structured reason records, approval statuses, eligibility invariants,
+and compatibility behavior.
+
 ### Probability Separation Rules
 
 The following values remain distinct by contract:

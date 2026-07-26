@@ -19,6 +19,25 @@ not approved. A thesis, forecast, scanner result, or API payload MUST NOT create
 a position without reconciliation, strategy eligibility, risk approval, sizing,
 explicit intent creation, and the required confirmation and receipt sequence.
 
+## V1 Amendment 0.1
+
+This freeze includes Probability Contract V1 Amendment 0.1.
+The amendment adds explicit identity, prior, approval, lineage, and eligibility
+invariants for probability snapshot and reconciliation contracts before Phase 1
+reconciliation implementation begins.
+
+Reference document: `docs/control_plane_contract_amendment_0_1.md`.
+
+Compatibility notes:
+
+- `ProbabilityReconciliationResultV1.reconciled_execution_probability` is the
+  authoritative value.
+- `ProbabilityReconciliationResultV1.probability` remains as a compatibility
+  alias and MUST equal `reconciled_execution_probability`.
+- `ProbabilitySnapshotV1.reconciled_execution_probability` is optional prior to
+  reconciliation and MUST NOT be fabricated pre-reconciliation.
+- Machine gating must consume structured reason codes, not free-form text.
+
 ## Contract classifications
 
 - **Authoritative**: the intended v1 control-plane domain contract.

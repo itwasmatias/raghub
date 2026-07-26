@@ -18,7 +18,12 @@ from sports.execution.contracts import (
     serialize_contract,
 )
 from sports.execution.statuses import (
+    CalibrationApprovalStatusV1,
+    CalibrationStatusV1,
+    ModelApprovalStatusV1,
+    ModelStatusV1,
     OrderIntentStateV1,
+    VersionApprovalStatusV1,
     order_intent_transition_allowed,
 )
 
@@ -26,24 +31,58 @@ from sports.execution.statuses import (
 def _snapshot() -> ProbabilitySnapshotV1:
     return ProbabilitySnapshotV1(
         snapshot_id="snapshot-1",
+        league="wnba",
+        event_id="event-1",
         market_id="market-1",
+        market_type="moneyline",
+        period="full_game",
         outcome_id="outcome-1",
+        selection_id="selection-1",
+        outcome_schema="home_away",
+        event_start_time="2026-07-25T20:00:00+00:00",
+        as_of="2026-07-25T12:05:00+00:00",
         raw_american_odds=-110,
         raw_decimal_odds=Decimal("1.909091"),
-        raw_implied_probability=Decimal("0.523810"),
+        raw_implied_probability=Decimal("0.523809"),
         no_vig_probability=Decimal("0.515000"),
         cross_book_consensus_probability=Decimal("0.520000"),
         raw_sip_probability=Decimal("0.610000"),
         calibrated_sip_probability=Decimal("0.640000"),
-        reconciled_execution_probability=Decimal("0.560000"),
+        reconciled_execution_probability=None,
         confidence_lower_bound=Decimal("0.520000"),
         confidence_upper_bound=Decimal("0.600000"),
-        break_even_probability=Decimal("0.512000"),
+        break_even_probability=Decimal("0.523809"),
+        historical_prior_probability=Decimal("0.530000"),
+        historical_prior_source="wnba-prior-dataset",
+        historical_prior_version="prior-v1",
+        historical_prior_timestamp="2026-07-24T00:00:00+00:00",
+        historical_prior_sample_scope="league_last_2000_games",
+        historical_prior_missing=False,
+        execution_quote_id="quote-1",
+        execution_sportsbook_id="book-1",
+        execution_quote_timestamp="2026-07-25T12:00:00+00:00",
+        consensus_constituent_quote_ids=("quote-1", "quote-2"),
+        constituent_sportsbook_ids=("book-1", "book-2"),
+        oldest_constituent_timestamp="2026-07-25T11:59:00+00:00",
+        consensus_calculated_at="2026-07-25T12:01:30+00:00",
+        complete_fresh_sportsbook_count=2,
+        market_dispersion=Decimal("0.025000"),
+        canonical_input_hash="",
+        source_quote_set_id="quote-set-1",
         quote_timestamp="2026-07-25T12:00:00+00:00",
         forecast_timestamp="2026-07-25T12:01:00+00:00",
         model_version="model-v1",
         calibration_version="cal-v1",
         reconciliation_version="recon-v1",
+        reconciliation_policy_version="recon-policy-v1",
+        reconciliation_method_version="weighted-shrink-v1",
+        confidence_interval_method_version="normal-approx-v1",
+        model_status=ModelStatusV1.APPROVED,
+        calibration_status=CalibrationStatusV1.APPROVED,
+        model_approval_status=ModelApprovalStatusV1.APPROVED,
+        calibration_approval_status=CalibrationApprovalStatusV1.APPROVED,
+        policy_approval_status=VersionApprovalStatusV1.APPROVED,
+        reconciliation_approval_status=VersionApprovalStatusV1.APPROVED,
         data_quality_score=Decimal("0.830000"),
         sportsbook_coverage=4,
         reconciliation_method="weighted-shrink",
@@ -51,6 +90,10 @@ def _snapshot() -> ProbabilitySnapshotV1:
             "calibrated_sip": Decimal("0.500000"),
             "consensus": Decimal("0.300000"),
             "prior": Decimal("0.200000"),
+        },
+        trust_factors={
+            "data_quality": Decimal("0.830000"),
+            "coverage": Decimal("0.500000"),
         },
         source_quote_ids=("quote-1", "quote-2"),
         notes=("freeze",),
@@ -68,8 +111,8 @@ def test_contract_serialization_is_stable_and_decimal_safe():
     second = serialize_contract(snapshot)
 
     assert first == second
-    assert '"raw_implied_probability":"0.523810"' in first
-    assert '"reconciled_execution_probability":"0.560000"' in first
+    assert '"raw_implied_probability":"0.523809"' in first
+    assert '"reconciled_execution_probability":null' in first
     assert contract_to_dict(snapshot)["raw_american_odds"] == -110
 
 

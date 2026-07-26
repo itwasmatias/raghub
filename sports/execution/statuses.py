@@ -18,6 +18,53 @@ class ProbabilityReconciliationStatusV1(StrEnum):
     ERROR = "error"
 
 
+class ModelStatusV1(StrEnum):
+    APPROVED = "approved"
+    EXPERIMENTAL = "experimental"
+    SHADOW = "shadow"
+    UNTRAINED = "untrained"
+    UNSTABLE = "unstable"
+
+
+class CalibrationStatusV1(StrEnum):
+    APPROVED = "approved"
+    CALIBRATION_MISSING = "calibration_missing"
+    CALIBRATION_FAILED = "calibration_failed"
+    CALIBRATION_STALE = "calibration_stale"
+
+
+class ModelApprovalStatusV1(StrEnum):
+    APPROVED = "approved"
+    VERSION_UNAPPROVED = "version_unapproved"
+
+
+class CalibrationApprovalStatusV1(StrEnum):
+    APPROVED = "approved"
+    VERSION_UNAPPROVED = "version_unapproved"
+
+
+class VersionApprovalStatusV1(StrEnum):
+    APPROVED = "approved"
+    VERSION_UNAPPROVED = "version_unapproved"
+
+
+class DecisionReasonSeverityV1(StrEnum):
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+
+
+class DecisionReasonCategoryV1(StrEnum):
+    DATA_QUALITY = "data_quality"
+    COVERAGE = "coverage"
+    FRESHNESS = "freshness"
+    MODEL = "model"
+    CALIBRATION = "calibration"
+    POLICY = "policy"
+    RECONCILIATION = "reconciliation"
+    VALIDATION = "validation"
+
+
 class StrategyDecisionStatusV1(StrEnum):
     ELIGIBLE = "eligible"
     BLOCKED = "blocked"
@@ -66,14 +113,12 @@ class OrderIntentStateV1(StrEnum):
     REVIEWED = "reviewed"
 
 
-ORDER_INTENT_TRANSITIONS_V1: dict[OrderIntentStateV1, tuple[OrderIntentStateV1, ...]] = {
+ORDER_INTENT_TRANSITIONS_V1: dict[
+    OrderIntentStateV1, tuple[OrderIntentStateV1, ...]
+] = {
     OrderIntentStateV1.THESIS_DRAFTED: (OrderIntentStateV1.FORECAST_CREATED,),
-    OrderIntentStateV1.FORECAST_CREATED: (
-        OrderIntentStateV1.PROBABILITIES_RECONCILED,
-    ),
-    OrderIntentStateV1.PROBABILITIES_RECONCILED: (
-        OrderIntentStateV1.STRATEGY_MATCHED,
-    ),
+    OrderIntentStateV1.FORECAST_CREATED: (OrderIntentStateV1.PROBABILITIES_RECONCILED,),
+    OrderIntentStateV1.PROBABILITIES_RECONCILED: (OrderIntentStateV1.STRATEGY_MATCHED,),
     OrderIntentStateV1.STRATEGY_MATCHED: (OrderIntentStateV1.RISK_EVALUATED,),
     OrderIntentStateV1.RISK_EVALUATED: (OrderIntentStateV1.RISK_APPROVED,),
     OrderIntentStateV1.RISK_APPROVED: (OrderIntentStateV1.ORDER_INTENT_CREATED,),
