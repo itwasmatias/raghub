@@ -24,7 +24,6 @@ class OverviewService:
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     def snapshot(self) -> dict[str, Any]:
-        generated_at = self.clock().astimezone(timezone.utc).isoformat()
         notices: list[dict[str, str]] = []
 
         try:
@@ -45,6 +44,12 @@ class OverviewService:
                     "message": "Persisted Sports Intelligence state could not be read.",
                 }
             )
+            sports_snapshot = {}
+
+        generated_at = str(
+            sports_snapshot.get("generated_at")
+            or self.clock().astimezone(timezone.utc).isoformat()
+        )
 
         situation_room, evidence = self._situation_payload()
         compute = self._compute_payload()
@@ -93,7 +98,9 @@ class OverviewService:
         status = self._league_status(feed, freshness)
 
         events = [
-            item for item in snapshot.get("events") or [] if item.get("league") == league
+            item
+            for item in snapshot.get("events") or []
+            if item.get("league") == league
         ]
         evaluations = [
             item
@@ -169,11 +176,11 @@ class OverviewService:
                 "detail": model.get("detail"),
             },
             "counts": {
-                "upcoming_events": self._count(summary, "upcoming_events", count_status),
-                "evaluations": self._count(summary, "evaluations", count_status),
-                "qualified": self._count(
-                    summary, "qualified_choices", count_status
+                "upcoming_events": self._count(
+                    summary, "upcoming_events", count_status
                 ),
+                "evaluations": self._count(summary, "evaluations", count_status),
+                "qualified": self._count(summary, "qualified_choices", count_status),
                 "no_bet": self._count(summary, "no_bet_results", count_status),
                 "resolved_predictions": self._count(
                     summary, "resolved_predictions", "available"
@@ -310,9 +317,7 @@ class OverviewService:
                 "resolution_deadline": item.get("resolution_deadline"),
                 "calibration_status": item.get("calibration_status"),
                 "last_updated_at": item.get("last_updated_at"),
-                "supporting_evidence_count": len(
-                    item.get("supporting_evidence") or []
-                ),
+                "supporting_evidence_count": len(item.get("supporting_evidence") or []),
                 "contradicting_evidence_count": len(
                     item.get("contradicting_evidence") or []
                 ),
@@ -329,7 +334,9 @@ class OverviewService:
             for item in evidence_rows
             if item.get("observed_at")
         ]
-        status = "available" if forecasts or evidence_rows or latest_cycle else "unavailable"
+        status = (
+            "available" if forecasts or evidence_rows or latest_cycle else "unavailable"
+        )
         return (
             {
                 "status": status,
@@ -452,9 +459,7 @@ class OverviewService:
         }
 
     @staticmethod
-    def _count(
-        summary: dict[str, Any], key: str, status: str
-    ) -> dict[str, Any]:
+    def _count(summary: dict[str, Any], key: str, status: str) -> dict[str, Any]:
         if status != "available" or key not in summary:
             return {"status": "unavailable", "value": None}
         return {"status": "available", "value": int(summary[key])}
@@ -509,9 +514,7 @@ class OverviewService:
 
     @staticmethod
     def _performance_status(sports: dict[str, Any]) -> str:
-        states = [
-            item.get("performance", {}).get("status") for item in sports.values()
-        ]
+        states = [item.get("performance", {}).get("status") for item in sports.values()]
         if all(item == "available" for item in states):
             return "available"
         if any(item == "available" for item in states):
@@ -538,9 +541,7 @@ class OverviewService:
         return "ready"
 
     @staticmethod
-    def _unavailable_league(
-        league: str, status: str, reason: str
-    ) -> dict[str, Any]:
+    def _unavailable_league(league: str, status: str, reason: str) -> dict[str, Any]:
         unavailable_count = {"status": "error", "value": None}
         return {
             "league": league,

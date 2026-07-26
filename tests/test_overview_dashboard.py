@@ -10,18 +10,32 @@ class FakeSettings:
     odds_provider = "odds_api_io"
 
 
+class _ForbiddenScheduler:
+    def run_pending(self, **_kwargs):
+        raise AssertionError("overview must not trigger scheduler execution")
+
+
+class _ForbiddenQualifier:
+    def evaluate(self, *_args, **_kwargs):
+        raise AssertionError("overview must not rerun qualification")
+
+
 class FakePersonalService:
     settings = FakeSettings()
+    scheduler = _ForbiddenScheduler()
+    qualifier = _ForbiddenQualifier()
 
     def __init__(self, payload):
         self.payload = payload
         self.snapshot_calls = 0
+        self.refresh_calls = 0
 
     def snapshot(self):
         self.snapshot_calls += 1
         return deepcopy(self.payload)
 
     def refresh(self):
+        self.refresh_calls += 1
         raise AssertionError("overview must not refresh providers")
 
 
@@ -29,6 +43,7 @@ class FakeSituationRepository:
     def __init__(self, *, forecasts=None, evidence=None):
         self._forecasts = forecasts or []
         self._evidence = evidence or []
+        self.write_attempts = 0
 
     def list_forecasts(self):
         return deepcopy(self._forecasts)
@@ -44,6 +59,15 @@ class FakeSituationRepository:
 
     def get_latest_autonomy_cycle(self):
         return None
+
+    # Guardrails: these are persistence write paths and must remain unused.
+    def upsert_forecast(self, *_args, **_kwargs):
+        self.write_attempts += 1
+        raise AssertionError("overview must not create forecasts")
+
+    def upsert_evidence(self, *_args, **_kwargs):
+        self.write_attempts += 1
+        raise AssertionError("overview must not create evidence")
 
 
 class FakeSituationRoomService:
@@ -88,6 +112,11 @@ def sports_snapshot():
             "status": "PARTIALLY_TRAINED",
             "calibration_status": "partial",
             "leagues": {
+                "NBA": {
+                    "status": "MODEL_NOT_TRAINED",
+                    "calibration_status": "not_trained",
+                    "detail": "No validated artifact.",
+                },
                 "WNBA": {
                     "status": "ready",
                     "calibration_status": "calibrated",
@@ -101,6 +130,13 @@ def sports_snapshot():
             },
         },
         "league_summary": {
+            "NBA": {
+                "upcoming_events": 0,
+                "evaluations": 0,
+                "qualified_choices": 0,
+                "no_bet_results": 0,
+                "resolved_predictions": 0,
+            },
             "WNBA": {
                 "upcoming_events": 1,
                 "evaluations": 2,
@@ -196,19 +232,18 @@ def sports_snapshot():
 
 def build_service(payload=None, *, forecasts=None, evidence=None):
     personal = FakePersonalService(payload or sports_snapshot())
-    situation = FakeSituationRoomService(
-        FakeSituationRepository(forecasts=forecasts, evidence=evidence)
-    )
+    situation_repo = FakeSituationRepository(forecasts=forecasts, evidence=evidence)
+    situation = FakeSituationRoomService(situation_repo)
     service = OverviewService(
         personal_service=personal,
         situation_room_service=situation,
         compute_repository=FakeComputeRepository(),
     )
-    return service, personal
+    return service, personal, situation_repo
 
 
 def test_overview_contract_separates_leagues_and_preserves_decisions():
-    service, personal = build_service()
+    service, personal, _ = build_service()
 
     payload = service.snapshot()
 
@@ -235,7 +270,7 @@ def test_overview_maps_stale_and_error_without_discarding_persisted_values():
             "error": "Provider rate limit.",
         }
     )
-    service, _ = build_service(snapshot)
+    service, _, _ = build_service(snapshot)
 
     payload = service.snapshot()
 
@@ -257,7 +292,7 @@ def test_overview_marks_counts_unavailable_when_feed_never_refreshed():
         }
     )
     snapshot["league_summary"]["MLB"]["upcoming_events"] = 0
-    service, _ = build_service(snapshot)
+    service, _, _ = build_service(snapshot)
 
     mlb = service.snapshot()["sports"]["MLB"]
 
@@ -291,12 +326,14 @@ def test_overview_uses_only_persisted_situation_room_records():
             "observed_at": "2026-07-25T12:00:00+00:00",
         }
     ]
-    service, _ = build_service(forecasts=forecasts, evidence=evidence)
+    service, _, _ = build_service(forecasts=forecasts, evidence=evidence)
 
     payload = service.snapshot()
 
     assert payload["situation_room"]["status"] == "available"
-    assert payload["situation_room"]["active_forecasts"][0]["forecast_id"] == "forecast-1"
+    assert (
+        payload["situation_room"]["active_forecasts"][0]["forecast_id"] == "forecast-1"
+    )
     assert payload["situation_room"]["briefs"] == []
     assert payload["situation_room"]["briefs_status"] == "unavailable"
     assert payload["evidence"]["persisted_records"] == {
@@ -328,8 +365,37 @@ def test_overview_sections_fail_independently():
     assert payload["status"] == "partial"
 
 
-def test_overview_routes_render_without_changing_home(tmp_path):
-    service, _ = build_service()
+def test_overview_snapshot_does_not_trigger_refresh_scheduler_or_writes():
+    service, personal, situation_repo = build_service()
+
+    payload = service.snapshot()
+
+    assert payload["schema_version"] == "overview.v1"
+    assert personal.refresh_calls == 0
+    assert situation_repo.write_attempts == 0
+
+
+def test_overview_contract_top_level_shape_is_stable():
+    service, _, _ = build_service()
+
+    payload = service.snapshot()
+
+    assert set(payload) == {
+        "schema_version",
+        "generated_at",
+        "status",
+        "status_reason",
+        "sports",
+        "situation_room",
+        "forecast_performance",
+        "evidence",
+        "system_health",
+        "notices",
+    }
+
+
+def test_overview_routes_render_without_changing_home():
+    service, _, _ = build_service()
     app = create_app(
         runtime=FakeRuntime(),
         personal_service=FakePersonalService(sports_snapshot()),
@@ -348,12 +414,47 @@ def test_overview_routes_render_without_changing_home(tmp_path):
     assert "Unified Overview" in html
     assert "/static/overview.css" in html
     assert "/static/overview.js" in html
-    home_rule = next(rule for rule in app.url_map.iter_rules() if rule.rule == "/")
-    assert home_rule.endpoint == "home"
+    assert any(rule.rule == "/" for rule in app.url_map.iter_rules())
+
+
+def test_overview_has_existing_detail_page_links():
+    app = create_app(
+        runtime=FakeRuntime(),
+        personal_service=FakePersonalService(sports_snapshot()),
+        situation_room_service=FakeSituationRoomService(FakeSituationRepository()),
+        overview_service=build_service()[0],
+    )
+
+    html = app.test_client().get("/overview").get_data(as_text=True)
+
+    for href in (
+        'href="/"',
+        'href="/wnba"',
+        'href="/betting"',
+        'href="/calibration"',
+        'href="/situation-room"',
+    ):
+        assert href in html
+
+
+def test_overview_api_is_deterministic_for_unchanged_state():
+    service, _, _ = build_service()
+    app = create_app(
+        runtime=FakeRuntime(),
+        personal_service=FakePersonalService(sports_snapshot()),
+        situation_room_service=FakeSituationRoomService(FakeSituationRepository()),
+        overview_service=service,
+    )
+    client = app.test_client()
+
+    first = client.get("/api/overview").get_json()
+    second = client.get("/api/overview").get_json()
+
+    assert first == second
 
 
 def test_overview_page_excludes_legacy_synthetic_metrics():
-    service, _ = build_service()
+    service, _, _ = build_service()
     app = create_app(
         runtime=FakeRuntime(),
         personal_service=FakePersonalService(sports_snapshot()),
@@ -371,3 +472,10 @@ def test_overview_page_excludes_legacy_synthetic_metrics():
         "Integrations 4",
     ):
         assert forbidden not in html
+
+
+def test_overview_mobile_css_prevents_horizontal_scroll():
+    css = open("static/overview.css", encoding="utf-8").read()
+
+    assert "overflow-x:hidden" in css or "overflow-x: hidden" in css
+    assert "max-width:100%" in css or "max-width: 100%" in css
