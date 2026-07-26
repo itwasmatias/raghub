@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RAGHub Unified Overview</title>
+  <link rel="stylesheet" href="/static/overview.css?v={{ frontend_version }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="/overview"><span class="mark">R</span><span><strong>RAGHub</strong><small>Unified Overview</small></span></a>
+      <nav aria-label="Primary navigation">
+        <a aria-current="page" href="/overview">Overview</a>
+        <a href="/">Sports</a>
+        <a href="/betting">Choices</a>
+        <a href="/calibration">Performance</a>
+        <a href="/situation-room">Situation Room</a>
+        <a href="/situation-room/evidence">Evidence</a>
+      </nav>
+    </div>
+  </header>
+  <main class="shell" id="overviewRoot">
+    <section class="page-heading">
+      <div><p class="eyebrow">Persisted intelligence state</p><h1>Unified Overview</h1></div>
+      <div class="page-state"><span id="overviewStatus" class="status unavailable">Loading</span><span id="overviewGeneratedAt">Time unavailable</span></div>
+    </section>
+    <div id="overviewNotices" class="notices" aria-live="polite"></div>
+
+    <section aria-labelledby="sportsHeading">
+      <div class="section-heading"><div><p class="eyebrow">Sports Intelligence</p><h2 id="sportsHeading">WNBA and MLB</h2></div><a href="/">Open sports dashboard</a></div>
+      <div class="league-grid">
+        <div id="leagueWNBA"></div>
+        <div id="leagueMLB"></div>
+      </div>
+    </section>
+
+    <section aria-labelledby="situationHeading">
+      <div class="section-heading"><div><p class="eyebrow">Situation Room</p><h2 id="situationHeading">Forecasts and persisted evidence</h2></div><a href="/situation-room">Open Situation Room</a></div>
+      <div id="situationRoom"></div>
+    </section>
+
+    <section class="lower-grid" aria-label="Performance, evidence, and health">
+      <div id="forecastPerformance"></div>
+      <div id="evidenceStatus"></div>
+      <div id="systemHealth"></div>
+    </section>
+  </main>
+  <script src="/static/overview.js?v={{ frontend_version }}"></script>
+</body>
+</html>

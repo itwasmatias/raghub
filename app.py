@@ -18,6 +18,7 @@ from intelligence.service import SituationRoomService
 from intelligence.ui import render_situation_room
 from models.sports.player import Player
 from services.answer import AnswerService
+from services.overview import OverviewService
 from services.retrieve import RetrievalService
 from sports.application.production_runtime import (
     ApplicationRuntime,
@@ -53,6 +54,7 @@ def create_app(
     personal_service: PersonalEditionService | None = None,
     compute_repository: ComputeJobRepository | None = None,
     worker_token: str | None = None,
+    overview_service: OverviewService | None = None,
 ):
     app = Flask(__name__)
     if os.getenv("SIP_TRUST_PROXY", "false").strip().lower() in {"1", "true", "yes"}:
@@ -142,6 +144,16 @@ def create_app(
         if personal_service is None:
             personal_service = PersonalEditionService.from_environment()
         return personal_service
+
+    def _overview_service() -> OverviewService:
+        nonlocal overview_service
+        if overview_service is None:
+            overview_service = OverviewService(
+                personal_service=_personal_service(),
+                situation_room_service=situation_room_service,
+                compute_repository=compute_repository,
+            )
+        return overview_service
 
     @app.before_request
     def enforce_release_guardrails():
@@ -237,6 +249,14 @@ def create_app(
     def home():
         snapshot = _personal_service().snapshot()
         return render_template("sip_personal.html", snapshot=snapshot)
+
+    @app.get("/overview")
+    def overview():
+        return render_template("overview.html")
+
+    @app.get("/api/overview")
+    def overview_snapshot():
+        return _overview_service().snapshot()
 
     @app.route("/wnba")
     def wnba_home():
