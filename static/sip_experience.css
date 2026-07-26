@@ -1,0 +1,246 @@
+/* SIP Experience v1: visual helpers layered on existing pages */
+:root {
+    --sipx-bg: #0f1626;
+    --sipx-card: #121d2f;
+    --sipx-card-soft: #1b2940;
+    --sipx-ink: #e6edf7;
+    --sipx-muted: #9db0cc;
+    --sipx-line: #334966;
+    --sipx-good: #24a36a;
+    --sipx-warn: #e0a234;
+    --sipx-bad: #d65454;
+    --sipx-info: #3e8be6;
+    --sipx-null: #8b95a7;
+}
+
+html,
+body {
+    max-width: 100%;
+    overflow-x: hidden;
+}
+
+.sipx-guide,
+.sipx-calculator,
+.sipx-analytics,
+.sipx-immediate,
+.sipx-details {
+    border: 1px solid var(--sipx-line);
+    background: var(--sipx-card);
+    color: var(--sipx-ink);
+    border-radius: 12px;
+    padding: 12px;
+    margin-top: 10px;
+}
+
+.sipx-guide h3,
+.sipx-calculator h3,
+.sipx-analytics h3,
+.sipx-immediate h3,
+.sipx-details h3 {
+    margin: 0 0 8px;
+    font-size: 0.95rem;
+}
+
+.sipx-help-grid {
+    display: grid;
+    gap: 8px;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.sipx-help-grid details {
+    background: var(--sipx-card-soft);
+    border: 1px solid var(--sipx-line);
+    border-radius: 10px;
+    padding: 8px;
+}
+
+.sipx-help-grid summary {
+    cursor: pointer;
+    font-weight: 700;
+    color: var(--sipx-ink);
+}
+
+.sipx-help-grid p {
+    margin: 6px 0 0;
+    color: var(--sipx-muted);
+}
+
+.sipx-line {
+    margin: 4px 0;
+    color: var(--sipx-muted);
+}
+
+.sipx-emphasis {
+    color: var(--sipx-ink);
+    font-weight: 700;
+}
+
+.sipx-status-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.sipx-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--sipx-line);
+    font-size: 0.76rem;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.sipx-status::before {
+    content: "\25CF";
+    font-size: 0.62rem;
+}
+
+.sipx-status.qualified,
+.sipx-status.ev-positive {
+    color: var(--sipx-good);
+}
+
+.sipx-status.no-bet,
+.sipx-status.stale,
+.sipx-status.experimental,
+.sipx-status.partial {
+    color: var(--sipx-warn);
+}
+
+.sipx-status.error,
+.sipx-status.ev-negative,
+.sipx-status.unavailable,
+.sipx-status.not_trained {
+    color: var(--sipx-bad);
+}
+
+.sipx-status.info,
+.sipx-status.available,
+.sipx-status.fresh,
+.sipx-status.ready {
+    color: var(--sipx-info);
+}
+
+.sipx-metric-bars {
+    display: grid;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.sipx-bar-wrap {
+    display: grid;
+    gap: 4px;
+}
+
+.sipx-bar-label {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 0.8rem;
+    color: var(--sipx-muted);
+}
+
+.sipx-bar {
+    position: relative;
+    height: 8px;
+    border-radius: 999px;
+    border: 1px solid var(--sipx-line);
+    background: #0f1a2b;
+    overflow: hidden;
+}
+
+.sipx-fill {
+    position: absolute;
+    top: 0;
+    left: 0;
+    bottom: 0;
+}
+
+.sipx-fill.model {
+    background: var(--sipx-info);
+}
+
+.sipx-fill.market {
+    background: var(--sipx-null);
+}
+
+.sipx-fill.quality {
+    background: var(--sipx-warn);
+}
+
+.sipx-fill.ev-positive {
+    background: var(--sipx-good);
+}
+
+.sipx-fill.ev-negative {
+    background: var(--sipx-bad);
+}
+
+.sipx-calculator .sipx-warning {
+    margin: 0 0 10px;
+    color: var(--sipx-muted);
+    font-size: 0.84rem;
+}
+
+.sipx-form-grid {
+    display: grid;
+    gap: 8px;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+}
+
+.sipx-form-grid label {
+    display: grid;
+    gap: 4px;
+    font-size: 0.82rem;
+    color: var(--sipx-muted);
+}
+
+.sipx-form-grid input {
+    border: 1px solid var(--sipx-line);
+    background: #0f1a2b;
+    color: var(--sipx-ink);
+    border-radius: 8px;
+    padding: 8px;
+}
+
+.sipx-actions {
+    margin-top: 8px;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.sipx-result {
+    margin-top: 10px;
+    display: grid;
+    gap: 6px;
+    font-size: 0.85rem;
+}
+
+.sipx-result div {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    color: var(--sipx-muted);
+}
+
+.sipx-result strong {
+    color: var(--sipx-ink);
+}
+
+.sipx-error {
+    color: var(--sipx-bad);
+    font-weight: 700;
+}
+
+@media (max-width: 760px) {
+
+    .sipx-form-grid,
+    .sipx-help-grid {
+        grid-template-columns: 1fr;
+    }
+}

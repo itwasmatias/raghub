@@ -1,3 +1,30 @@
-<!-- historical-replay-status={{ replay.get("status", "unavailable") | e }};
-message={{ replay.get("message", "Historical replay unavailable.") | e }} -->
-{{ betting_html | safe }}
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>SIP Betting Analysis</title>
+	<link rel="stylesheet" href="/static/sip_experience.css?v={{ frontend_version }}">
+</head>
+<body>
+	<!-- historical-replay-status={{ replay.get("status", "unavailable") | e }};
+	message={{ replay.get("message", "Historical replay unavailable.") | e }} -->
+	{{ betting_html | safe }}
+	<section class="sipx-calculator" aria-label="Practice Bet Calculator" style="margin:16px;">
+		<h3>Practice Bet Calculator</h3>
+		<p class="sipx-warning">Practice Bet Calculator — estimates hypothetical returns only. It does not place a wager.</p>
+		<form class="sipx-practice-form" novalidate>
+			<div class="sipx-form-grid">
+				<label>American odds<input name="american_odds" inputmode="numeric" placeholder="e.g. -120"></label>
+				<label>Hypothetical wager (USD)<input name="wager_amount_usd" inputmode="decimal" placeholder="e.g. 25"></label>
+				<label>Model probability (optional)<input name="model_probability" inputmode="decimal" placeholder="e.g. 0.58"></label>
+				<label>Market-implied probability (optional)<input name="market_implied_probability" inputmode="decimal" placeholder="e.g. 0.52"></label>
+			</div>
+			<div class="sipx-actions"><button type="submit">Calculate</button></div>
+			<p class="sipx-error" data-practice-error aria-live="polite"></p>
+			<div class="sipx-result" data-practice-output></div>
+		</form>
+	</section>
+	<script src="/static/sip_experience.js?v={{ frontend_version }}"></script>
+</body>
+</html>

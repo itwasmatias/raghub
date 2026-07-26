@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SIP v1.0 Personal Edition</title>
+  <link rel="stylesheet" href="/static/sip_experience.css?v={{ frontend_version }}">
   <style>
     :root{--navy:#0b1830;--ink:#152033;--paper:#f6f1e7;--card:#fffdf8;--teal:#147d78;--green:#16734b;--amber:#a46709;--red:#aa3541;--line:#d8d2c5;--muted:#657084}
     *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.5 system-ui,-apple-system,sans-serif}a{color:inherit}
@@ -29,6 +30,36 @@
     <div class="scope-note">Pregame · full-game moneyline · updated {{ snapshot.generated_at }}</div>
   </div>
   <div class="evidence warn"><strong>Live evidence boundary:</strong> Sportsbook prices, model forecasts, and supporting context must be refreshed from configured sources. When evidence is absent, SIP preserves the no-bet result instead of guessing.</div>
+  <section class="sipx-guide" aria-label="How to read this card">
+    <h3>How to read this card</h3>
+    <p class="sipx-line">SIP estimates this team wins 58% of the time.</p>
+    <p class="sipx-line">The sportsbook price implies approximately 52%.</p>
+    <p class="sipx-line">The estimated advantage is 6 percentage points.</p>
+    <p class="sipx-line">No-bet: the estimated advantage is too small.</p>
+    <p class="sipx-line">No-bet: fewer than two complete sportsbook quotes are available.</p>
+    {% if snapshot.feed.freshness == 'stale' %}
+    <p class="sipx-line">Stale quote warning: sportsbook snapshots are outside the freshness window.</p>
+    {% endif %}
+    <div class="sipx-help-grid" role="group" aria-label="Metric help">
+      <details><summary>American odds</summary><p>American odds show hypothetical profit relative to a $100 baseline.</p></details>
+      <details><summary>Implied probability</summary><p>Implied probability is the sportsbook break-even win rate from the listed price.</p></details>
+      <details><summary>Model probability</summary><p>Model probability is SIP's estimated win chance from trained forecast inputs.</p></details>
+      <details><summary>Edge</summary><p>Edge equals model probability minus market-implied probability.</p></details>
+      <details><summary>Expected value</summary><p>Expected value combines probability and price into a long-run expectation.</p></details>
+      <details><summary>Brier score</summary><p>Brier score measures probabilistic accuracy; lower values are better.</p></details>
+      <details><summary>Calibration</summary><p>Calibration checks whether model probabilities align with realized outcomes.</p></details>
+      <details><summary>Qualified</summary><p>Qualified means all required gates passed for this analytical recommendation.</p></details>
+      <details><summary>No-bet</summary><p>No-bet means one or more guardrails failed, so SIP does not recommend action.</p></details>
+      <details><summary>Data quality</summary><p>Data quality scores the completeness and reliability of supporting inputs.</p></details>
+      <details><summary>Stale quote</summary><p>Stale quotes are too old for reliable comparison and can force no-bet.</p></details>
+    </div>
+    <div class="sipx-status-row" aria-label="Status labels">
+      <span class="sipx-status qualified">Qualified analytical choice</span>
+      <span class="sipx-status no-bet">No-bet result</span>
+      <span class="sipx-status stale">Stale quote warning</span>
+      <span class="sipx-status unavailable">Unavailable</span>
+    </div>
+  </section>
   <div class="metrics">
     <div class="metric"><span>Odds feed</span><strong>{{ snapshot.feed.status|replace('_',' ')|title }}</strong></div>
     <div class="metric"><span>Upcoming NBA games</span><strong>{{ snapshot.league_summary.NBA.upcoming_events }}</strong><small>Future canonical events</small></div>
@@ -43,7 +74,23 @@
       <article class="event{% if event.league != 'NBA' %} hidden-by-filter{% endif %}" data-filter-item data-league="{{ event.league }}"><div class="event-head"><div><span class="badge">{{ event.league }}</span><div class="market-label">Full-game moneyline</div><h3>{{ event.away_team_name }} at {{ event.home_team_name }}</h3><div class="muted">{{ event.start_time }} · {{ event.venue or 'Venue unavailable' }}</div></div><span class="badge {{ 'passed' if event.complete_books >= snapshot.thresholds.minimum_complete_books else 'failed' }}">{{ event.complete_books }} complete books</span></div>
       <div class="table-wrap"><table class="quotes"><thead><tr><th>Sportsbook</th><th>Side</th><th>American price</th><th>Observed</th></tr></thead><tbody>{% for quote in event.quotes %}<tr><td>{{ quote.sportsbook|replace('_',' ')|title }}</td><td>{{ event.home_team_name if quote.selection == 'home' else event.away_team_name }}</td><td>{{ '%+d'|format(quote.american_price) }}</td><td>{{ quote.observed_at }}</td></tr>{% endfor %}</tbody></table></div>
       <div class="evidence"><strong>Current season:</strong> {{ event.season_context.current_season }}<br><strong>Previous season:</strong> {{ event.season_context.previous_season }}{% if event.forecasts %}<br><strong>Forecast factors:</strong> {{ event.forecasts[0].contributing_factors|join('; ') }}{% endif %}</div>
+      <div class="evidence warn"><strong>Important missing information:</strong> lineup, injury, and other context can be unavailable until the next persisted feature refresh.</div>
       {% if event.league == 'MLB' %}<div class="evidence warn"><strong>Baseball evidence check:</strong> Starting pitcher and confirmed lineup context are unavailable unless present in the refreshed feature snapshot. SIP does not infer them from the moneyline.</div>{% endif %}
+      <section class="sipx-calculator" aria-label="Practice Bet Calculator">
+        <h3>Practice Bet Calculator</h3>
+        <p class="sipx-warning">Practice Bet Calculator — estimates hypothetical returns only. It does not place a wager.</p>
+        <form class="sipx-practice-form" novalidate>
+          <div class="sipx-form-grid">
+            <label>American odds<input name="american_odds" inputmode="numeric" value="{{ event.quotes[0].american_price if event.quotes else '' }}"></label>
+            <label>Hypothetical wager (USD)<input name="wager_amount_usd" inputmode="decimal" value="25"></label>
+            <label>Model probability (optional)<input name="model_probability" inputmode="decimal" value="{{ event.evaluations[0].model_probability if event.evaluations else '' }}"></label>
+            <label>Market-implied probability (optional)<input name="market_implied_probability" inputmode="decimal" value="{{ event.evaluations[0].market_probability if event.evaluations else '' }}"></label>
+          </div>
+          <div class="sipx-actions"><button type="submit">Calculate</button></div>
+          <p class="sipx-error" data-practice-error aria-live="polite"></p>
+          <div class="sipx-result" data-practice-output></div>
+        </form>
+      </section>
       <div class="source-line">Source observations: {{ event.quotes|length }} · Canonical event: {{ event.canonical_id }}</div>
       <p><a href="/api/sip/games/{{ event.canonical_id }}">Inspect normalized event JSON →</a></p></article>
     {% else %}<div class="empty">No genuine upcoming events are stored. Configure the odds credential and run Refresh; live mode never inserts fixtures.</div>{% endfor %}
@@ -55,6 +102,10 @@
     {% for result in snapshot.qualified_choices %}
       <article class="choice{% if not result.canonical_event_id.lower().startswith('mlb:') %} hidden-by-filter{% endif %}" data-filter-item data-league="{{ result.canonical_event_id.split(':')[0]|upper }}"><div class="choice-head"><h3>{{ result.canonical_event_id }} · {{ result.selection|title }}</h3><span class="badge qualified">Qualified analytical choice</span></div>
       <div class="numbers"><div class="number"><span>Best price</span><strong>{{ result.best_sportsbook }} {{ '%+d'|format(result.best_price) }}</strong></div><div class="number"><span>Model</span><strong>{{ '%.1f%%'|format(result.model_probability*100) }}</strong></div><div class="number"><span>Market</span><strong>{{ '%.1f%%'|format(result.market_probability*100) }}</strong></div><div class="number"><span>Edge / EV</span><strong>{{ '%+.1f%%'|format(result.edge*100) }} / {{ '%+.1f%%'|format(result.expected_value*100) }}</strong></div></div>
+      <div class="sipx-line">SIP estimates this team wins {{ '%.1f%%'|format(result.model_probability*100) }} of the time.</div>
+      <div class="sipx-line">The sportsbook price implies approximately {{ '%.1f%%'|format(result.market_probability*100) }}.</div>
+      <div class="sipx-line">The estimated advantage is {{ '%+.1f'|format(result.edge*100) }} percentage points.</div>
+      <div class="sipx-line">Expected value is {{ '%+.1f%%'|format(result.expected_value*100) }} and this card remains informational only.</div>
       <div class="evidence">{{ result.evidence|join('<br>')|safe }}</div><p class="muted">Data quality {{ '%.0f%%'|format(result.data_quality*100) }}. This is analytical decision support, not a guaranteed winner.</p></article>
     {% endfor %}
     {% for result in snapshot.no_bet_results %}
@@ -67,7 +118,12 @@
         <div class="check"><span>Calibration</span><strong>{{ 'Passed' if result.diagnostics.calibration.passed else 'Failed' }}</strong></div>
         <div class="check"><span>Data quality</span><strong>{{ '%.0f%%'|format(result.diagnostics.data_quality.actual*100) }} / {{ '%.0f%%'|format(result.diagnostics.data_quality.required*100) }}</strong></div>
         <div class="check"><span>Edge</span><strong>{% if result.edge is not none %}{{ '%+.1f%%'|format(result.edge*100) }}{% else %}Unavailable{% endif %} / {{ '%.1f%%'|format(result.diagnostics.edge.required*100) }}</strong></div>
-      </div><div class="evidence warn"><strong>Reason codes:</strong> {{ result.reason_codes|join(', ') }}<br><strong>Next action:</strong> {{ result.diagnostics.next_actions|join(' ') }}</div></article>
+      </div><div class="evidence warn"><strong>Reason codes:</strong> {{ result.reason_codes|join(', ') }}<br><strong>Next action:</strong> {{ result.diagnostics.next_actions|join(' ') }}</div>
+      <div class="sipx-line">No-bet: the estimated advantage is too small.</div>
+      {% if result.diagnostics.complete_books.actual < result.diagnostics.complete_books.required %}
+      <div class="sipx-line">No-bet: fewer than two complete sportsbook quotes are available.</div>
+      {% endif %}
+      </article>
     {% else %}{% if not snapshot.qualified_choices %}<div class="empty">No evaluations exist yet. Run Refresh to create a persisted qualified or no-bet result.</div>{% endif %}{% endfor %}
     </div>
   </section>
@@ -85,4 +141,5 @@ const button=document.getElementById("refresh"),status=document.getElementById("
 button.addEventListener("click",async()=>{button.disabled=true;status.textContent="Refreshing provider data, forecasts, and qualification…";try{const response=await fetch("/api/sip/refresh",{method:"POST",headers:{"accept":"application/json"}});const result=await response.json();if(!response.ok)throw new Error("Refresh request failed");status.textContent=result.status==="succeeded"?"Refresh completed. Reloading…":`Refresh ${result.status}: ${result.error||"inspect System Status"}`;if(result.status==="succeeded")location.reload()}catch(error){status.textContent="Refresh failed safely. No demo data was substituted."}finally{button.disabled=false}});
 document.querySelectorAll("[data-league-filter]").forEach(control=>control.addEventListener("click",()=>{const league=control.dataset.leagueFilter;document.querySelectorAll("[data-league-filter]").forEach(item=>item.setAttribute("aria-pressed",String(item===control)));document.querySelectorAll("[data-filter-item]").forEach(item=>item.classList.toggle("hidden-by-filter",league!=="ALL"&&item.dataset.league!==league));}));
 </script>
+<script src="/static/sip_experience.js?v={{ frontend_version }}"></script>
 </body></html>

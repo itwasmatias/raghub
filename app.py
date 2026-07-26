@@ -20,6 +20,7 @@ from models.sports.player import Player
 from services.answer import AnswerService
 from services.overview import OverviewService
 from services.retrieve import RetrievalService
+from services.wager_calculator import PracticeWagerCalculator
 from sports.application.production_runtime import (
     ApplicationRuntime,
     build_production_runtime,
@@ -473,6 +474,52 @@ def create_app(
     @app.post("/api/sip/refresh")
     def sip_refresh():
         return _personal_service().scheduler.run_pending(force=True)
+
+    @app.post("/api/sip/practice-wager")
+    def sip_practice_wager():
+        payload = request.get_json(silent=True) or {}
+        try:
+            result = PracticeWagerCalculator.calculate(
+                american_odds=payload.get("american_odds"),
+                wager_amount_usd=payload.get("wager_amount_usd"),
+                model_probability=payload.get("model_probability"),
+                market_implied_probability=payload.get("market_implied_probability"),
+            )
+        except ValueError as error:
+            return {"error": str(error)}, 400
+
+        return {
+            "potential_profit_usd": f"{result['potential_profit_usd']:.2f}",
+            "total_return_usd": f"{result['total_return_usd']:.2f}",
+            "break_even_probability": f"{result['break_even_probability']:.4f}",
+            "model_probability": (
+                f"{result['model_probability']:.4f}"
+                if result["model_probability"] is not None
+                else None
+            ),
+            "market_implied_probability": (
+                f"{result['market_implied_probability']:.4f}"
+                if result["market_implied_probability"] is not None
+                else None
+            ),
+            "expected_profit_usd": (
+                f"{result['expected_profit_usd']:.2f}"
+                if result["expected_profit_usd"] is not None
+                else None
+            ),
+            "expected_return_percentage": (
+                f"{result['expected_return_percentage']:.2f}"
+                if result["expected_return_percentage"] is not None
+                else None
+            ),
+            "win_outcome_usd": f"{result['win_outcome_usd']:.2f}",
+            "loss_outcome_usd": f"{result['loss_outcome_usd']:.2f}",
+            "plain_language": result["plain_language"],
+            "warning": (
+                "Practice Bet Calculator — estimates hypothetical returns only. "
+                "It does not place a wager."
+            ),
+        }
 
     def _run_replay_demo() -> dict[str, object]:
         if replay_demo_factory is not None:
