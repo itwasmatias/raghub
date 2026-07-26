@@ -58,7 +58,7 @@ def configure_logging() -> None:
 
 
 def service() -> PersonalEditionService:
-    load_dotenv()
+    load_dotenv(override=True)
     return PersonalEditionService.from_environment()
 
 
@@ -124,7 +124,10 @@ def train_model(dataset: str | None, leagues: list[str]) -> int:
             model.save(output)
             results[label] = {**asdict(model.metadata), "path": str(output)}
     except FileNotFoundError as error:
-        print(f"MODEL_NOT_TRAINED: training dataset was not found: {error.filename}", file=sys.stderr)
+        print(
+            f"MODEL_NOT_TRAINED: training dataset was not found: {error.filename}",
+            file=sys.stderr,
+        )
         return 2
     except InsufficientCalibrationData as error:
         print(str(error), file=sys.stderr)
@@ -135,15 +138,20 @@ def train_model(dataset: str | None, leagues: list[str]) -> int:
 
 def evaluate() -> int:
     snapshot = service().snapshot()
-    print(json.dumps({
-        "mode": snapshot["mode"],
-        "feed": snapshot["feed"],
-        "model": snapshot["model"],
-        "events": len(snapshot["events"]),
-        "qualified_choices": len(snapshot["qualified_choices"]),
-        "no_bet_results": len(snapshot["no_bet_results"]),
-        "thresholds": snapshot["thresholds"],
-    }, indent=2))
+    print(
+        json.dumps(
+            {
+                "mode": snapshot["mode"],
+                "feed": snapshot["feed"],
+                "model": snapshot["model"],
+                "events": len(snapshot["events"]),
+                "qualified_choices": len(snapshot["qualified_choices"]),
+                "no_bet_results": len(snapshot["no_bet_results"]),
+                "thresholds": snapshot["thresholds"],
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -154,6 +162,7 @@ def run_server() -> int:
     application = service()
     settings = application.settings
     flask_app = create_app(personal_service=application)
+
     class StructuredRequestHandler(WSGIRequestHandler):
         def log_message(self, format, *args):
             logging.getLogger("sip.http").info(format, *args)
@@ -196,7 +205,7 @@ def run_scheduler() -> int:
 
 
 def main() -> int:
-    load_dotenv()
+    load_dotenv(override=True)
     configure_logging()
     parser = argparse.ArgumentParser(description="SIP Personal Edition operations")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -231,16 +240,12 @@ def main() -> int:
     }
     if arguments.command == "train-model":
         leagues = (
-            ["WNBA", "MLB"]
-            if arguments.league == "all"
-            else [arguments.league.upper()]
+            ["WNBA", "MLB"] if arguments.league == "all" else [arguments.league.upper()]
         )
         return train_model(arguments.dataset, leagues)
     if arguments.command == "prepare-history":
         leagues = (
-            ["WNBA", "MLB"]
-            if arguments.league == "all"
-            else [arguments.league.upper()]
+            ["WNBA", "MLB"] if arguments.league == "all" else [arguments.league.upper()]
         )
         return prepare_history(leagues)
     return actions[arguments.command]()

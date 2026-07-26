@@ -222,12 +222,17 @@ class ProductionBasketballRuntime:
             self.database_path
         )
         odds_provider = os.getenv("ODDS_PROVIDER", "the_odds_api").strip().lower()
-        api_key = os.getenv("ODDS_API_KEY", "").strip()
-        self.odds_source = odds_source or (
-            TheOddsApiSource(api_key=api_key)
-            if api_key and odds_provider == "the_odds_api"
-            else None
-        )
+        api_key = os.getenv("ODDS_API_IO_API_KEY", "").strip()
+        if odds_source is not None:
+            self.odds_source = odds_source
+        elif (
+            source is None
+            and api_key
+            and odds_provider in {"the_odds_api", "odds_api_io"}
+        ):
+            self.odds_source = TheOddsApiSource(api_key=api_key)
+        else:
+            self.odds_source = None
         self.betting_engine = betting_engine or BettingIntelligenceEngine()
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
@@ -252,9 +257,7 @@ class ProductionBasketballRuntime:
             ).refresh(now=self.clock())
 
     def get_betting_board(self) -> dict[str, Any]:
-        raw_quotes = self.intelligence_store.list_records(
-            "sportsbook_markets"
-        )
+        raw_quotes = self.intelligence_store.list_records("sportsbook_markets")
         now = self.clock().astimezone(timezone.utc)
         classifications = {
             str(row.get("data_classification") or "delayed").lower()
@@ -273,20 +276,16 @@ class ProductionBasketballRuntime:
                 "message": "Stored market records failed the production classification gate.",
             }
         board_classification = (
-            "live"
-            if raw_quotes and classifications == {"live"}
-            else "delayed"
+            "live" if raw_quotes and classifications == {"live"} else "delayed"
         )
         health = self.intelligence_store.source_health().get(
             "sportsbook_markets",
             {
                 "status": (
-                    "unconfigured"
-                    if self.odds_source is None
-                    else "not_refreshed"
+                    "unconfigured" if self.odds_source is None else "not_refreshed"
                 ),
                 "last_error": (
-                    "Configure ODDS_API_KEY for the selected provider and run Refresh."
+                    "Configure ODDS_API_IO_API_KEY for the selected provider and run Refresh."
                     if self.odds_source is None
                     else "Run Refresh to retrieve live odds."
                 ),
@@ -326,9 +325,7 @@ class ProductionBasketballRuntime:
             ):
                 if label and canonical_team:
                     team_aliases[str(label).lower()] = canonical_team
-        defaults = MarketNormalizer.release_candidate_defaults(
-            players=player_aliases
-        )
+        defaults = MarketNormalizer.release_candidate_defaults(players=player_aliases)
         normalizer = MarketNormalizer(
             team_aliases={**defaults.team_aliases, **team_aliases},
             player_aliases=player_aliases,
@@ -351,11 +348,7 @@ class ProductionBasketballRuntime:
             SQLiteLifecycleRepository(self.database_path)
         ).evaluate_forecasts()
         evaluated = int(forecast_quality.get("evaluated_forecasts") or 0)
-        brier = (
-            float(forecast_quality["brier_score"])
-            if evaluated >= 30
-            else None
-        )
+        brier = float(forecast_quality["brier_score"]) if evaluated >= 30 else None
         for event_id, canonical_player, market, line, outcome_definition in targets:
             player_id = player_ids.get(canonical_player)
             if not player_id:
@@ -364,9 +357,7 @@ class ProductionBasketballRuntime:
                 )
                 continue
             player_rows = [
-                row
-                for row in logs
-                if str(row.get("player_id")) == player_id
+                row for row in logs if str(row.get("player_id")) == player_id
             ]
             intelligence = self.player_intelligence_service.analyze(
                 player_id,
@@ -381,9 +372,7 @@ class ProductionBasketballRuntime:
             profile = intelligence.profiles.get("NBA:regular") or next(
                 iter(intelligence.profiles.values())
             )
-            standard_deviation = max(
-                1.0, profile.volatility.standard_deviation
-            )
+            standard_deviation = max(1.0, profile.volatility.standard_deviation)
             components = tuple(
                 self._normal_probability(
                     average.points,
@@ -426,9 +415,7 @@ class ProductionBasketballRuntime:
                 outcome_definition=outcome_definition,
                 forecast_type="player_points_over",
                 team_id=(
-                    f"nba:team:{player_rows[-1].get('team_id')}"
-                    if player_rows
-                    else ""
+                    f"nba:team:{player_rows[-1].get('team_id')}" if player_rows else ""
                 ),
                 player_role=(
                     "starter"
@@ -1844,4 +1831,3 @@ class ProductionBasketballRuntime:
             if value:
                 return value
         return default
-

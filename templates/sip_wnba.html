@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SIP WNBA Live Moneyline</title>
+  <style>
+    :root{--bg:#f6f4ee;--card:#fffdf8;--ink:#13233b;--muted:#5a6a7e;--line:#d8d2c4;--good:#17694a;--warn:#9b6208;--bad:#a6343d;--accent:#145f8c}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,sans-serif}
+    .shell{max-width:1100px;margin:auto;padding:24px}
+    h1,h2,h3{margin:0}
+    .hero{display:flex;justify-content:space-between;gap:20px;align-items:end;margin-bottom:18px}
+    .hero h1{font-size:2.25rem;letter-spacing:-0.02em}
+    .muted{color:var(--muted)}
+    .badge{display:inline-block;padding:4px 10px;border-radius:999px;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+    .healthy{background:#e2f4ea;color:var(--good)} .unavailable,.stale{background:#fde4e6;color:var(--bad)} .warn{background:#fff0da;color:var(--warn)}
+    .grid{display:grid;gap:12px}
+    .metrics{grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:18px}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
+    .card strong{display:block;font-size:1.4rem}
+    .event,.choice{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left}
+    .section{margin-top:18px}
+    .list{display:grid;gap:10px}
+    .kv{display:grid;grid-template-columns:180px 1fr;gap:8px}
+    .empty{padding:16px;border:1px dashed var(--line);border-radius:12px;color:var(--muted)}
+    @media(max-width:900px){.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.kv{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <span class="badge">WNBA Vertical Slice</span>
+        <h1>Live WNBA Moneyline</h1>
+        <p class="muted">Pregame full-game moneyline only. Shows live odds health, forecasts, qualification, and resolved performance.</p>
+      </div>
+      <div class="muted">Generated {{ snapshot.generated_at }}</div>
+    </section>
+
+    <section class="grid metrics">
+      <article class="card"><span class="muted">Feed status</span><strong>{{ snapshot.feed.status|replace('_',' ')|title }}</strong></article>
+      <article class="card"><span class="muted">Data freshness</span><strong>{{ snapshot.feed.freshness|replace('_',' ')|title }}</strong></article>
+      <article class="card"><span class="muted">Upcoming WNBA games</span><strong>{{ snapshot.league_summary.upcoming_events or 0 }}</strong></article>
+      <article class="card"><span class="muted">Resolved predictions</span><strong>{{ snapshot.wnba_performance.resolved_predictions or 0 }}</strong></article>
+    </section>
+
+    <section class="section">
+      <h2>Upcoming Games</h2>
+      <div class="list">
+      {% for event in snapshot.events %}
+        <article class="event">
+          <h3>{{ event.away_team_name }} at {{ event.home_team_name }}</h3>
+          <div class="muted">{{ event.start_time }} | Canonical: {{ event.canonical_id }}</div>
+          <div class="muted">Status: {{ event.status }} | Complete books: {{ event.complete_books }}</div>
+          <table>
+            <thead><tr><th>Sportsbook</th><th>Selection</th><th>Price</th><th>Observed</th></tr></thead>
+            <tbody>
+              {% for quote in event.quotes %}
+              <tr>
+                <td>{{ quote.sportsbook }}</td>
+                <td>{{ quote.selection }}</td>
+                <td>{{ '%+d'|format(quote.american_price) }}</td>
+                <td>{{ quote.observed_at }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+          {% if event.forecasts %}
+          <p><strong>Forecast model version:</strong> {{ event.forecasts[0].model_version }}</p>
+          {% else %}
+          <p class="muted">No persisted forecast yet for this event.</p>
+          {% endif %}
+        </article>
+      {% else %}
+        <div class="empty">No stored WNBA upcoming events.</div>
+      {% endfor %}
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Qualification Results</h2>
+      <div class="list">
+      {% for result in snapshot.evaluations %}
+        <article class="choice">
+          <h3>{{ result.canonical_event_id }} | {{ result.selection|title }} | {{ result.status }}</h3>
+          <div class="kv">
+            <div class="muted">Best sportsbook/price</div><div>{{ result.best_sportsbook or 'n/a' }} {% if result.best_price is not none %}{{ '%+d'|format(result.best_price) }}{% endif %}</div>
+            <div class="muted">Consensus implied probability</div><div>{% if result.market_probability is not none %}{{ '%.2f'|format(result.market_probability) }}{% else %}n/a{% endif %}</div>
+            <div class="muted">Model probability</div><div>{% if result.model_probability is not none %}{{ '%.2f'|format(result.model_probability) }}{% else %}n/a{% endif %}</div>
+            <div class="muted">Edge</div><div>{% if result.edge is not none %}{{ '%+.2f'|format(result.edge) }}{% else %}n/a{% endif %}</div>
+            <div class="muted">Expected value</div><div>{% if result.expected_value is not none %}{{ '%+.3f'|format(result.expected_value) }}{% else %}n/a{% endif %}</div>
+            <div class="muted">Data quality</div><div>{{ '%.0f%%'|format((result.data_quality or 0)*100) }}</div>
+            <div class="muted">Reason codes</div><div>{{ result.reason_codes|join(', ') if result.reason_codes else 'qualified' }}</div>
+          </div>
+        </article>
+      {% else %}
+        <div class="empty">No WNBA qualification results yet.</div>
+      {% endfor %}
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Resolved Performance</h2>
+      <div class="card">
+        <div class="kv">
+          <div class="muted">Accuracy</div><div>{% if snapshot.wnba_performance.accuracy is not none %}{{ '%.2f'|format(snapshot.wnba_performance.accuracy) }}{% else %}n/a{% endif %}</div>
+          <div class="muted">Brier score</div><div>{% if snapshot.wnba_performance.brier_score is not none %}{{ '%.4f'|format(snapshot.wnba_performance.brier_score) }}{% else %}n/a{% endif %}</div>
+          <div class="muted">Log loss</div><div>{% if snapshot.wnba_performance.log_loss is not none %}{{ '%.4f'|format(snapshot.wnba_performance.log_loss) }}{% else %}n/a{% endif %}</div>
+        </div>
+      </div>
+      <div class="list" style="margin-top:10px;">
+      {% for item in snapshot.resolved_predictions %}
+        <article class="card">
+          <strong>{{ item.canonical_event_id }} | {{ item.selection }} -> {{ item.winner_selection }}</strong>
+          <div class="muted">Model {{ item.model_version }} | Correct: {{ item.correct }} | Brier {{ '%.4f'|format(item.brier_contribution) }} | Log loss {{ '%.4f'|format(item.log_loss_contribution) }}</div>
+        </article>
+      {% else %}
+        <div class="empty">No resolved WNBA predictions yet.</div>
+      {% endfor %}
+      </div>
+    </section>
+  </main>
+</body>
+</html>

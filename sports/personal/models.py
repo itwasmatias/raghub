@@ -21,6 +21,11 @@ class FeedHealth:
     complete_books: int
     freshness: str
     error: str | None = None
+    provider: str | None = None
+    quota_remaining: int | None = None
+    quota_used: int | None = None
+    quota_last: int | None = None
+    provider_health: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def configured_success(
@@ -35,6 +40,11 @@ class FeedHealth:
             events_received=events,
             complete_books=complete_books,
             freshness="fresh",
+            provider=None,
+            quota_remaining=None,
+            quota_used=None,
+            quota_last=None,
+            provider_health={},
         )
 
 
@@ -176,3 +186,22 @@ class QualificationResult:
     evaluated_at: str = ""
     evidence: tuple[str, ...] = ()
     risks: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedPredictionRecord:
+    canonical_event_id: str
+    league: str
+    selection: str
+    winner_selection: str
+    model_probability: float
+    calibrated_probability: float | None
+    model_version: str
+    feature_timestamp: str
+    forecast_timestamp: str
+    resolved_at: str
+    outcome_event_time: str
+    correct: bool
+    brier_contribution: float
+    log_loss_contribution: float
+    source: str

@@ -15,6 +15,7 @@ from sports.personal.models import (
     MoneylineForecast,
     NormalizedMoneylineQuote,
     QualificationResult,
+    ResolvedPredictionRecord,
 )
 
 
@@ -84,6 +85,25 @@ class PersonalEditionRepository:
                 attempts INTEGER NOT NULL,
                 error TEXT
             );
+            """,
+        ),
+        (
+            2,
+            """
+            CREATE TABLE IF NOT EXISTS sip_resolved_predictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                canonical_event_id TEXT NOT NULL,
+                selection TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                forecast_timestamp TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                UNIQUE (
+                    canonical_event_id, selection, model_version,
+                    forecast_timestamp
+                )
+            );
+            CREATE INDEX IF NOT EXISTS idx_sip_resolved_predictions_event
+                ON sip_resolved_predictions(canonical_event_id, forecast_timestamp);
             """,
         ),
     )
@@ -204,9 +224,7 @@ class PersonalEditionRepository:
                     ],
                 )
 
-    def save_evaluation(
-        self, result: QualificationResult, *, data_mode: str
-    ) -> int:
+    def save_evaluation(self, result: QualificationResult, *, data_mode: str) -> int:
         self.migrate()
         payload = asdict(result)
         payload["reason_codes"] = [
@@ -292,9 +310,7 @@ class PersonalEditionRepository:
             metadata["training_period"] = tuple(metadata["training_period"])
             metadata["validation_period"] = tuple(metadata["validation_period"])
             payload["metadata"] = ModelMetadata(**metadata)
-            payload["contributing_factors"] = tuple(
-                payload["contributing_factors"]
-            )
+            payload["contributing_factors"] = tuple(payload["contributing_factors"])
             payload["missing_feature_warnings"] = tuple(
                 payload["missing_feature_warnings"]
             )
@@ -362,3 +378,56 @@ class PersonalEditionRepository:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def save_resolved_predictions(
+        self,
+        rows: tuple[ResolvedPredictionRecord, ...] | list[ResolvedPredictionRecord],
+    ) -> None:
+        if not rows:
+            return
+        self.migrate()
+        with closing(self.connect()) as connection:
+            with connection:
+                connection.executemany(
+                    """
+                    INSERT OR IGNORE INTO sip_resolved_predictions (
+                        canonical_event_id, selection, model_version,
+                        forecast_timestamp, payload_json
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            item.canonical_event_id,
+                            item.selection,
+                            item.model_version,
+                            item.forecast_timestamp,
+                            json.dumps(asdict(item), sort_keys=True),
+                        )
+                        for item in rows
+                    ],
+                )
+
+    def list_resolved_predictions(
+        self,
+    ) -> list[ResolvedPredictionRecord]:
+        self.migrate()
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT payload_json
+                FROM sip_resolved_predictions
+                ORDER BY forecast_timestamp
+                """
+            ).fetchall()
+        return [ResolvedPredictionRecord(**json.loads(row[0])) for row in rows]
+
+    def resolved_prediction_keys(self) -> set[tuple[str, str, str, str]]:
+        self.migrate()
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT canonical_event_id, selection, model_version, forecast_timestamp
+                FROM sip_resolved_predictions
+                """
+            ).fetchall()
+        return {(str(a), str(b), str(c), str(d)) for a, b, c, d in rows}

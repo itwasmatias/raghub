@@ -36,10 +36,12 @@ class SportsGameOddsMoneylineSource:
         page_limit: int = 5,
     ) -> None:
         if not api_key.strip():
-            raise ValueError("ODDS_API_KEY is required")
+            raise ValueError("SPORTSGAMEODDS_API_KEY is required")
         unsupported = set(leagues) - set(self.supported_leagues)
         if unsupported:
-            raise ValueError(f"unsupported SportsGameOdds leagues: {sorted(unsupported)}")
+            raise ValueError(
+                f"unsupported SportsGameOdds leagues: {sorted(unsupported)}"
+            )
         self.api_key = api_key.strip()
         self.leagues = leagues
         normalized_base_url = base_url.strip().rstrip("/")
@@ -68,7 +70,10 @@ class SportsGameOddsMoneylineSource:
         payload = response.json()
         if not isinstance(payload, dict) or payload.get("success") is not True:
             raise ValueError(self._error(payload))
-        return {"authenticated": True, "events_accessible": len(payload.get("data") or [])}
+        return {
+            "authenticated": True,
+            "events_accessible": len(payload.get("data") or []),
+        }
 
     def fetch(self, *, correlation_id: str = "") -> list[dict[str, Any]]:
         rows = []
@@ -184,32 +189,34 @@ class SportsGameOddsMoneylineSource:
                         price = int(str(quote["odds"]).replace("+", ""))
                     except (KeyError, TypeError, ValueError):
                         continue
-                    rows.append({
-                        "provider_event_id": event_id,
-                        "league": league,
-                        "season": str(
-                            datetime.fromisoformat(
-                                start.replace("Z", "+00:00")
-                            ).year
-                        ),
-                        "event_start": start,
-                        "home_team": home,
-                        "away_team": away,
-                        "venue": (event.get("venue") or {}).get("name"),
-                        "sportsbook": book_key,
-                        "market": "h2h",
-                        "period": "full_game",
-                        "selection": selection,
-                        "selection_team": selected_team,
-                        "line": None,
-                        "american_price": price,
-                        "observed_at": retrieved_at,
-                        "provider_updated_at": quote.get("lastUpdatedAt"),
-                        "source": self.name,
-                        "source_url": self.base_url,
-                        "data_mode": "live",
-                        "is_live": False,
-                    })
+                    rows.append(
+                        {
+                            "provider_event_id": event_id,
+                            "league": league,
+                            "season": str(
+                                datetime.fromisoformat(
+                                    start.replace("Z", "+00:00")
+                                ).year
+                            ),
+                            "event_start": start,
+                            "home_team": home,
+                            "away_team": away,
+                            "venue": (event.get("venue") or {}).get("name"),
+                            "sportsbook": book_key,
+                            "market": "h2h",
+                            "period": "full_game",
+                            "selection": selection,
+                            "selection_team": selected_team,
+                            "line": None,
+                            "american_price": price,
+                            "observed_at": retrieved_at,
+                            "provider_updated_at": quote.get("lastUpdatedAt"),
+                            "source": self.name,
+                            "source_url": self.base_url,
+                            "data_mode": "live",
+                            "is_live": False,
+                        }
+                    )
         return rows
 
     @staticmethod

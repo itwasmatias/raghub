@@ -229,9 +229,7 @@ class MoneylineQualificationService:
             ),
             risks=tuple(
                 str(value)
-                for value in (
-                    forecast.missing_feature_warnings if forecast else ()
-                )
+                for value in (forecast.missing_feature_warnings if forecast else ())
             ),
         )
 
@@ -251,7 +249,9 @@ class MoneylineQualificationService:
     @staticmethod
     def _next_action(reason: QualificationReason) -> str:
         actions = {
-            QualificationReason.ODDS_FEED_NOT_CONFIGURED: "Configure ODDS_API_KEY and enable the odds feed.",
+            QualificationReason.ODDS_FEED_NOT_CONFIGURED: (
+                "Configure ODDS_API_IO_API_KEY or SPORTSGAMEODDS_API_KEY and enable the odds feed."
+            ),
             QualificationReason.ODDS_FEED_UNAVAILABLE: "Retry the provider refresh and inspect System Status.",
             QualificationReason.ODDS_DATA_STALE: "Refresh sportsbook odds before evaluating.",
             QualificationReason.EVENT_NORMALIZATION_FAILED: "Resolve league, teams, and start-time identities.",

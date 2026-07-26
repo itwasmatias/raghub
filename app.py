@@ -38,7 +38,7 @@ from sports.features.registry import FeatureRegistry
 from web_ui import create_feature_ui_instance
 
 
-load_dotenv(Path(__file__).with_name(".env"))
+load_dotenv(Path(__file__).with_name(".env"), override=True)
 
 
 def create_app(
@@ -55,12 +55,8 @@ def create_app(
     worker_token: str | None = None,
 ):
     app = Flask(__name__)
-    if os.getenv("SIP_TRUST_PROXY", "false").strip().lower() in {
-        "1", "true", "yes"
-    }:
-        app.wsgi_app = ProxyFix(
-            app.wsgi_app, x_for=1, x_proto=1, x_host=1
-        )
+    if os.getenv("SIP_TRUST_PROXY", "false").strip().lower() in {"1", "true", "yes"}:
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
     version = Path("VERSION").read_text(encoding="utf-8").strip()
     frontend_files = (
         Path("templates/sip_personal.html"),
@@ -163,10 +159,11 @@ def create_app(
                 "request_id": g.request_id,
             }, 429
         window.append(now)
-        if (
-            release_settings.demo_read_only
-            and request.method not in {"GET", "HEAD", "OPTIONS"}
-        ):
+        if release_settings.demo_read_only and request.method not in {
+            "GET",
+            "HEAD",
+            "OPTIONS",
+        }:
             return {
                 "error": "This deployment is in read-only demo mode.",
                 "request_id": g.request_id,
@@ -184,7 +181,10 @@ def create_app(
         )
         response.headers["X-SIP-Frontend-Version"] = frontend_version
         if response.mimetype in {
-            "text/html", "text/css", "application/javascript", "text/javascript"
+            "text/html",
+            "text/css",
+            "application/javascript",
+            "text/javascript",
         }:
             response.headers["Cache-Control"] = "no-store, max-age=0"
             response.headers["Pragma"] = "no-cache"
@@ -237,6 +237,11 @@ def create_app(
     def home():
         snapshot = _personal_service().snapshot()
         return render_template("sip_personal.html", snapshot=snapshot)
+
+    @app.route("/wnba")
+    def wnba_home():
+        snapshot = _personal_service().wnba_snapshot()
+        return render_template("sip_wnba.html", snapshot=snapshot)
 
     @app.route("/legacy")
     def legacy_home():
@@ -407,6 +412,10 @@ def create_app(
     @app.get("/api/sip/dashboard")
     def sip_dashboard():
         return _personal_service().snapshot()
+
+    @app.get("/api/sip/wnba")
+    def sip_wnba_dashboard():
+        return _personal_service().wnba_snapshot()
 
     @app.get("/api/sip/games")
     def sip_games():
