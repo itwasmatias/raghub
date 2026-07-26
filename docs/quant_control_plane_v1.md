@@ -171,3 +171,78 @@ Reversal and correction are append-only. A correction creates a new event that s
 3. Route qualification output through the strategy eligibility contract.
 4. Route exposure and risk checks before sizing or execution.
 5. Add settlement and feedback contracts after the approval path is sealed.
+
+## Phase 2A Additive Exposure Authority Freeze
+
+Phase 2A introduces additive authoritative exposure contracts under
+`sports.execution.exposure_v1`.
+
+Legacy compatibility shapes remain frozen and readable as legacy summary views:
+
+- `sports.execution.exposure.ExposureCalculator`
+- `sports.execution.exposure.ExposurePosition`
+- `sports.execution.contracts.ExposureSnapshotV1`
+
+Phase 2A does not modify API routes, repository integration, risk sizing behavior,
+or persistence migration. It freezes contract semantics only.
+
+### Exposure authority constraints
+
+- No probability values are accepted in exposure input contracts.
+- Exposure uses reconciliation references and version lineage only.
+- Monetary values use `Decimal`; USD quantization is explicit at `0.01` with
+  `ROUND_HALF_EVEN`.
+- Contribution-ledger semantics separate top-level monetary totals from
+  non-additive dimensional allocation evidence.
+- Projection contracts are immutable and cannot mutate bankroll references,
+  ledger balances, positions, or reservations.
+- Authoritative projections require actual bound snapshot, candidate, and
+  bankroll objects; opaque IDs and hashes are insufficient.
+- Constructed projections retain those actual objects, and future downstream
+  consumers must call `validate_authoritative_projection_integrity` before a
+  projection can inform risk, sizing, or execution.
+- Projected totals derive exclusively from current snapshot totals plus verified
+  candidate economics.
+- Candidate parlay dimensions derive from the actual parent and complete leg
+  identities and remain non-additive; straight candidates also require their
+  complete frozen dimensional identity.
+- Record collection validation accepts actual records and resolves corrections
+  and reversals through an append-only acyclic single-head lineage graph whose
+  edges retire prior heads without rewriting frozen targets and whose
+  replacements preserve complete wager and leg identity. Terminal historical
+  heads remain hash-bound evidence but are excluded from current aggregation;
+  corrected and superseded states require a replacement child.
+- Record, candidate, bankroll, contribution, and projection authority boundaries
+  reconstruct public fields through the frozen constructors. Semantic/type
+  validation therefore does not trust a recomputed hash or process-local seal.
+- Canonical sportsbook identity uses the closed V1 provider taxonomy;
+  display-name and separator aliases reject before import or manual-ticket
+  deduplication.
+- Snapshot construction binds actual final-head records, an actual bankroll
+  object, and complete monetary and full-identity dimensional contribution
+  ledgers. Snapshot totals, counts, aggregates, concentration/correlation
+  outputs, and denominator percentages derive from that evidence rather than
+  caller values. Positive exposure against a zero bankroll denominator derives
+  an unavailable status and explicit reasons; non-available snapshots cannot
+  be promoted into authoritative projections. Bound snapshot evidence is
+  retained and revalidated at projection assembly, including the original
+  availability status and reasons. Full historical lineage has independent
+  derived construction evidence, remains scope-checked, and participates in
+  candidate collision detection even when it contributes zero current
+  economics.
+- Keyed seals are process-local tamper evidence only. They are excluded from
+  public dataclass hashes, are not durable signatures, and do not defend against
+  hostile code invoking module-private helpers. Cross-process payloads must be
+  reconstructed through V1 constructors.
+- Manual recorded-real records preserve typed immutable receipt and actor
+  provenance, point-in-time eligibility, and duplicate-execution identity
+  without creating execution authority.
+- Reason codes use a closed taxonomy and canonical ordering includes severity
+  and deterministic, type-restricted metadata.
+
+Phase 2A does not prove repository completeness or snapshot-ID issuance.
+Phase 2B must assemble authoritative history from a repository
+manifest/idempotency boundary and run snapshot/projection integrity validation
+before any downstream financial decision.
+
+See `docs/exposure_engine_v1_contract_freeze.md` for the complete Phase 2A freeze.
