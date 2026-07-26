@@ -170,6 +170,48 @@ class DecisionReasonV1:
 
 
 @dataclass(frozen=True, slots=True)
+class ConsensusQuoteEvidenceV1:
+    quote_id: str
+    canonical_sportsbook_id: str
+    provider_id: str
+    league: str
+    event_id: str
+    market_id: str
+    market_type: str
+    selection_id: str
+    outcome_id: str
+    period: str
+    outcome_schema: str
+    observed_at: str
+    active: bool
+    complete_market: bool
+    included_in_consensus: bool
+    no_vig_probability: Decimal
+    schema_version: str = SCHEMA_VERSION_V1
+
+    def __post_init__(self) -> None:
+        _require_nonempty_text("quote_id", self.quote_id)
+        _require_nonempty_text("canonical_sportsbook_id", self.canonical_sportsbook_id)
+        _require_nonempty_text("provider_id", self.provider_id)
+        _require_nonempty_text("league", self.league)
+        _require_nonempty_text("event_id", self.event_id)
+        _require_nonempty_text("market_id", self.market_id)
+        _require_nonempty_text("market_type", self.market_type)
+        _require_nonempty_text("selection_id", self.selection_id)
+        _require_nonempty_text("outcome_id", self.outcome_id)
+        _require_nonempty_text("period", self.period)
+        _require_nonempty_text("outcome_schema", self.outcome_schema)
+        _parse_utc_timestamp("observed_at", self.observed_at)
+        normalized_probability = _normalize_probability(
+            "no_vig_probability",
+            self.no_vig_probability,
+        )
+        if normalized_probability is None:
+            raise ValueError("no_vig_probability must be present")
+        object.__setattr__(self, "no_vig_probability", normalized_probability)
+
+
+@dataclass(frozen=True, slots=True)
 class ProbabilitySnapshotV1:
     snapshot_id: str
     league: str
@@ -186,7 +228,7 @@ class ProbabilitySnapshotV1:
     raw_decimal_odds: Decimal
     raw_implied_probability: Decimal
     no_vig_probability: Decimal
-    cross_book_consensus_probability: Decimal
+    cross_book_consensus_probability: Decimal | None
     raw_sip_probability: Decimal
     calibrated_sip_probability: Decimal
     reconciled_execution_probability: Decimal | None
@@ -337,6 +379,17 @@ class ProbabilitySnapshotV1:
         ):
             raise ValueError("reconciled probability must be inside confidence bounds")
 
+        if (
+            self.cross_book_consensus_probability is None
+            and not self.historical_prior_missing
+        ):
+            # Missing consensus is allowed at contract level for pre-reconciliation evidence,
+            # but prior evidence must be explicit when consensus is unavailable.
+            if self.historical_prior_probability is None:
+                raise ValueError(
+                    "historical_prior_probability is required when consensus is missing"
+                )
+
         implied_from_decimal = (Decimal("1") / self.raw_decimal_odds).quantize(
             PROBABILITY_PRECISION, rounding=ROUND_HALF_UP
         )
@@ -436,9 +489,10 @@ class ProbabilitySnapshotV1:
             "raw_decimal_odds": format(self.raw_decimal_odds, "f"),
             "raw_implied_probability": format(self.raw_implied_probability, "f"),
             "no_vig_probability": format(self.no_vig_probability, "f"),
-            "cross_book_consensus_probability": format(
-                self.cross_book_consensus_probability,
-                "f",
+            "cross_book_consensus_probability": (
+                format(self.cross_book_consensus_probability, "f")
+                if self.cross_book_consensus_probability is not None
+                else None
             ),
             "raw_sip_probability": format(self.raw_sip_probability, "f"),
             "calibrated_sip_probability": format(self.calibrated_sip_probability, "f"),

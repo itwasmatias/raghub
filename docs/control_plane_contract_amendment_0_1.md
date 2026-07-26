@@ -109,3 +109,45 @@ Category values: data_quality, coverage, freshness, model, calibration, policy, 
 - New producers should populate all added identity, approval, and evidence fields
 - Consumers should switch to reconciled_execution_probability and execution_eligible checks
 - Structured reason codes should replace free-form string matching in downstream gates
+
+## Additive correction: authoritative quote identity and uniqueness
+
+This amendment now requires full quote-evidence identity for reconciliation scope authority.
+
+### Added quote-evidence identity fields
+
+ConsensusQuoteEvidenceV1 now requires these immutable scope fields per quote observation:
+
+- league
+- event_id
+- market_id
+- market_type
+- selection_id
+- outcome_id
+- period
+- outcome_schema
+
+These are additive fields and do not create a parallel evidence type.
+
+### Quote-ID uniqueness invariant
+
+- quote_id is a unique immutable source-observation identifier.
+- Repeated quote_id values in one reconciliation request are treated as an integrity violation.
+- Duplicate quote_id records emit a blocking PRB_DUPLICATE_QUOTE_ID reason.
+- Coverage and admitted-consensus derivation do not proceed until uniqueness passes.
+
+### Coverage validation order
+
+Coverage and consensus are now derived only after both checks pass:
+
+1. quote_id uniqueness validation
+2. full scope identity validation against the snapshot
+
+If either check fails, reconciliation remains non-execution-eligible and emitted blockers explain the violation.
+
+### Scope compatibility implications
+
+- Admitted evidence must match snapshot scope for league, event, market, market type,
+  period, selection, outcome identity, and outcome schema.
+- Out-of-scope evidence emits PRB_CONSENSUS_SCOPE_MISMATCH.
+- Opposing selection or outcome quotes cannot be admitted merely by sharing market-level labels.

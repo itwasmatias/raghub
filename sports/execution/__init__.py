@@ -27,7 +27,12 @@ from sports.execution.models import (
     StrategyEligibilityPolicy,
     SizingResult,
 )
-from sports.execution.probability import ProbabilityReconciler
+from sports.execution.probability import (
+    ProbabilityReconciler as LegacyProbabilityReconciler,
+)
+from sports.execution.probability_reconciliation import (
+    ProbabilityReconciliationServiceV1 as ProbabilityReconciler,
+)
 from sports.execution.risk import RiskPolicyEngine
 from sports.execution.sizing import KellySizer
 from sports.execution.state_machine import OrderIntentStateMachine
@@ -49,6 +54,7 @@ __all__ = [
     "OrderIntentStateMachine",
     "PracticeExecutionAdapter",
     "ProbabilityReconciler",
+    "LegacyProbabilityReconciler",
     "ProbabilityRecord",
     "ProbabilityReconciliationPolicy",
     "ReconciledProbabilityResult",
