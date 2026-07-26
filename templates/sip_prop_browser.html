@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SIP Props Browser</title>
+    <link rel="stylesheet" href="/static/sip_market_ui.css?v={{ frontend_version }}" />
+  </head>
+  <body data-page="props">
+    <header class="topbar">
+      <div class="brand">SIP Market Intelligence</div>
+      <nav class="topnav" aria-label="Primary">
+        <a href="/sip/markets">Markets</a>
+        <a href="/sip/props" aria-current="page">Props</a>
+        <a href="/sip/parlay-builder">Parlay Builder</a>
+        <a href="/sip/portfolio">Portfolio</a>
+      </nav>
+      <a class="pill" href="/sip/markets">All Markets</a>
+    </header>
+    <main class="detail-main">
+      <h1>Prop Browser</h1>
+      <p>Player props and team props with market versus SIP comparison.</p>
+      <div id="props-root" class="market-feed" aria-live="polite"></div>
+    </main>
+    <script src="/static/sip_market_ui.js?v={{ frontend_version }}"></script>
+  </body>
+</html>

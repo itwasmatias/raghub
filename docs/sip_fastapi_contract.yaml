@@ -1,0 +1,320 @@
+openapi: 3.1.0
+info:
+  title: SIP Market and Portfolio API Contract
+  version: 0.1.0
+  description: |
+    Contract-first design for the SIP market-centric architecture.
+    This specification intentionally excludes sportsbook execution.
+servers:
+  - url: /api/sip
+paths:
+  /markets:
+    get:
+      summary: List market feed cards
+      parameters:
+        - in: query
+          name: league
+          schema:
+            type: string
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [open, closed, settled, void]
+        - in: query
+          name: search
+          schema:
+            type: string
+        - in: query
+          name: account_id
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Market feed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MarketFeedResponse"
+  /markets/{market_id}:
+    get:
+      summary: Get market detail page data
+      parameters:
+        - in: path
+          name: market_id
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: account_id
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Market detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MarketDetailResponse"
+  /order-intents:
+    post:
+      summary: Record proposed position intent, validate, and optionally commit to ledger records
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OrderIntentRequest"
+      responses:
+        "200":
+          description: Recorded and committed without execution
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderIntentRecordedResponse"
+        "400":
+          description: Intent recorded but not committed due to validation failures
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderIntentRejectedResponse"
+  /portfolio:
+    get:
+      summary: Portfolio summary and position lists
+      parameters:
+        - in: query
+          name: account_id
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Portfolio data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PortfolioResponse"
+  /activity:
+    get:
+      summary: Immutable activity feed
+      parameters:
+        - in: query
+          name: account_id
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Activity data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActivityResponse"
+components:
+  schemas:
+    Market:
+      type: object
+      required:
+        - id
+        - canonical_event_id
+        - league
+        - market_type
+        - period
+        - title
+        - description
+        - status
+        - opens_at
+        - closes_at
+        - settlement_rule
+        - resolution_source
+        - created_at
+        - updated_at
+      properties:
+        id: { type: string }
+        canonical_event_id: { type: string }
+        league: { type: string }
+        market_type: { type: string }
+        period: { type: string }
+        title: { type: string }
+        description: { type: string }
+        status: { type: string, enum: [open, closed, settled, void] }
+        opens_at: { type: string, format: date-time }
+        closes_at: { type: string, format: date-time }
+        settlement_rule: { type: string }
+        resolution_source: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    Outcome:
+      type: object
+      required: [id, market_id, name, selection_key, status, result]
+      properties:
+        id: { type: string }
+        market_id: { type: string }
+        name: { type: string }
+        selection_key: { type: string }
+        team_id: { type: [string, "null"] }
+        status: { type: string, enum: [open, closed, settled] }
+        result: { type: string, enum: [pending, win, loss, push, void] }
+    Quote:
+      type: object
+      required:
+        - id
+        - market_id
+        - outcome_id
+        - provider
+        - sportsbook
+        - american_odds
+        - decimal_odds
+        - implied_probability
+        - observed_at
+        - is_best_price
+        - is_stale
+      properties:
+        id: { type: string }
+        market_id: { type: string }
+        outcome_id: { type: string }
+        provider: { type: string }
+        sportsbook: { type: string }
+        american_odds: { type: integer }
+        decimal_odds: { type: string }
+        implied_probability: { type: string }
+        observed_at: { type: string, format: date-time }
+        is_best_price: { type: boolean }
+        is_stale: { type: boolean }
+    OrderIntentRequest:
+      type: object
+      required: [market_id, outcome_id, mode, stake, accepted_odds]
+      properties:
+        account_id: { type: string }
+        market_id: { type: string }
+        outcome_id: { type: string }
+        mode: { type: string, enum: [practice, recorded_real] }
+        stake: { type: string }
+        requested_odds: { type: integer }
+        accepted_odds: { type: integer }
+    ValidationIssue:
+      type: object
+      required: [code, detail]
+      properties:
+        code: { type: string }
+        detail: { type: string }
+    OrderIntentRejectedResponse:
+      type: object
+      required: [status, order_intent_id, validation, execution]
+      properties:
+        status: { type: string, enum: [rejected] }
+        order_intent_id: { type: string }
+        validation:
+          type: object
+          properties:
+            is_valid: { type: boolean, const: false }
+            issues:
+              type: array
+              items:
+                $ref: "#/components/schemas/ValidationIssue"
+        execution: { type: string, const: disabled }
+        message: { type: string }
+    OrderIntentRecordedResponse:
+      type: object
+      required: [status, order_intent_id, bet_id, position_id, execution, actions]
+      properties:
+        status: { type: string, enum: [recorded] }
+        order_intent_id: { type: string }
+        bet_id: { type: string }
+        position_id: { type: string }
+        execution: { type: string, const: disabled }
+        actions:
+          type: object
+          properties:
+            primary: { type: string }
+    MarketFeedCard:
+      allOf:
+        - $ref: "#/components/schemas/Market"
+        - type: object
+          properties:
+            outcomes:
+              type: array
+              items:
+                type: object
+            qualified_label: { type: string }
+            has_open_position: { type: boolean }
+    MarketFeedResponse:
+      type: object
+      required: [markets, has_persisted_data]
+      properties:
+        markets:
+          type: array
+          items:
+            $ref: "#/components/schemas/MarketFeedCard"
+        has_persisted_data: { type: boolean }
+        unavailable_state: { type: [string, "null"] }
+        filters:
+          type: object
+    MarketDetailResponse:
+      type: object
+      required: [market, outcomes, quotes, positions, related_markets, recent_activity]
+      properties:
+        market:
+          $ref: "#/components/schemas/Market"
+        outcomes:
+          type: array
+          items:
+            $ref: "#/components/schemas/Outcome"
+        quotes:
+          type: array
+          items:
+            $ref: "#/components/schemas/Quote"
+        positions:
+          type: array
+          items:
+            type: object
+        related_markets:
+          type: array
+          items:
+            $ref: "#/components/schemas/Market"
+        recent_activity:
+          type: array
+          items:
+            type: object
+    PortfolioResponse:
+      type: object
+      required:
+        - account_id
+        - cash_balance
+        - reserved_balance
+        - portfolio_value
+        - open_stake
+        - maximum_possible_loss
+        - maximum_possible_profit
+        - realized_profit_loss
+        - open_positions
+        - settled_positions
+        - exposure
+      properties:
+        account_id: { type: string }
+        cash_balance: { type: string }
+        reserved_balance: { type: string }
+        portfolio_value: { type: string }
+        open_stake: { type: string }
+        maximum_possible_loss: { type: string }
+        maximum_possible_profit: { type: string }
+        realized_profit_loss: { type: string }
+        open_positions: { type: integer }
+        settled_positions: { type: integer }
+        open_positions_list:
+          type: array
+          items:
+            type: object
+        settled_positions_list:
+          type: array
+          items:
+            type: object
+        exposure:
+          type: object
+    ActivityResponse:
+      type: object
+      required: [account_id, events]
+      properties:
+        account_id: { type: string }
+        events:
+          type: array
+          items:
+            type: object

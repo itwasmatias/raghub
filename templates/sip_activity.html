@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SIP Activity</title>
+    <link rel="stylesheet" href="/static/sip_market_ui.css?v={{ frontend_version }}" />
+  </head>
+  <body data-page="activity">
+    <header class="topbar">
+      <div class="brand">SIP Market Intelligence</div>
+      <nav class="topnav" aria-label="Primary">
+        <a href="/sip/markets">Markets</a>
+        <a href="/sip/portfolio">Portfolio</a>
+        <a href="/sip/activity" aria-current="page">Activity</a>
+      </nav>
+      <a class="pill" href="/sip/portfolio">Portfolio Summary</a>
+    </header>
+
+    <main class="activity-layout">
+      <h1>Immutable Activity Ledger</h1>
+      <p>Chronological feed of deposits, reservations, settlements, and adjustments.</p>
+      <div id="activity-root" class="activity-feed" aria-live="polite"></div>
+    </main>
+
+    <script src="/static/sip_market_ui.js?v={{ frontend_version }}"></script>
+  </body>
+</html>

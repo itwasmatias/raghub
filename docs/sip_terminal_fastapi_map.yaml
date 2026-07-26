@@ -1,0 +1,192 @@
+openapi: 3.1.0
+info:
+  title: SIP Terminal API Map
+  version: 0.1.0
+  description: Endpoint map for the sports markets intelligence terminal design milestone.
+servers:
+  - url: /api/v1
+paths:
+  /overview:
+    get:
+      summary: Terminal overview across market, scanner, exposure, and model health.
+  /markets:
+    get:
+      summary: Unified market browser for events and props.
+      parameters:
+        - in: query
+          name: sport
+          schema: { type: string }
+        - in: query
+          name: league
+          schema: { type: string }
+        - in: query
+          name: date
+          schema: { type: string, format: date }
+        - in: query
+          name: team
+          schema: { type: string }
+        - in: query
+          name: player
+          schema: { type: string }
+        - in: query
+          name: market_type
+          schema: { type: string }
+        - in: query
+          name: status
+          schema: { type: string }
+        - in: query
+          name: sportsbook
+          schema: { type: string }
+        - in: query
+          name: sort_by
+          schema: { type: string }
+        - in: query
+          name: search
+          schema: { type: string }
+  /events:
+    get:
+      summary: Event browser.
+  /events/{event_id}:
+    get:
+      summary: Event detail with attached markets and context.
+      parameters:
+        - in: path
+          name: event_id
+          required: true
+          schema: { type: string }
+  /props:
+    get:
+      summary: Prop browser for player/team props.
+  /markets/{market_id}/workspace:
+    get:
+      summary: Full market intelligence workspace.
+      parameters:
+        - in: path
+          name: market_id
+          required: true
+          schema: { type: string }
+  /markets/{market_id}/probability-history:
+    get:
+      summary: Probability history for market outcomes.
+  /markets/{market_id}/odds-history:
+    get:
+      summary: Odds history for market outcomes.
+  /edge-scanner:
+    get:
+      summary: Ranked scanner results where SIP disagrees with market consensus.
+      parameters:
+        - in: query
+          name: rank_mode
+          schema: { type: string }
+        - in: query
+          name: strategy_id
+          schema: { type: string }
+        - in: query
+          name: minimum_edge
+          schema: { type: number }
+        - in: query
+          name: maximum_exposure
+          schema: { type: number }
+  /strategies:
+    get:
+      summary: List strategy definitions.
+    post:
+      summary: Create strategy definition.
+  /strategies/{strategy_id}:
+    get:
+      summary: Strategy detail and current matches.
+      parameters:
+        - in: path
+          name: strategy_id
+          required: true
+          schema: { type: string }
+    patch:
+      summary: Versioned strategy update.
+  /research/notebooks:
+    get:
+      summary: List notebooks.
+    post:
+      summary: Create notebook.
+  /research/notebooks/{notebook_id}:
+    get:
+      summary: Notebook timeline and links.
+      parameters:
+        - in: path
+          name: notebook_id
+          required: true
+          schema: { type: string }
+  /research/notes:
+    post:
+      summary: Append note.
+  /research/notes/{note_id}/revise:
+    post:
+      summary: Create revision note with supersedes pointer.
+  /positions:
+    get:
+      summary: List positions with thesis metadata.
+  /positions/intents:
+    post:
+      summary: Record and validate order intent (no execution).
+  /execution/orders:
+    get:
+      summary: List execution orders and states.
+    post:
+      summary: Create an execution order from an order intent.
+  /execution/orders/{order_id}:
+    get:
+      summary: Execution order detail with transitions and receipts.
+      parameters:
+        - in: path
+          name: order_id
+          required: true
+          schema: { type: string }
+  /execution/orders/{order_id}/confirm:
+    post:
+      summary: Confirm a pending manual execution order.
+      parameters:
+        - in: path
+          name: order_id
+          required: true
+          schema: { type: string }
+  /execution/orders/{order_id}/external-confirmation:
+    post:
+      summary: Record external sportsbook acceptance or rejection for a prefilled-link order.
+      parameters:
+        - in: path
+          name: order_id
+          required: true
+          schema: { type: string }
+  /positions/{position_id}:
+    get:
+      summary: Position + thesis lineage + valuation.
+      parameters:
+        - in: path
+          name: position_id
+          required: true
+          schema: { type: string }
+  /parlays:
+    get:
+      summary: List parlays.
+    post:
+      summary: Record parlay and legs.
+  /portfolio:
+    get:
+      summary: Portfolio summary with cash and synthetic sections separated.
+  /exposure:
+    get:
+      summary: Exposure dashboard cube.
+  /performance:
+    get:
+      summary: Settled and thesis-performance analytics.
+  /activity:
+    get:
+      summary: User-facing chronological activity feed.
+  /event-log:
+    get:
+      summary: Append-only domain event stream.
+  /models:
+    get:
+      summary: Model metadata, versions, and calibration.
+  /data-health:
+    get:
+      summary: Data quality and freshness by provider and market.

@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SIP Markets</title>
+    <link rel="stylesheet" href="/static/sip_market_ui.css?v={{ frontend_version }}" />
+  </head>
+  <body data-page="markets">
+    <header class="topbar">
+      <div class="brand">SIP Market Intelligence</div>
+      <nav class="topnav" aria-label="Primary">
+        <a href="/sip/markets" aria-current="page">Markets</a>
+        <a href="/sip/props">Props</a>
+        <a href="/sip/parlay-builder">Parlay Builder</a>
+        <a href="/sip/portfolio">Portfolio</a>
+        <a href="/sip/activity">Activity</a>
+      </nav>
+      <div class="pill" id="portfolio-pill">Portfolio loading</div>
+    </header>
+
+    <main class="market-layout">
+      <section class="feed-panel" aria-label="Market feed">
+        <div class="feed-controls">
+          <label>
+            Sport
+            <select id="sport-filter">
+              <option value="">All</option>
+              <option value="basketball">Basketball</option>
+              <option value="baseball">Baseball</option>
+            </select>
+          </label>
+          <label>
+            League
+            <select id="league-filter">
+              <option value="">All</option>
+              <option value="NBA">NBA</option>
+              <option value="WNBA">WNBA</option>
+              <option value="MLB">MLB</option>
+            </select>
+          </label>
+          <label>
+            Date
+            <input id="date-filter" type="date" />
+          </label>
+          <label>
+            Team
+            <input id="team-filter" type="text" placeholder="Team" />
+          </label>
+          <label>
+            Player
+            <input id="player-filter" type="text" placeholder="Player" />
+          </label>
+          <label>
+            Market Type
+            <select id="market-type-filter">
+              <option value="">All</option>
+              <option value="moneyline">Moneyline</option>
+              <option value="spread">Spread</option>
+              <option value="total">Total</option>
+              <option value="player_prop">Player Prop</option>
+              <option value="team_prop">Team Prop</option>
+            </select>
+          </label>
+          <label>
+            Provider
+            <input id="provider-filter" type="text" placeholder="Provider" />
+          </label>
+          <label>
+            Status
+            <select id="status-filter">
+              <option value="">All</option>
+              <option value="upcoming">Upcoming</option>
+              <option value="live">Live</option>
+              <option value="suspended">Suspended</option>
+              <option value="open">Open</option>
+              <option value="closed">Closed</option>
+              <option value="settled">Settled</option>
+            </select>
+          </label>
+          <label>
+            Sort
+            <select id="sort-filter">
+              <option value="start_time">Start Time</option>
+              <option value="sip_edge">SIP Edge</option>
+              <option value="expected_value">Expected Value</option>
+              <option value="popularity">Popularity</option>
+              <option value="open_exposure">Open Exposure</option>
+            </select>
+          </label>
+          <label class="search-box">
+            Search
+            <input id="search-filter" type="search" placeholder="Team, market, event" />
+          </label>
+        </div>
+        <div id="market-feed" class="market-feed" aria-live="polite"></div>
+      </section>
+
+      <aside class="ticket-panel" aria-label="Position entry panel">
+        <h2>Position Entry</h2>
+        <p class="ticket-copy">Record position intent only. No sportsbook execution is enabled.</p>
+
+        <label>
+          Outcome
+          <select id="ticket-outcome"></select>
+        </label>
+        <label>
+          Mode
+          <select id="ticket-mode">
+            <option value="practice">Practice</option>
+            <option value="recorded_real">Recorded Real</option>
+          </select>
+        </label>
+        <label>
+          Stake
+          <input id="ticket-stake" type="number" min="1" step="0.01" value="25" />
+        </label>
+        <label>
+          Accepted American Odds
+          <input id="ticket-odds" type="number" step="1" value="-110" />
+        </label>
+
+        <dl class="ticket-metrics">
+          <div><dt>Potential profit</dt><dd id="metric-profit">--</dd></div>
+          <div><dt>Total return</dt><dd id="metric-return">--</dd></div>
+          <div><dt>Break-even probability</dt><dd id="metric-breakeven">--</dd></div>
+          <div><dt>SIP expected profit</dt><dd id="metric-ev">Unavailable</dd></div>
+          <div><dt>SIP expected return %</dt><dd id="metric-evpct">Unavailable</dd></div>
+          <div><dt>Available bankroll</dt><dd id="metric-bankroll">--</dd></div>
+          <div><dt>Reserved after entry</dt><dd id="metric-reserved">--</dd></div>
+        </dl>
+
+        <div id="ticket-warning" class="status-chip warning" role="status">Awaiting selection</div>
+        <button id="ticket-submit" class="action-button" type="button">Record Practice Position</button>
+      </aside>
+    </main>
+
+    <section class="parlay-tray" aria-label="Parlay builder">
+      <header>
+        <h2>Parlay Builder</h2>
+        <p>Persistent selection tray with validation and exposure preview.</p>
+      </header>
+      <div id="parlay-legs" class="parlay-legs"></div>
+      <div class="parlay-metrics">
+        <span id="parlay-combined">Combined odds: --</span>
+        <span id="parlay-implied">Naive implied probability: --</span>
+        <span id="parlay-sip">SIP probability: Unavailable</span>
+        <span id="parlay-warning" class="status-chip warning">No selections</span>
+      </div>
+    </section>
+
+    <script src="/static/sip_market_ui.js?v={{ frontend_version }}"></script>
+  </body>
+</html>

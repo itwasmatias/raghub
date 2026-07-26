@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SIP Market Detail</title>
+    <link rel="stylesheet" href="/static/sip_market_ui.css?v={{ frontend_version }}" />
+  </head>
+  <body data-page="market-detail" data-market-id="{{ market_id }}">
+    <header class="topbar">
+      <div class="brand">SIP Market Intelligence</div>
+      <nav class="topnav" aria-label="Primary">
+        <a href="/sip/markets">Markets</a>
+        <a href="/sip/portfolio">Portfolio</a>
+        <a href="/sip/activity">Activity</a>
+      </nav>
+      <a class="pill" href="/sip/markets">Back to feed</a>
+    </header>
+
+    <main class="detail-layout">
+      <section class="detail-main" id="market-detail-root" aria-live="polite"></section>
+      <aside class="ticket-panel" aria-label="Position entry panel">
+        <h2>Position Entry</h2>
+        <p class="ticket-copy">Record intent only. Execution adapter is not active.</p>
+        <label>
+          Outcome
+          <select id="ticket-outcome"></select>
+        </label>
+        <label>
+          Mode
+          <select id="ticket-mode">
+            <option value="practice">Practice</option>
+            <option value="recorded_real">Recorded Real</option>
+          </select>
+        </label>
+        <label>
+          Stake
+          <input id="ticket-stake" type="number" min="1" step="0.01" value="20" />
+        </label>
+        <label>
+          Accepted American Odds
+          <input id="ticket-odds" type="number" step="1" value="-110" />
+        </label>
+        <div id="ticket-warning" class="status-chip warning" role="status">Select an outcome</div>
+        <button id="ticket-submit" class="action-button" type="button">Record Practice Position</button>
+      </aside>
+    </main>
+
+    <script src="/static/sip_market_ui.js?v={{ frontend_version }}"></script>
+  </body>
+</html>

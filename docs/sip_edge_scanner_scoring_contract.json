@@ -1,0 +1,68 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "SIP Edge Scanner Scoring Contract",
+    "type": "object",
+    "required": [
+        "rank_mode",
+        "absolute_disagreement",
+        "expected_value",
+        "confidence_adjusted_edge",
+        "rank_explanation"
+    ],
+    "properties": {
+        "rank_mode": {
+            "type": "string",
+            "enum": [
+                "largest_probability_disagreement",
+                "highest_expected_value",
+                "highest_confidence_adjusted_edge",
+                "best_data_quality",
+                "largest_cross_book_disagreement",
+                "largest_recent_line_movement",
+                "strongest_model_stability",
+                "lowest_current_exposure",
+                "closing_soon"
+            ]
+        },
+        "raw_implied_probability": {
+            "type": "number"
+        },
+        "no_vig_consensus_probability": {
+            "type": "number"
+        },
+        "sip_probability": {
+            "type": "number"
+        },
+        "absolute_disagreement": {
+            "type": "number"
+        },
+        "expected_value": {
+            "type": "number"
+        },
+        "confidence_adjusted_edge": {
+            "type": "number"
+        },
+        "data_quality_status": {
+            "type": "string"
+        },
+        "quote_freshness_seconds": {
+            "type": "number"
+        },
+        "market_movement_score": {
+            "type": "number"
+        },
+        "time_to_close_seconds": {
+            "type": "number"
+        },
+        "current_exposure": {
+            "type": "number"
+        },
+        "qualification_status": {
+            "type": "string"
+        },
+        "rank_explanation": {
+            "type": "string",
+            "minLength": 1
+        }
+    }
+}
