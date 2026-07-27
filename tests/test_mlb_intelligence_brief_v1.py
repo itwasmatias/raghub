@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 
@@ -463,3 +464,242 @@ def test_delivery_package_writes_markdown_html_pdf_and_manifest(tmp_path):
     manifest = manifest_path.read_text(encoding="utf-8")
     assert "pilot-client" in manifest
     assert "methodology_version" in manifest
+
+
+class _PersonalServiceDouble:
+    """Static service double that returns a controlled snapshot."""
+
+    def __init__(self, snapshot: dict[str, object]) -> None:
+        self._snapshot = snapshot
+        self.snapshot_call_count = 0
+
+    def snapshot(self) -> dict[str, object]:
+        self.snapshot_call_count += 1
+        return self._snapshot
+
+
+def _make_mlb_event(
+    canonical_id: str,
+    start_time: str,
+    *,
+    home: str = "Home Team",
+    away: str = "Away Team",
+) -> dict[str, object]:
+    return {
+        "canonical_id": canonical_id,
+        "league": "MLB",
+        "season": "2026",
+        "start_time": start_time,
+        "home_team_name": home,
+        "away_team_name": away,
+        "venue": "Test Park",
+        "status": "pregame",
+        "provider_event_ids": ("test-provider",),
+        "source_urls": ("https://test.test/game",),
+        "complete_books": 0,
+        "quotes": [],
+        "evaluations": [],
+        "forecasts": [],
+        "season_context": {},
+    }
+
+
+def _make_nba_event(
+    canonical_id: str,
+    start_time: str,
+) -> dict[str, object]:
+    return {
+        "canonical_id": canonical_id,
+        "league": "NBA",
+        "season": "2026",
+        "start_time": start_time,
+        "home_team_name": "Home NBA",
+        "away_team_name": "Away NBA",
+        "venue": "Test Arena",
+        "status": "pregame",
+        "provider_event_ids": ("test-provider",),
+        "source_urls": ("https://test.test/nba",),
+        "complete_books": 0,
+        "quotes": [],
+        "evaluations": [],
+        "forecasts": [],
+        "season_context": {},
+    }
+
+
+def test_build_from_personal_service_preserves_matching_persisted_data():
+    from sports.intelligence.briefs.service import MlbIntelligenceBriefService
+
+    snapshot = _snapshot()
+    original_snapshot = deepcopy(snapshot)
+    double = _PersonalServiceDouble(snapshot)
+    service = MlbIntelligenceBriefService()
+    report = service.build_from_personal_service(double, "2026-07-27")
+
+    assert double.snapshot_call_count == 1
+    assert snapshot == original_snapshot
+    assert report.slate_summary.games_analyzed == 2
+
+    card = report.game_cards[0]
+    quote = next(
+        item
+        for item in card.available_sportsbook_quotes
+        if item.provider_quote_id == "quote:v1:early-away-dk"
+    )
+    assert card.canonical_game_id == (
+        "mlb:game:v1:away:los-angeles-dodgers:home:new-york-yankees:"
+        "instance:start:20260727T001000Z"
+    )
+    assert card.scheduled_start == "2026-07-27T00:10:00+00:00"
+    assert quote.provider == "odds_api_io"
+    assert quote.sportsbook == "draftkings"
+    assert quote.provider_event_id == "provider-a-101"
+    assert quote.provider_quote_id == "quote:v1:early-away-dk"
+    assert quote.observed_at == (NOW - timedelta(minutes=1)).isoformat()
+    assert quote.source_url == "https://example.test/early/dk/away"
+    assert card.probabilities.market_probability == 0.53
+    assert card.probabilities.model_probability == 0.59
+    assert card.evidence_references == ("bullpen-rest-edge",)
+    assert card.risk_flags == ("weather-volatility",)
+    assert card.contradictions == (
+        "Pitching note conflicts with public lineup report",
+    )
+
+
+def test_build_from_personal_service_filters_non_mlb_and_wrong_date_events():
+    from sports.intelligence.briefs.service import MlbIntelligenceBriefService
+
+    mlb_today = _make_mlb_event(
+        "mlb:test:today",
+        "2026-07-27T00:10:00+00:00",
+        home="Yankees",
+        away="Dodgers",
+    )
+    mlb_wrong_date = _make_mlb_event(
+        "mlb:test:wrong-date",
+        "2026-07-28T00:10:00+00:00",
+        home="Mets",
+        away="Braves",
+    )
+    nba_event = _make_nba_event("nba:test:game", "2026-07-27T19:00:00+00:00")
+    snapshot = {
+        "generated_at": "2026-07-27T12:00:00+00:00",
+        "feed": {"freshness": "fresh", "status": "healthy"},
+        "events": [mlb_today, mlb_wrong_date, nba_event],
+        "evaluations": [],
+        "resolved_predictions": [],
+    }
+    double = _PersonalServiceDouble(snapshot)
+    service = MlbIntelligenceBriefService()
+    report = service.build_from_personal_service(double, "2026-07-27")
+
+    assert report.slate_summary.games_analyzed == 1
+    assert report.game_cards[0].canonical_game_id == "mlb:test:today"
+
+
+def test_build_from_personal_service_empty_variants_are_transparent():
+    from sports.intelligence.briefs.markdown import render_brief
+    from sports.intelligence.briefs.service import MlbIntelligenceBriefService
+
+    required = "No MLB events available for the requested slate."
+    snapshots = (
+        {
+            "generated_at": "2026-07-27T12:00:00+00:00",
+            "feed": {"freshness": "fresh", "status": "healthy"},
+            "events": [],
+            "evaluations": [],
+            "resolved_predictions": [],
+        },
+        {
+            "generated_at": "2026-07-27T12:00:00+00:00",
+            "feed": {"freshness": "fresh", "status": "healthy"},
+            "events": [
+                _make_nba_event("nba:test:game", "2026-07-27T19:00:00+00:00")
+            ],
+            "evaluations": [],
+            "resolved_predictions": [],
+        },
+        {
+            "generated_at": "2026-07-27T12:00:00+00:00",
+            "feed": {"freshness": "fresh", "status": "healthy"},
+            "events": [
+                _make_mlb_event(
+                    "mlb:test:wrong-date",
+                    "2026-07-28T00:10:00+00:00",
+                )
+            ],
+            "evaluations": [],
+            "resolved_predictions": [],
+        },
+    )
+
+    for snapshot in snapshots:
+        original_snapshot = deepcopy(snapshot)
+        double = _PersonalServiceDouble(snapshot)
+        report = MlbIntelligenceBriefService().build_from_personal_service(
+            double, "2026-07-27"
+        )
+        markdown = render_brief(report)
+
+        assert double.snapshot_call_count == 1
+        assert snapshot == original_snapshot
+        assert report.game_cards == ()
+        assert report.unavailable_reason == required
+        assert report.slate_summary.highest_priority_research_items == (required,)
+        assert required in markdown
+        assert "\n### " not in markdown
+
+
+def test_build_from_personal_service_missing_forecast_stays_unavailable():
+    from sports.intelligence.briefs.service import MlbIntelligenceBriefService
+
+    snapshot = _snapshot()
+    snapshot["events"] = [snapshot["events"][0]]
+    snapshot["evaluations"] = snapshot["events"][0]["evaluations"]
+    report = MlbIntelligenceBriefService().build_from_personal_service(
+        _PersonalServiceDouble(snapshot), "2026-07-27"
+    )
+
+    assert report.slate_summary.games_analyzed == 1
+    assert report.game_cards[0].probabilities.model_probability is None
+    assert report.game_cards[0].probabilities.model_probability_reason == (
+        "No experimental model probability was persisted."
+    )
+
+
+def test_build_from_personal_service_output_is_deterministic():
+    from sports.intelligence.briefs.service import MlbIntelligenceBriefService
+
+    service = MlbIntelligenceBriefService()
+    first = service.build_from_personal_service(
+        _PersonalServiceDouble(_snapshot()), "2026-07-27"
+    )
+    second = service.build_from_personal_service(
+        _PersonalServiceDouble(_snapshot()), "2026-07-27"
+    )
+
+    assert first == second
+
+
+def test_build_from_personal_service_existing_build_report_still_works():
+    from sports.intelligence.briefs.service import MlbIntelligenceBriefService
+
+    service = MlbIntelligenceBriefService()
+    markdown = service.build_markdown(_snapshot())
+    empty_report = service.build_report(
+        {
+            "generated_at": NOW.isoformat(),
+            "events": [],
+            "evaluations": [],
+            "resolved_predictions": [],
+        }
+    )
+
+    assert "# MLB Intelligence Brief" in markdown
+    assert "New York Yankees vs Los Angeles Dodgers" in markdown
+    assert "New York Mets vs Atlanta Braves" in markdown
+    assert (
+        empty_report.unavailable_reason
+        == "Unavailable: no MLB events were available for this slate."
+    )
+    assert empty_report.slate_summary.highest_priority_research_items == ()

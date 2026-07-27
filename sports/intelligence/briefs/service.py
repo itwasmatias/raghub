@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,9 @@ from sports.personal.wagering import DataQualityStatus
 class MlbIntelligenceBriefService:
     METHODOLOGY_VERSION = "mlb-intelligence-brief-v1"
     LEAGUE = "MLB"
+    _PERSISTED_SLATE_EMPTY_REASON = (
+        "No MLB events available for the requested slate."
+    )
 
     def __init__(
         self,
@@ -38,6 +42,57 @@ class MlbIntelligenceBriefService:
         self.methodology_version = methodology_version or self.METHODOLOGY_VERSION
         self.odds_max_age_seconds = odds_max_age_seconds
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def build_from_personal_service(
+        self,
+        personal_service: Any,
+        slate_date: str,
+    ) -> MlbIntelligenceBrief:
+        """Build an MLB brief from a PersonalEditionService snapshot filtered by slate date.
+
+        Parameters
+        ----------
+        personal_service : PersonalEditionService
+            Service whose snapshot() method returns a Personal Edition snapshot dict.
+        slate_date : str
+            ISO date string (YYYY-MM-DD) used to filter events.
+
+        Returns
+        -------
+        MlbIntelligenceBrief
+        """
+        snapshot = personal_service.snapshot()
+        selected_ids: set[str] = set()
+        filtered_events: list[dict[str, Any]] = []
+        for event in (snapshot.get("events") or []):
+            league = str(event.get("league") or "").upper()
+            start = str(event.get("start_time") or "")
+            if league == self.LEAGUE and start[:10] == slate_date:
+                selected_ids.add(str(event.get("canonical_id") or ""))
+                filtered_events.append(event)
+        filtered_snapshot = {
+            **snapshot,
+            "events": filtered_events,
+            "evaluations": [
+                ev
+                for ev in (snapshot.get("evaluations") or [])
+                if str(ev.get("canonical_event_id") or "") in selected_ids
+            ],
+        }
+        report = self.build_report(filtered_snapshot)
+        if report.game_cards:
+            return report
+        return replace(
+            report,
+            slate_summary=replace(
+                report.slate_summary,
+                highest_priority_research_items=(
+                    self._PERSISTED_SLATE_EMPTY_REASON,
+                ),
+            ),
+            unavailable_reason=self._PERSISTED_SLATE_EMPTY_REASON,
+            notes=(self._PERSISTED_SLATE_EMPTY_REASON,),
+        )
 
     def build_report(self, snapshot: dict[str, Any]) -> MlbIntelligenceBrief:
         generated_at = str(
