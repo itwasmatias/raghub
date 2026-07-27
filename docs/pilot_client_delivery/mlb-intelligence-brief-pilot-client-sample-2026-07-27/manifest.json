@@ -1,0 +1,24 @@
+{
+  "client_slug": "pilot-client-sample",
+  "data_freshness": "fresh (last successful refresh: 2026-07-26T12:00:00+00:00)",
+  "files": {
+    "html": "brief.html",
+    "markdown": "brief.md",
+    "pdf": "brief.pdf",
+    "readme": "README.txt"
+  },
+  "games_analyzed": 2,
+  "generated_at": "2026-07-26T12:00:00+00:00",
+  "league": "MLB",
+  "limitations": [
+    "Experimental model probabilities are directional research inputs and may be missing for some games.",
+    "Consensus no-vig market probabilities depend on available complete sportsbook books and may be unavailable."
+  ],
+  "methodology_version": "mlb-intelligence-brief-v1",
+  "notes": [
+    "This package uses the deterministic MLB sample fixture because the current persisted database contained no MLB events at generation time.",
+    "All probabilities, contradictions, and provenance in this package come from static test fixtures rather than live provider calls."
+  ],
+  "report_id": "mlb-brief:v1:62bc6c0d4a03",
+  "slate_date": "2026-07-27"
+}

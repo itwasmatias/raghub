@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MLB Intelligence Brief</title>
+  <style>
+    :root { color-scheme: light; --ink:#152033; --muted:#5a687d; --line:#d7deea; --panel:#ffffff; --soft:#f4f7fb; --accent:#0f5cc0; }
+    body { margin:0; font-family: Georgia, 'Times New Roman', serif; color:var(--ink); background:linear-gradient(180deg,#eef3fb 0%,#ffffff 240px); }
+    main { max-width: 980px; margin: 0 auto; padding: 40px 24px 64px; }
+    header, section, article { background:var(--panel); border:1px solid var(--line); border-radius:18px; box-shadow:0 18px 50px rgba(21,32,51,0.08); }
+    header { padding:28px; margin-bottom:24px; }
+    section { padding:24px 28px; margin-bottom:24px; }
+    article { padding:20px 22px; margin:20px 0; background:var(--soft); }
+    h1,h2,h3,h4 { margin:0 0 12px; line-height:1.2; }
+    h1 { font-size:2.2rem; }
+    h2 { font-size:1.35rem; color:var(--accent); }
+    h3 { font-size:1.25rem; }
+    p, li, td, th { line-height:1.5; }
+    .meta-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; }
+    .metric { padding:14px; border-radius:14px; background:var(--soft); border:1px solid var(--line); }
+    table { width:100%; border-collapse:collapse; margin-top:12px; font-size:0.95rem; }
+    th, td { text-align:left; padding:10px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+    th { color:var(--muted); font-weight:600; }
+    a { color:var(--accent); }
+    .disclosure { color:var(--muted); }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p>Professional research brief for manual analyst review.</p>
+      <h1>MLB Intelligence Brief</h1>
+      <p class="disclosure">This report is research and analysis, not a guarantee of results or outcomes, and no automated execution is authorized or implied.</p>
+    </header>
+    <section>
+      <h2>Report Metadata</h2>
+      <div class="meta-grid">
+        <div class="metric"><strong>Report ID</strong><br>mlb-brief:v1:62bc6c0d4a03</div>
+        <div class="metric"><strong>Generated at</strong><br>2026-07-26T12:00:00+00:00</div>
+        <div class="metric"><strong>Slate date</strong><br>2026-07-27</div>
+        <div class="metric"><strong>League</strong><br>MLB</div>
+        <div class="metric"><strong>Data freshness</strong><br>fresh (last successful refresh: 2026-07-26T12:00:00+00:00)</div>
+        <div class="metric"><strong>Methodology version</strong><br>mlb-intelligence-brief-v1</div>
+      </div>
+    </section>
+    <section>
+      <h2>Slate Summary</h2>
+      <p><strong>Games analyzed:</strong> 2</p>
+      <p><strong>Markets available:</strong> moneyline/full_game</p>
+      <p><strong>Books represented:</strong> draftkings, fanduel</p>
+      <p><strong>Stale or incomplete markets:</strong> mlb:game:v1:away:atlanta-braves:home:new-york-mets:instance:start:20260727T021000Z (stale)</p>
+      <p><strong>Highest-priority research items:</strong> mlb:game:v1:away:los-angeles-dodgers:home:new-york-yankees:instance:start:20260727T001000Z: investigate; mlb:game:v1:away:atlanta-braves:home:new-york-mets:instance:start:20260727T021000Z: avoid</p>
+    </section>
+    <section>
+      <h2>Game Cards</h2>
+      
+<article class="game-card">
+  <h3>New York Yankees vs Los Angeles Dodgers</h3>
+  <p><strong>Canonical game ID:</strong> mlb:game:v1:away:los-angeles-dodgers:home:new-york-yankees:instance:start:20260727T001000Z</p>
+  <p><strong>Scheduled start:</strong> 2026-07-27T00:10:00+00:00</p>
+  <p><strong>Data-quality status:</strong> verified</p>
+  <p><strong>Confidence:</strong> 0.680</p>
+  <p><strong>Research selection:</strong> away</p>
+  <p><strong>Consensus no-vig market probability:</strong> 0.530</p>
+  <p><strong>Experimental model probability:</strong> 0.590</p>
+  <p><strong>Probability difference:</strong> +0.060</p>
+  <p><strong>Verdict:</strong> Investigate</p>
+  <p><strong>Verdict detail:</strong> Qualified angle is worth manual research review before any decision.</p>
+  
+  <h4>Available Sportsbook Quotes</h4>
+  <table>
+    <thead>
+      <tr><th>Book</th><th>Selection</th><th>Price</th><th>Provider</th><th>Observed</th><th>Provider Event ID</th><th>Provider Quote ID</th><th>Link</th></tr>
+    </thead>
+    <tbody><tr><td>fanduel</td><td>away</td><td>118</td><td>sportsgameodds</td><td>2026-07-26T11:58:00+00:00</td><td>provider-b-888</td><td>quote:v1:early-away-fd</td><td><a href="https://example.test/early/fd/away">source</a></td></tr><tr><td>fanduel</td><td>home</td><td>-138</td><td>sportsgameodds</td><td>2026-07-26T11:58:00+00:00</td><td>provider-b-888</td><td>quote:v1:early-home-fd</td><td><a href="https://example.test/early/fd/home">source</a></td></tr><tr><td>draftkings</td><td>away</td><td>120</td><td>odds_api_io</td><td>2026-07-26T11:59:00+00:00</td><td>provider-a-101</td><td>quote:v1:early-away-dk</td><td><a href="https://example.test/early/dk/away">source</a></td></tr><tr><td>draftkings</td><td>home</td><td>-140</td><td>odds_api_io</td><td>2026-07-26T11:59:00+00:00</td><td>provider-a-101</td><td>quote:v1:early-home-dk</td><td><a href="https://example.test/early/dk/home">source</a></td></tr></tbody>
+  </table>
+  <h4>Evidence References</h4>
+  <ul><li>bullpen-rest-edge</li></ul>
+  <h4>Contradictions</h4>
+  <ul><li>Pitching note conflicts with public lineup report</li></ul>
+  <h4>Risk Flags</h4>
+  <ul><li>weather-volatility</li></ul>
+</article>
+            
+<article class="game-card">
+  <h3>New York Mets vs Atlanta Braves</h3>
+  <p><strong>Canonical game ID:</strong> mlb:game:v1:away:atlanta-braves:home:new-york-mets:instance:start:20260727T021000Z</p>
+  <p><strong>Scheduled start:</strong> 2026-07-27T02:10:00+00:00</p>
+  <p><strong>Data-quality status:</strong> stale</p>
+  <p><strong>Confidence:</strong> Unavailable</p>
+  <p><strong>Research selection:</strong> away</p>
+  <p><strong>Consensus no-vig market probability:</strong> 0.530</p>
+  <p><strong>Experimental model probability:</strong> Unavailable</p>
+  <p><strong>Probability difference:</strong> Unavailable</p>
+  <p><strong>Verdict:</strong> Avoid</p>
+  <p><strong>Verdict detail:</strong> No-bet status preserved from evaluation: NO_BET</p>
+  <p><strong>Stale quote warning:</strong> One or more quotes are stale; oldest observed quote is 45.0 minutes old.</p>
+  <h4>Available Sportsbook Quotes</h4>
+  <table>
+    <thead>
+      <tr><th>Book</th><th>Selection</th><th>Price</th><th>Provider</th><th>Observed</th><th>Provider Event ID</th><th>Provider Quote ID</th><th>Link</th></tr>
+    </thead>
+    <tbody><tr><td>draftkings</td><td>away</td><td>110</td><td>odds_api_io</td><td>2026-07-26T11:15:00+00:00</td><td>provider-c-301</td><td>quote:v1:late-away-dk</td><td><a href="https://example.test/late/dk/away">source</a></td></tr><tr><td>draftkings</td><td>home</td><td>-130</td><td>odds_api_io</td><td>2026-07-26T11:15:00+00:00</td><td>provider-c-301</td><td>quote:v1:late-home-dk</td><td><a href="https://example.test/late/dk/home">source</a></td></tr></tbody>
+  </table>
+  <h4>Evidence References</h4>
+  <p>Unavailable: no evidence references were persisted.</p>
+  <h4>Contradictions</h4>
+  <p>None recorded.</p>
+  <h4>Risk Flags</h4>
+  <ul><li>lineup-uncertain</li><li>market-thin</li></ul>
+</article>
+            
+    </section>
+    <section>
+      <h2>Audit and Disclosure</h2>
+      <p><strong>Generated timestamp:</strong> 2026-07-26T12:00:00+00:00</p>
+      <h3>Audit Trail</h3>
+      <table>
+        <thead>
+          <tr><th>Source/provider</th><th>Observed timestamp</th><th>Canonical game ID</th><th>Provider event ID</th><th>Provider quote ID</th><th>Link</th></tr>
+        </thead>
+        <tbody><tr><td>odds_api_io</td><td>2026-07-26T11:15:00+00:00</td><td>mlb:game:v1:away:atlanta-braves:home:new-york-mets:instance:start:20260727T021000Z</td><td>provider-c-301</td><td>quote:v1:late-away-dk</td><td><a href="https://example.test/late/dk/away">source</a></td></tr><tr><td>odds_api_io</td><td>2026-07-26T11:15:00+00:00</td><td>mlb:game:v1:away:atlanta-braves:home:new-york-mets:instance:start:20260727T021000Z</td><td>provider-c-301</td><td>quote:v1:late-home-dk</td><td><a href="https://example.test/late/dk/home">source</a></td></tr><tr><td>sportsgameodds</td><td>2026-07-26T11:58:00+00:00</td><td>mlb:game:v1:away:los-angeles-dodgers:home:new-york-yankees:instance:start:20260727T001000Z</td><td>provider-b-888</td><td>quote:v1:early-away-fd</td><td><a href="https://example.test/early/fd/away">source</a></td></tr><tr><td>sportsgameodds</td><td>2026-07-26T11:58:00+00:00</td><td>mlb:game:v1:away:los-angeles-dodgers:home:new-york-yankees:instance:start:20260727T001000Z</td><td>provider-b-888</td><td>quote:v1:early-home-fd</td><td><a href="https://example.test/early/fd/home">source</a></td></tr><tr><td>odds_api_io</td><td>2026-07-26T11:59:00+00:00</td><td>mlb:game:v1:away:los-angeles-dodgers:home:new-york-yankees:instance:start:20260727T001000Z</td><td>provider-a-101</td><td>quote:v1:early-away-dk</td><td><a href="https://example.test/early/dk/away">source</a></td></tr><tr><td>odds_api_io</td><td>2026-07-26T11:59:00+00:00</td><td>mlb:game:v1:away:los-angeles-dodgers:home:new-york-yankees:instance:start:20260727T001000Z</td><td>provider-a-101</td><td>quote:v1:early-home-dk</td><td><a href="https://example.test/early/dk/home">source</a></td></tr></tbody>
+      </table>
+      <h3>Model Limitations</h3>
+      <ul><li>Experimental model probabilities are directional research inputs and may be missing for some games.</li><li>Consensus no-vig market probabilities depend on available complete sportsbook books and may be unavailable.</li></ul>
+      <p class="disclosure"><strong>Disclosure:</strong> This report is research and analysis for manual review, not a guarantee of results or outcomes.</p>
+      <p class="disclosure"><strong>Disclosure:</strong> This report supports research workflows only; no automated execution is authorized or implied.</p>
+    </section>
+  </main>
+</body>
+</html>

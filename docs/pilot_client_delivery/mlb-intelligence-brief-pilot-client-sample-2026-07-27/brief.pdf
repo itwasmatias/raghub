@@ -1,0 +1,366 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [5 0 R 7 0 R 9 0 R 11 0 R] /Count 4 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+4 0 obj
+<< /Length 2258 >>
+stream
+BT
+/F1 10 Tf
+50 790 Td
+14 TL
+(# MLB Intelligence Brief) Tj
+T*
+( ) Tj
+T*
+(## Report Metadata) Tj
+T*
+( ) Tj
+T*
+(- Report ID: mlb-brief:v1:62bc6c0d4a03) Tj
+T*
+(- Generated at: 2026-07-26T12:00:00+00:00) Tj
+T*
+(- Slate date: 2026-07-27) Tj
+T*
+(- League: MLB) Tj
+T*
+(- Data freshness: fresh \(last successful refresh: 2026-07-26T12:00:00+00:00\)) Tj
+T*
+(- Methodology version: mlb-intelligence-brief-v1) Tj
+T*
+( ) Tj
+T*
+(## Slate Summary) Tj
+T*
+( ) Tj
+T*
+(- Games analyzed: 2) Tj
+T*
+(- Markets available: moneyline/full_game) Tj
+T*
+(- Books represented: draftkings, fanduel) Tj
+T*
+(- Stale or incomplete markets: mlb:game:v1:away:atlanta-braves:home:new-york-mets:instance:start:20260727T021000Z \(stale\)) Tj
+T*
+(- Highest-priority research items: mlb:game:v1:away:los-angeles-dodgers:home:new-york-yankees:instance:start:20260727T001000Z: investigate; mlb:game:v1:away:atlanta-braves:home:new-york-mets:instance:start:20260727T021000Z: avoid) Tj
+T*
+( ) Tj
+T*
+(## Game Cards) Tj
+T*
+( ) Tj
+T*
+(### New York Yankees vs Los Angeles Dodgers) Tj
+T*
+(- Canonical game ID: mlb:game:v1:away:los-angeles-dodgers:home:new-york-yankees:instance:start:20260727T001000Z) Tj
+T*
+(- Scheduled start: 2026-07-27T00:10:00+00:00) Tj
+T*
+(- Data-quality status: verified) Tj
+T*
+(- Confidence: 0.680) Tj
+T*
+(- Research selection: away) Tj
+T*
+(- Consensus no-vig market probability: 0.530) Tj
+T*
+(- Experimental model probability: 0.590) Tj
+T*
+(- Probability difference: +0.060) Tj
+T*
+(- Verdict: Investigate) Tj
+T*
+(- Verdict detail: Qualified angle is worth manual research review before any decision.) Tj
+T*
+(- Available sportsbook quotes:) Tj
+T*
+(  - fanduel away 118) Tj
+T*
+(    - Source/provider: sportsgameodds) Tj
+T*
+(    - Observed timestamp: 2026-07-26T11:58:00+00:00) Tj
+T*
+(    - Provider event ID: provider-b-888) Tj
+T*
+(    - Provider quote ID: quote:v1:early-away-fd) Tj
+T*
+(    - Source URL: https://example.test/early/fd/away) Tj
+T*
+(  - fanduel home -138) Tj
+T*
+(    - Source/provider: sportsgameodds) Tj
+T*
+(    - Observed timestamp: 2026-07-26T11:58:00+00:00) Tj
+T*
+(    - Provider event ID: provider-b-888) Tj
+T*
+(    - Provider quote ID: quote:v1:early-home-fd) Tj
+T*
+(    - Source URL: https://example.test/early/fd/home) Tj
+T*
+(  - draftkings away 120) Tj
+T*
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>
+endobj
+6 0 obj
+<< /Length 2353 >>
+stream
+BT
+/F1 10 Tf
+50 790 Td
+14 TL
+(    - Source/provider: odds_api_io) Tj
+T*
+(    - Observed timestamp: 2026-07-26T11:59:00+00:00) Tj
+T*
+(    - Provider event ID: provider-a-101) Tj
+T*
+(    - Provider quote ID: quote:v1:early-away-dk) Tj
+T*
+(    - Source URL: https://example.test/early/dk/away) Tj
+T*
+(  - draftkings home -140) Tj
+T*
+(    - Source/provider: odds_api_io) Tj
+T*
+(    - Observed timestamp: 2026-07-26T11:59:00+00:00) Tj
+T*
+(    - Provider event ID: provider-a-101) Tj
+T*
+(    - Provider quote ID: quote:v1:early-home-dk) Tj
+T*
+(    - Source URL: https://example.test/early/dk/home) Tj
+T*
+(- Evidence references:) Tj
+T*
+(  - bullpen-rest-edge) Tj
+T*
+(- Contradictions:) Tj
+T*
+(  - Pitching note conflicts with public lineup report) Tj
+T*
+(- Risk flags:) Tj
+T*
+(  - weather-volatility) Tj
+T*
+( ) Tj
+T*
+(### New York Mets vs Atlanta Braves) Tj
+T*
+(- Canonical game ID: mlb:game:v1:away:atlanta-braves:home:new-york-mets:instance:start:20260727T021000Z) Tj
+T*
+(- Scheduled start: 2026-07-27T02:10:00+00:00) Tj
+T*
+(- Data-quality status: stale) Tj
+T*
+(- Confidence: Unavailable) Tj
+T*
+(- Research selection: away) Tj
+T*
+(- Consensus no-vig market probability: 0.530) Tj
+T*
+(- Experimental model probability: Unavailable \(No experimental model probability was persisted.\)) Tj
+T*
+(- Probability difference: Unavailable \(Model and market probabilities were not both available.\)) Tj
+T*
+(- Verdict: Avoid) Tj
+T*
+(- Verdict detail: No-bet status preserved from evaluation: NO_BET) Tj
+T*
+(- Stale quote warning: One or more quotes are stale; oldest observed quote is 45.0 minutes old.) Tj
+T*
+(- Available sportsbook quotes:) Tj
+T*
+(  - draftkings away 110) Tj
+T*
+(    - Source/provider: odds_api_io) Tj
+T*
+(    - Observed timestamp: 2026-07-26T11:15:00+00:00) Tj
+T*
+(    - Provider event ID: provider-c-301) Tj
+T*
+(    - Provider quote ID: quote:v1:late-away-dk) Tj
+T*
+(    - Source URL: https://example.test/late/dk/away) Tj
+T*
+(  - draftkings home -130) Tj
+T*
+(    - Source/provider: odds_api_io) Tj
+T*
+(    - Observed timestamp: 2026-07-26T11:15:00+00:00) Tj
+T*
+(    - Provider event ID: provider-c-301) Tj
+T*
+(    - Provider quote ID: quote:v1:late-home-dk) Tj
+T*
+(    - Source URL: https://example.test/late/dk/home) Tj
+T*
+(- Evidence references:) Tj
+T*
+(  - Unavailable: no evidence references were persisted.) Tj
+T*
+(- Contradictions:) Tj
+T*
+ET
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 6 0 R >>
+endobj
+8 0 obj
+<< /Length 2620 >>
+stream
+BT
+/F1 10 Tf
+50 790 Td
+14 TL
+(  - None recorded.) Tj
+T*
+(- Risk flags:) Tj
+T*
+(  - lineup-uncertain) Tj
+T*
+(  - market-thin) Tj
+T*
+( ) Tj
+T*
+(## Audit And Disclosure) Tj
+T*
+( ) Tj
+T*
+(- Generated timestamp: 2026-07-26T12:00:00+00:00) Tj
+T*
+(- Audit trail:) Tj
+T*
+(  - Source/provider: odds_api_io) Tj
+T*
+(    - Observed timestamp: 2026-07-26T11:15:00+00:00) Tj
+T*
+(    - Canonical game ID: mlb:game:v1:away:atlanta-braves:home:new-york-mets:instance:start:20260727T021000Z) Tj
+T*
+(    - Provider event ID: provider-c-301) Tj
+T*
+(    - Provider quote ID: quote:v1:late-away-dk) Tj
+T*
+(    - Source URL: https://example.test/late/dk/away) Tj
+T*
+(  - Source/provider: odds_api_io) Tj
+T*
+(    - Observed timestamp: 2026-07-26T11:15:00+00:00) Tj
+T*
+(    - Canonical game ID: mlb:game:v1:away:atlanta-braves:home:new-york-mets:instance:start:20260727T021000Z) Tj
+T*
+(    - Provider event ID: provider-c-301) Tj
+T*
+(    - Provider quote ID: quote:v1:late-home-dk) Tj
+T*
+(    - Source URL: https://example.test/late/dk/home) Tj
+T*
+(  - Source/provider: sportsgameodds) Tj
+T*
+(    - Observed timestamp: 2026-07-26T11:58:00+00:00) Tj
+T*
+(    - Canonical game ID: mlb:game:v1:away:los-angeles-dodgers:home:new-york-yankees:instance:start:20260727T001000Z) Tj
+T*
+(    - Provider event ID: provider-b-888) Tj
+T*
+(    - Provider quote ID: quote:v1:early-away-fd) Tj
+T*
+(    - Source URL: https://example.test/early/fd/away) Tj
+T*
+(  - Source/provider: sportsgameodds) Tj
+T*
+(    - Observed timestamp: 2026-07-26T11:58:00+00:00) Tj
+T*
+(    - Canonical game ID: mlb:game:v1:away:los-angeles-dodgers:home:new-york-yankees:instance:start:20260727T001000Z) Tj
+T*
+(    - Provider event ID: provider-b-888) Tj
+T*
+(    - Provider quote ID: quote:v1:early-home-fd) Tj
+T*
+(    - Source URL: https://example.test/early/fd/home) Tj
+T*
+(  - Source/provider: odds_api_io) Tj
+T*
+(    - Observed timestamp: 2026-07-26T11:59:00+00:00) Tj
+T*
+(    - Canonical game ID: mlb:game:v1:away:los-angeles-dodgers:home:new-york-yankees:instance:start:20260727T001000Z) Tj
+T*
+(    - Provider event ID: provider-a-101) Tj
+T*
+(    - Provider quote ID: quote:v1:early-away-dk) Tj
+T*
+(    - Source URL: https://example.test/early/dk/away) Tj
+T*
+(  - Source/provider: odds_api_io) Tj
+T*
+(    - Observed timestamp: 2026-07-26T11:59:00+00:00) Tj
+T*
+(    - Canonical game ID: mlb:game:v1:away:los-angeles-dodgers:home:new-york-yankees:instance:start:20260727T001000Z) Tj
+T*
+(    - Provider event ID: provider-a-101) Tj
+T*
+(    - Provider quote ID: quote:v1:early-home-dk) Tj
+T*
+(    - Source URL: https://example.test/early/dk/home) Tj
+T*
+(- Model limitations:) Tj
+T*
+ET
+endstream
+endobj
+9 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 8 0 R >>
+endobj
+10 0 obj
+<< /Length 498 >>
+stream
+BT
+/F1 10 Tf
+50 790 Td
+14 TL
+(  - Experimental model probabilities are directional research inputs and may be missing for some games.) Tj
+T*
+(  - Consensus no-vig market probabilities depend on available complete sportsbook books and may be unavailable.) Tj
+T*
+(- Disclosure: This report is research and analysis for manual review, not a guarantee of results or outcomes.) Tj
+T*
+(- Disclosure: This report supports research workflows only; no automated execution is authorized or implied.) Tj
+T*
+ET
+endstream
+endobj
+11 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 10 0 R >>
+endobj
+xref
+0 12
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000140 00000 n 
+0000000210 00000 n 
+0000002520 00000 n 
+0000002646 00000 n 
+0000005051 00000 n 
+0000005177 00000 n 
+0000007849 00000 n 
+0000007975 00000 n 
+0000008525 00000 n 
+trailer
+<< /Size 12 /Root 1 0 R >>
+startxref
+8653
+%%EOF
