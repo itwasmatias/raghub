@@ -47,7 +47,7 @@ def test_wagering_migrations_are_applied_after_existing_versions(tmp_path):
     first = repository.migrate()
     second = repository.migrate()
 
-    assert first == [1, 2, 3, 4, 5, 6]
+    assert first == [1, 2, 3, 4, 5, 6, 7]
     assert second == []
 
 

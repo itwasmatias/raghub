@@ -370,7 +370,7 @@ def test_clean_migration_and_disabled_live_mode_never_returns_fixtures(tmp_path)
         )
     )
     repository = PersonalEditionRepository(settings.database_path)
-    assert repository.migrate() == [1, 2, 3, 4, 5, 6]
+    assert repository.migrate() == [1, 2, 3, 4, 5, 6, 7]
     assert repository.migrate() == []
     service = PersonalEditionService(settings, repository=repository, clock=lambda: NOW)
 

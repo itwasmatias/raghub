@@ -65,6 +65,20 @@ class CanonicalEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderQuoteProvenanceV1:
+    provider: str
+    provider_event_id: str
+    provider_quote_id: str
+    source_url: str
+    observed_at: str
+    canonical_sportsbook_id: str
+    canonical_game_id: str
+    canonical_market_id: str
+    canonical_outcome_id: str
+    identity_version: str = "mlb_moneyline_core_v1"
+
+
+@dataclass(frozen=True, slots=True)
 class NormalizedMoneylineQuote:
     canonical_event_id: str
     provider_event_id: str
@@ -84,6 +98,11 @@ class NormalizedMoneylineQuote:
     source: str
     source_url: str
     data_mode: str
+    canonical_sportsbook_id: str = ""
+    canonical_market_id: str = ""
+    canonical_outcome_id: str = ""
+    provider_quote_id: str = ""
+    identity_version: str = "mlb_moneyline_core_v1"
 
     @property
     def decimal_price(self) -> float:
@@ -94,6 +113,29 @@ class NormalizedMoneylineQuote:
     @property
     def implied_probability(self) -> float:
         return 1 / self.decimal_price
+
+    @property
+    def provenance_v1(self) -> ProviderQuoteProvenanceV1:
+        return ProviderQuoteProvenanceV1(
+            provider=self.source,
+            provider_event_id=self.provider_event_id,
+            provider_quote_id=self.provider_quote_id,
+            source_url=self.source_url,
+            observed_at=self.observed_at,
+            canonical_sportsbook_id=self.canonical_sportsbook_id or self.sportsbook,
+            canonical_game_id=self.canonical_event_id,
+            canonical_market_id=(
+                self.canonical_market_id
+                or f"{self.canonical_event_id}:market:moneyline:full_game:v1"
+            ),
+            canonical_outcome_id=(
+                self.canonical_outcome_id
+                or (
+                    f"{self.canonical_event_id}:market:moneyline:full_game:v1:"
+                    f"outcome:{self.selection}:v1"
+                )
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)

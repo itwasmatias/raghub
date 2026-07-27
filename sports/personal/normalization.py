@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timezone
+from hashlib import sha256
 from typing import Any
 
 from sports.personal.models import (
@@ -11,6 +12,77 @@ from sports.personal.models import (
     NormalizationRejection,
     NormalizedMoneylineQuote,
 )
+
+
+def canonical_game_identity_v1(
+    *,
+    league: str,
+    start: datetime | None,
+    away_team_name: str,
+    home_team_name: str,
+    official_game_number: int | None = None,
+) -> str:
+    away = "-".join(away_team_name.split())
+    home = "-".join(home_team_name.split())
+    league_key = league.lower()
+
+    if league_key != "mlb":
+        if start is None or start.tzinfo is None:
+            raise ValueError("timezone-aware scheduled start is required")
+        start_utc = start.astimezone(timezone.utc)
+        return f"{league_key}:{start_utc.strftime('%Y%m%d')}:{away}:{home}"
+
+    prefix = f"{league_key}:game:v1:away:{away}:home:{home}:instance:"
+
+    if official_game_number is not None:
+        if official_game_number < 1:
+            raise ValueError("official game number must be a positive integer")
+        return f"{prefix}official_game_number:{official_game_number}"
+
+    if start is None or start.tzinfo is None:
+        raise ValueError(
+            "official game number or timezone-aware scheduled start is required"
+        )
+    start_utc = start.astimezone(timezone.utc)
+    return f"{prefix}start:{start_utc.strftime('%Y%m%dT%H%M%SZ')}"
+
+
+def canonical_moneyline_market_id_v1(canonical_game_id: str) -> str:
+    return f"{canonical_game_id}:market:moneyline:full_game:v1"
+
+
+def canonical_outcome_id_v1(canonical_market_id: str, selection: str) -> str:
+    if selection not in {"home", "away"}:
+        raise ValueError("selection must be home or away")
+    return f"{canonical_market_id}:outcome:{selection}:v1"
+
+
+def canonical_sportsbook_id_v1(label: str) -> str | None:
+    return MoneylineNormalizer.BOOKS.get(MoneylineNormalizer._key(label))
+
+
+def provider_quote_identity_v1(
+    *,
+    provider: str,
+    provider_event_id: str,
+    source_url: str,
+    observed_at: str,
+    canonical_sportsbook_id: str,
+    canonical_outcome_id: str,
+    american_price: int,
+) -> str:
+    payload = "|".join(
+        [
+            provider.strip().lower(),
+            provider_event_id.strip().lower(),
+            source_url.strip(),
+            observed_at.strip(),
+            canonical_sportsbook_id,
+            canonical_outcome_id,
+            str(american_price),
+        ]
+    )
+    return f"quote:v1:{sha256(payload.encode('utf-8')).hexdigest()[:20]}"
 
 
 class MoneylineNormalizer:
@@ -37,8 +109,11 @@ class MoneylineNormalizer:
         "la sparks": "los angeles sparks",
         "los angeles sparks": "los angeles sparks",
         "ny yankees": "new york yankees",
+        "n y yankees": "new york yankees",
         "new york yankees": "new york yankees",
+        "new york yanks": "new york yankees",
         "la dodgers": "los angeles dodgers",
+        "l a dodgers": "los angeles dodgers",
         "los angeles dodgers": "los angeles dodgers",
     }
 
@@ -57,7 +132,7 @@ class MoneylineNormalizer:
         event_parts: dict[str, dict[str, Any]] = {}
         for row in rows:
             book_label = str(row.get("sportsbook") or "")
-            book = self.BOOKS.get(self._key(book_label))
+            book = canonical_sportsbook_id_v1(book_label)
             if book is None:
                 rejections.append(
                     NormalizationRejection(
@@ -69,9 +144,24 @@ class MoneylineNormalizer:
                 continue
             try:
                 league = self.LEAGUES[self._key(str(row["league"]))]
-                start = self._time(row["event_start"])
                 observed = self._time(row["observed_at"])
             except (KeyError, TypeError, ValueError) as error:
+                rejections.append(
+                    NormalizationRejection(
+                        "EVENT_NORMALIZATION_FAILED", str(error), book
+                    )
+                )
+                continue
+            try:
+                start_value = row.get("event_start")
+                start = self._time(start_value) if start_value is not None else None
+                official_game_number_value = row.get("official_game_number")
+                official_game_number = (
+                    int(official_game_number_value)
+                    if official_game_number_value is not None
+                    else None
+                )
+            except (TypeError, ValueError) as error:
                 rejections.append(
                     NormalizationRejection(
                         "EVENT_NORMALIZATION_FAILED", str(error), book
@@ -90,14 +180,18 @@ class MoneylineNormalizer:
             if observed > now:
                 rejections.append(
                     NormalizationRejection(
-                        "FUTURE_OBSERVATION", "Observation timestamp is in the future", book
+                        "FUTURE_OBSERVATION",
+                        "Observation timestamp is in the future",
+                        book,
                     )
                 )
                 continue
             if bool(row.get("is_live")):
                 rejections.append(
                     NormalizationRejection(
-                        "LIVE_QUOTE_UNSUPPORTED", "Only pregame quotes are supported", book
+                        "LIVE_QUOTE_UNSUPPORTED",
+                        "Only pregame quotes are supported",
+                        book,
                     )
                 )
                 continue
@@ -156,13 +250,32 @@ class MoneylineNormalizer:
                     )
                 )
                 continue
-            canonical_id = self._event_id(league, start, away_name, home_name)
+            try:
+                canonical_id = canonical_game_identity_v1(
+                    league=league,
+                    start=start,
+                    away_team_name=away_name,
+                    home_team_name=home_name,
+                    official_game_number=official_game_number,
+                )
+            except ValueError as error:
+                rejections.append(
+                    NormalizationRejection(
+                        "EVENT_NORMALIZATION_FAILED", str(error), book
+                    )
+                )
+                continue
+            market_id = canonical_moneyline_market_id_v1(canonical_id)
+            outcome_id = canonical_outcome_id_v1(market_id, selection)
+            source = str(row.get("source") or "")
+            source_url = str(row.get("source_url") or "")
+            provider_event_id = str(row.get("provider_event_id") or "")
             quote = NormalizedMoneylineQuote(
                 canonical_event_id=canonical_id,
-                provider_event_id=str(row.get("provider_event_id") or ""),
+                provider_event_id=provider_event_id,
                 league=league,
-                season=str(row.get("season") or start.year),
-                event_start=start.isoformat(),
+                season=str(row.get("season") or (start.year if start else "")),
+                event_start=start.isoformat() if start else "",
                 home_team_id=self._team_id(league, home_name),
                 away_team_id=self._team_id(league, away_name),
                 sportsbook=book,
@@ -173,9 +286,21 @@ class MoneylineNormalizer:
                 line=None,
                 american_price=price,
                 observed_at=observed.isoformat(),
-                source=str(row.get("source") or ""),
-                source_url=str(row.get("source_url") or ""),
+                source=source,
+                source_url=source_url,
                 data_mode=str(row.get("data_mode") or "live"),
+                canonical_sportsbook_id=book,
+                canonical_market_id=market_id,
+                canonical_outcome_id=outcome_id,
+                provider_quote_id=provider_quote_identity_v1(
+                    provider=source,
+                    provider_event_id=provider_event_id,
+                    source_url=source_url,
+                    observed_at=observed.isoformat(),
+                    canonical_sportsbook_id=book,
+                    canonical_outcome_id=outcome_id,
+                    american_price=price,
+                ),
             )
             quotes.append(quote)
             event = event_parts.setdefault(
@@ -183,7 +308,7 @@ class MoneylineNormalizer:
                 {
                     "league": league,
                     "season": quote.season,
-                    "start": start.isoformat(),
+                    "start": start.isoformat() if start else "",
                     "home_name": home_name.title(),
                     "away_name": away_name.title(),
                     "home_id": quote.home_team_id,
@@ -200,16 +325,16 @@ class MoneylineNormalizer:
 
         latest: dict[tuple[str, str, str], NormalizedMoneylineQuote] = {}
         for quote in sorted(quotes, key=lambda item: item.observed_at):
-            latest[
-                (quote.canonical_event_id, quote.sportsbook, quote.selection)
-            ] = quote
-        by_book: dict[
-            tuple[str, str], dict[str, NormalizedMoneylineQuote]
-        ] = defaultdict(dict)
+            latest[(quote.canonical_event_id, quote.sportsbook, quote.selection)] = (
+                quote
+            )
+        by_book: dict[tuple[str, str], dict[str, NormalizedMoneylineQuote]] = (
+            defaultdict(dict)
+        )
         for quote in latest.values():
-            by_book[(quote.canonical_event_id, quote.sportsbook)][
-                quote.selection
-            ] = quote
+            by_book[(quote.canonical_event_id, quote.sportsbook)][quote.selection] = (
+                quote
+            )
         complete = []
         for (event_id, book), selections in by_book.items():
             if {"home", "away"} <= set(selections):
@@ -261,7 +386,7 @@ class MoneylineNormalizer:
         )
         return MoneylineNormalizationResult(
             events=events,
-            quotes=tuple(latest.values()),
+            quotes=tuple(quotes),
             complete_books=tuple(complete),
             rejections=tuple(rejections),
         )
@@ -271,17 +396,22 @@ class MoneylineNormalizer:
         return " ".join(value.strip().lower().replace("_", " ").split())
 
     def _team(self, value: str) -> str:
-        key = self._key(value)
+        key = self._team_key(value)
         return self.TEAM_ALIASES.get(key, key)
+
+    @staticmethod
+    def _team_key(value: str) -> str:
+        lowered = value.strip().lower().replace("_", " ")
+        for char in (".", "'", "-"):
+            lowered = lowered.replace(char, " ")
+        return " ".join(lowered.split())
 
     @staticmethod
     def _team_id(league: str, name: str) -> str:
         return f"{league.lower()}:{'-'.join(name.split())}"
 
     @staticmethod
-    def _event_id(
-        league: str, start: datetime, away: str, home: str
-    ) -> str:
+    def _event_id(league: str, start: datetime, away: str, home: str) -> str:
         return (
             f"{league.lower()}:{start.strftime('%Y%m%d')}:"
             f"{'-'.join(away.split())}:{'-'.join(home.split())}"

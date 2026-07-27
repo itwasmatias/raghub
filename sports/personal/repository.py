@@ -673,6 +673,91 @@ class PersonalEditionRepository:
                 ON sip_execution_receipts(order_id, created_at DESC);
             """,
         ),
+        (
+            7,
+            """
+            BEGIN IMMEDIATE;
+
+            CREATE TABLE IF NOT EXISTS sip_quotes_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                canonical_event_id TEXT NOT NULL,
+                sportsbook TEXT NOT NULL,
+                market TEXT NOT NULL,
+                period TEXT NOT NULL,
+                selection TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                provider_quote_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                UNIQUE(provider_quote_id)
+            );
+
+            INSERT INTO sip_quotes_v2 (
+                id, canonical_event_id, sportsbook, market, period,
+                selection, observed_at, provider_quote_id, payload_json
+            )
+            WITH legacy_rows AS (
+                SELECT
+                    id,
+                    canonical_event_id,
+                    sportsbook,
+                    market,
+                    period,
+                    selection,
+                    observed_at,
+                    payload_json,
+                    COALESCE(
+                        NULLIF(json_extract(payload_json, '$.provider_quote_id'), ''),
+                        'legacy:' || CAST(id AS TEXT)
+                    ) AS base_provider_quote_id
+                FROM sip_quotes
+            ),
+            ranked_rows AS (
+                SELECT
+                    id,
+                    canonical_event_id,
+                    sportsbook,
+                    market,
+                    period,
+                    selection,
+                    observed_at,
+                    payload_json,
+                    base_provider_quote_id,
+                    COUNT(*) OVER (
+                        PARTITION BY base_provider_quote_id
+                    ) AS duplicate_count,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY base_provider_quote_id
+                        ORDER BY id
+                    ) AS duplicate_index
+                FROM legacy_rows
+            )
+            SELECT
+                id,
+                canonical_event_id,
+                sportsbook,
+                market,
+                period,
+                selection,
+                observed_at,
+                CASE
+                    WHEN duplicate_count = 1 THEN base_provider_quote_id
+                    ELSE base_provider_quote_id || ':dup:' || printf('%06d', duplicate_index)
+                END,
+                payload_json
+            FROM ranked_rows
+            ORDER BY id;
+
+            DROP TABLE sip_quotes;
+            ALTER TABLE sip_quotes_v2 RENAME TO sip_quotes;
+
+            CREATE INDEX IF NOT EXISTS idx_sip_quotes_event_time
+                ON sip_quotes(canonical_event_id, observed_at);
+            CREATE INDEX IF NOT EXISTS idx_sip_quotes_provider_quote_id
+                ON sip_quotes(provider_quote_id);
+
+            COMMIT;
+            """,
+        ),
     )
 
     def __init__(self, database_path: str | Path) -> None:
@@ -745,10 +830,18 @@ class PersonalEditionRepository:
                     )
                 connection.executemany(
                     """
-                    INSERT OR IGNORE INTO sip_quotes (
+                    INSERT INTO sip_quotes (
                         canonical_event_id, sportsbook, market, period,
-                        selection, observed_at, payload_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        selection, observed_at, provider_quote_id, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(provider_quote_id) DO UPDATE SET
+                        canonical_event_id=excluded.canonical_event_id,
+                        sportsbook=excluded.sportsbook,
+                        market=excluded.market,
+                        period=excluded.period,
+                        selection=excluded.selection,
+                        observed_at=excluded.observed_at,
+                        payload_json=excluded.payload_json
                     """,
                     [
                         (
@@ -758,11 +851,31 @@ class PersonalEditionRepository:
                             quote.period,
                             quote.selection,
                             quote.observed_at,
+                            self._quote_observation_id(quote),
                             json.dumps(asdict(quote), sort_keys=True),
                         )
                         for quote in quotes
                     ],
                 )
+
+    @staticmethod
+    def _quote_observation_id(quote: NormalizedMoneylineQuote) -> str:
+        if quote.provider_quote_id:
+            return quote.provider_quote_id
+        payload = "|".join(
+            [
+                quote.source.strip().lower(),
+                quote.provider_event_id.strip().lower(),
+                quote.source_url.strip(),
+                quote.observed_at.strip(),
+                quote.sportsbook,
+                quote.selection,
+                str(quote.american_price),
+            ]
+        )
+        return (
+            f"quote:legacy:{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:20]}"
+        )
 
     def save_forecasts(
         self, forecasts: tuple[MoneylineForecast, ...] | list[MoneylineForecast]
