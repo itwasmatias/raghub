@@ -102,6 +102,24 @@ def test_market_feed_and_order_intent_recording_flow(tmp_path):
     market = markets_payload["markets"][0]
     outcome = market["outcomes"][0]
 
+    assert outcome["sportsbook_consensus_probability"] is not None
+    assert outcome["market_probability"] is not None
+    assert outcome["best_odds"] is not None
+    assert outcome["american_odds"] is not None
+
+    markets_page = client.get("/sip/markets").get_data(as_text=True)
+    outcome_renderer = markets_page[
+        markets_page.index("function renderOutcomes(market) {"):
+        markets_page.index("function renderCard(market, index) {")
+    ]
+    for field in (
+        "outcome.sportsbook_consensus_probability",
+        "outcome.market_probability",
+        "outcome.best_odds",
+        "outcome.american_odds",
+    ):
+        assert field in outcome_renderer
+
     intent = client.post(
         "/api/sip/order-intents",
         json={

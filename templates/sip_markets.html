@@ -444,9 +444,15 @@
                             probability(firstDefined(
                                 outcome.probability,
                                 outcome.implied_probability,
+                                outcome.sportsbook_consensus_probability,
+                                outcome.market_probability,
                                 outcome.price
                             )),
-                            outcome.odds,
+                            firstDefined(
+                                outcome.odds,
+                                outcome.best_odds,
+                                outcome.american_odds
+                            ),
                             "Unavailable"
                         ))}</strong>
                     </div>
