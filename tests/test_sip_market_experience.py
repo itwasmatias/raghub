@@ -68,13 +68,29 @@ def test_market_pages_render_with_explicit_unavailable_state(tmp_path):
     app = app_module.create_app(personal_service=_service(tmp_path, with_feed=False))
     client = app.test_client()
 
-    assert client.get("/sip/markets").status_code == 200
+    markets_page = client.get("/sip/markets")
+    assert markets_page.status_code == 200
     assert client.get("/sip/portfolio").status_code == 200
     assert client.get("/sip/activity").status_code == 200
 
     markets = client.get("/api/sip/markets").get_json()
     assert markets["has_persisted_data"] is False
     assert "No persisted market records" in markets["unavailable_state"]
+
+    page = markets_page.get_data(as_text=True)
+    number_helper = page[
+        page.index("const numberValue = value => {"):
+        page.index("const probability = value => {")
+    ]
+    null_guard = "if (value === null || value === undefined) return null;"
+    blank_string_guard = (
+        'if (typeof value === "string" && value.trim() === "") return null;'
+    )
+
+    assert null_guard in number_helper
+    assert blank_string_guard in number_helper
+    assert number_helper.index(null_guard) < number_helper.index("Number(value)")
+    assert number_helper.index(blank_string_guard) < number_helper.index("Number(value)")
 
 
 def test_market_feed_and_order_intent_recording_flow(tmp_path):
