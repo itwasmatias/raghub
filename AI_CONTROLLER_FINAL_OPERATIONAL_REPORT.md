@@ -13,7 +13,7 @@ The live Codex run did not complete a queued task because external OpenAI access
 - Starting branch: `feature/ai-controller-operational-v1`
 - Starting commit: `ec65f7e1c3dc9b0c4b2a1462ea6dda04bc4178ee`
 - Final branch: `feature/ai-controller-operational-v1`
-- Final implementation commit: `7f533b21cb04a33d0a6b8cd987b6f4295f774a1b`
+- Final implementation commit: `4f711e2a9a8c26502e1e729765c8d61344f07829`
 - Authoritative controller path: `/home/matias/raghub-ai-controller/tools/ai_controller`
 
 ## 3. Root Causes Found
@@ -306,7 +306,7 @@ Blocked externally:
 
 ## 22. Commit Hash
 
-- `7f533b21cb04a33d0a6b8cd987b6f4295f774a1b`
+- `4f711e2a9a8c26502e1e729765c8d61344f07829`
 
 ## 23. Uncommitted Files Remaining
 
@@ -357,4 +357,3 @@ Task title: `Situation Room source-health visibility`
 Task prompt:
 
 > Update the Situation Room flow so `source_health`, `confidence`, `horizon`, `evidence`, and invalidation conditions are visible in the shared `/api/situation-room` and `/api/situation-room/predict` derived UI without inventing fallback news, odds, or stats. Preserve the existing forecast contract fields (`day`, `base_case`, `upside`, `downside`, `base_low`, `base_high`) and add focused regression tests that prove stale or missing source data renders a no-bet/degraded state instead of fabricated output.
-
