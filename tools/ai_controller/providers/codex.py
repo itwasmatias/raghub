@@ -105,6 +105,7 @@ class CodexProvider(Provider):
 
 
 
+
 class LocalOllamaProvider(CodexProvider):
     # Use Fedora Codex OSS mode with Windows Ollama through an SSH tunnel.
 
