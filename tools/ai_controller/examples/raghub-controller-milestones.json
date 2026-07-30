@@ -1,0 +1,130 @@
+{
+  "mission_id": "raghub-controller-milestones-v1",
+  "title": "RAGHub Controller Future Milestones",
+  "description": "Planning outline for upcoming controller improvements across three phases: foundation, orchestration, and production hardening. Do not execute directly.",
+  "base_ref": "HEAD",
+  "repository_path": "",
+  "budgets": {
+    "max_active_tasks": 5,
+    "max_queued_tasks": 20,
+    "max_total_attempts": 100,
+    "max_failed_tasks": 10,
+    "max_runtime_seconds": 86400.0,
+    "max_worktrees": 10
+  },
+  "metadata": {
+    "planning_only": true,
+    "do_not_execute": true,
+    "purpose": "Structured milestone outline for raghub-controller future work. Convert to a mission via outline_to_mission() before running."
+  },
+  "phases": [
+    {
+      "phase_id": "foundation",
+      "title": "Foundation",
+      "description": "Core controller infrastructure improvements that unblock later phases. Tasks run in parallel.",
+      "parallel": true,
+      "tasks": [
+        {
+          "task_id": "context-builder",
+          "title": "Context Builder",
+          "prompt": "Implement a ContextBuilder class in tools/ai_controller/context.py that assembles a task prompt with relevant repo context (changed files, test output, prior attempt history) so that the AI provider receives a richer, structured input rather than a bare prompt string.",
+          "tests": [["python", "-c", "print('ok')"]],
+          "max_attempts": 3,
+          "failure_policy": "block_dependents",
+          "metadata": {
+            "area": "context-assembly",
+            "effort": "medium"
+          }
+        },
+        {
+          "task_id": "test-feedback-loop",
+          "title": "Test Feedback Loop",
+          "prompt": "Extend the controller's task execution cycle to re-run the task's test commands after each AI response, capture the exit codes and stdout, and append a structured test-result block to the next attempt's context so the model can self-correct based on test failures.",
+          "tests": [["python", "-c", "print('ok')"]],
+          "max_attempts": 3,
+          "failure_policy": "block_dependents",
+          "metadata": {
+            "area": "execution-loop",
+            "effort": "medium"
+          }
+        }
+      ]
+    },
+    {
+      "phase_id": "orchestration",
+      "title": "Orchestration",
+      "description": "Mission-level orchestration primitives. Tasks run in parallel once the foundation phase is complete.",
+      "parallel": true,
+      "tasks": [
+        {
+          "task_id": "mission-cli",
+          "title": "Mission CLI",
+          "prompt": "Add a 'mission' sub-command group to tools/ai_controller/cli.py supporting: 'mission start <file>', 'mission status <id>', 'mission resume <id>', and 'mission cancel <id>'. Each sub-command should load/persist state via MissionStore and print a human-readable summary.",
+          "tests": [["python", "-c", "print('ok')"]],
+          "max_attempts": 3,
+          "failure_policy": "continue_independent",
+          "metadata": {
+            "area": "cli",
+            "effort": "medium"
+          }
+        },
+        {
+          "task_id": "mission-store",
+          "title": "Mission Store Hardening",
+          "prompt": "Audit MissionStore for race conditions under concurrent controller processes. Add atomic write-then-rename for state persistence, verify FileLock coverage on all read-modify-write paths, and add a store.integrity_check() method that detects and logs inconsistencies between stored state and the event log.",
+          "tests": [["python", "-c", "print('ok')"]],
+          "max_attempts": 3,
+          "failure_policy": "block_dependents",
+          "metadata": {
+            "area": "persistence",
+            "effort": "high"
+          }
+        },
+        {
+          "task_id": "mission-scheduler",
+          "title": "Mission Scheduler Improvements",
+          "prompt": "Refactor MissionScheduler to support a configurable tick interval, add a dry-run mode that computes the next set of ready tasks without mutating state, and expose a scheduler.status_summary() method returning counts of tasks by status for use in CLI output and reports.",
+          "tests": [["python", "-c", "print('ok')"]],
+          "max_attempts": 3,
+          "failure_policy": "continue_independent",
+          "metadata": {
+            "area": "scheduling",
+            "effort": "medium"
+          }
+        }
+      ]
+    },
+    {
+      "phase_id": "production",
+      "title": "Production Hardening",
+      "description": "Cross-platform and security hardening tasks. Run serially within this phase to avoid conflicting environment changes.",
+      "parallel": false,
+      "tasks": [
+        {
+          "task_id": "windows-compatibility",
+          "title": "Windows Compatibility",
+          "prompt": "Audit all filesystem and subprocess calls in tools/ai_controller/ for POSIX-only assumptions. Replace os.path usages with pathlib.Path, ensure FileLock works on Windows (use msvcrt-based locking as a fallback), and add a note in README.md listing any remaining platform limitations.",
+          "tests": [["python", "-c", "print('ok')"]],
+          "max_attempts": 3,
+          "failure_policy": "block_dependents",
+          "metadata": {
+            "area": "cross-platform",
+            "effort": "high"
+          }
+        },
+        {
+          "task_id": "ssh-hardening",
+          "title": "SSH Hardening",
+          "prompt": "Review all SSH-related configuration and subprocess invocations in tools/ai_controller/remote.py. Enforce StrictHostKeyChecking, disallow password authentication in constructed SSH command strings, and validate that the configured identity file path is absolute and exists before attempting connection.",
+          "tests": [["python", "-c", "print('ok')"]],
+          "max_attempts": 3,
+          "failure_policy": "stop_mission",
+          "metadata": {
+            "area": "security",
+            "effort": "medium"
+          }
+        }
+      ]
+    }
+  ]
+}

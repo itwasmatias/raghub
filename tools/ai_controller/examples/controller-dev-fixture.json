@@ -1,0 +1,180 @@
+{
+  "schema_version": "1",
+  "mission_id": "controller-dev-fixture-v1",
+  "title": "Controller Dev Fixture",
+  "description": "Fixture mission for testing the RAGHub AI Controller orchestrator. Demonstrates serial dependencies, parallel tasks, blocked tasks, and retry scenarios.",
+  "version": "0",
+  "base_ref": "HEAD",
+  "repository_path": "",
+  "budgets": {
+    "max_active_tasks": 5,
+    "max_queued_tasks": 20,
+    "max_total_attempts": 100,
+    "max_failed_tasks": 10,
+    "max_runtime_seconds": 86400.0,
+    "max_worktrees": 10
+  },
+  "metadata": {
+    "fixture": true,
+    "purpose": "orchestrator integration testing"
+  },
+  "tasks": [
+    {
+      "task_id": "inspect",
+      "title": "Inspect Repository",
+      "prompt": "Examine the repository structure and list the top-level directories and files. Summarise what you find in a one-paragraph comment at the top of a file called INSPECTION.md.",
+      "depends_on": [],
+      "base_ref": "HEAD",
+      "tests": [
+        ["python", "-c", "print('ok')"]
+      ],
+      "provider_preference": null,
+      "provider_fallback": [],
+      "provider_policy": "any_order",
+      "max_attempts": 3,
+      "timeout_seconds": 1800.0,
+      "failure_policy": "block_dependents",
+      "required_changed_paths": [],
+      "forbidden_changed_paths": [],
+      "approval_policy": "no_approval_required",
+      "cleanup_policy": "preserve",
+      "metadata": {}
+    },
+    {
+      "task_id": "add_feature",
+      "title": "Add Feature Stub",
+      "prompt": "Create a file called feature.py in the repository root containing a single function stub named `run_feature` that accepts no arguments and returns the string 'feature_ok'.",
+      "depends_on": ["inspect"],
+      "base_ref": "HEAD",
+      "tests": [
+        ["python", "-c", "print('ok')"]
+      ],
+      "provider_preference": null,
+      "provider_fallback": [],
+      "provider_policy": "any_order",
+      "max_attempts": 3,
+      "timeout_seconds": 1800.0,
+      "failure_policy": "block_dependents",
+      "required_changed_paths": [],
+      "forbidden_changed_paths": [],
+      "approval_policy": "no_approval_required",
+      "cleanup_policy": "preserve",
+      "metadata": {}
+    },
+    {
+      "task_id": "add_docs",
+      "title": "Add Documentation",
+      "prompt": "Create a file called FEATURE.md in the repository root with a one-sentence description of what the feature stub in feature.py does. This task runs in parallel with add_feature.",
+      "depends_on": ["inspect"],
+      "base_ref": "HEAD",
+      "tests": [
+        ["python", "-c", "print('ok')"]
+      ],
+      "provider_preference": null,
+      "provider_fallback": [],
+      "provider_policy": "any_order",
+      "max_attempts": 3,
+      "timeout_seconds": 1800.0,
+      "failure_policy": "continue_independent",
+      "required_changed_paths": [],
+      "forbidden_changed_paths": [],
+      "approval_policy": "no_approval_required",
+      "cleanup_policy": "preserve",
+      "metadata": {}
+    },
+    {
+      "task_id": "add_tests",
+      "title": "Add Tests",
+      "prompt": "Create a file called test_feature.py that imports `run_feature` from feature.py and asserts that calling it returns 'feature_ok'. Use only the Python standard library (no pytest).",
+      "depends_on": ["add_feature"],
+      "base_ref": "HEAD",
+      "tests": [
+        ["python", "-c", "print('ok')"]
+      ],
+      "provider_preference": null,
+      "provider_fallback": [],
+      "provider_policy": "any_order",
+      "max_attempts": 2,
+      "timeout_seconds": 1800.0,
+      "failure_policy": "block_dependents",
+      "required_changed_paths": [],
+      "forbidden_changed_paths": [],
+      "approval_policy": "no_approval_required",
+      "cleanup_policy": "preserve",
+      "metadata": {
+        "note": "max_attempts=2 exercises the retry scenario"
+      }
+    },
+    {
+      "task_id": "verify",
+      "title": "Verify End-to-End",
+      "prompt": "Run test_feature.py using `python test_feature.py` and confirm it exits with code 0. Record the outcome in a file called VERIFY.md.",
+      "depends_on": ["add_tests"],
+      "base_ref": "HEAD",
+      "tests": [
+        ["python", "-c", "print('ok')"]
+      ],
+      "provider_preference": null,
+      "provider_fallback": [],
+      "provider_policy": "any_order",
+      "max_attempts": 3,
+      "timeout_seconds": 1800.0,
+      "failure_policy": "block_dependents",
+      "required_changed_paths": [],
+      "forbidden_changed_paths": [],
+      "approval_policy": "no_approval_required",
+      "cleanup_policy": "preserve",
+      "metadata": {
+        "note": "blocked until add_tests succeeds"
+      }
+    },
+    {
+      "task_id": "report",
+      "title": "Generate Summary Report",
+      "prompt": "Create a file called REPORT.md summarising the outcome of inspect, add_feature, add_docs, add_tests, and verify tasks in bullet-point form.",
+      "depends_on": ["verify"],
+      "base_ref": "HEAD",
+      "tests": [
+        ["python", "-c", "print('ok')"]
+      ],
+      "provider_preference": null,
+      "provider_fallback": [],
+      "provider_policy": "any_order",
+      "max_attempts": 3,
+      "timeout_seconds": 1800.0,
+      "failure_policy": "block_dependents",
+      "required_changed_paths": [],
+      "forbidden_changed_paths": [],
+      "approval_policy": "no_approval_required",
+      "cleanup_policy": "preserve",
+      "metadata": {}
+    }
+  ],
+  "milestones": [
+    {
+      "milestone_id": "setup",
+      "title": "Setup",
+      "description": "Initial inspection of the repository.",
+      "task_ids": ["inspect"]
+    },
+    {
+      "milestone_id": "implementation",
+      "title": "Implementation",
+      "description": "Parallel feature and documentation tasks.",
+      "task_ids": ["add_feature", "add_docs"]
+    },
+    {
+      "milestone_id": "quality",
+      "title": "Quality Gate",
+      "description": "Tests and end-to-end verification.",
+      "task_ids": ["add_tests", "verify"]
+    },
+    {
+      "milestone_id": "reporting",
+      "title": "Reporting",
+      "description": "Final summary report.",
+      "task_ids": ["report"]
+    }
+  ],
+  "created_at": ""
+}

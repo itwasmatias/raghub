@@ -23,6 +23,18 @@ from .remote import LocalRunner, SSHRunner
 from .reports import ReportStore
 from .worktrees import WorktreeManager
 from ._locking import FileLock
+from .mission import (
+    MissionDefinition,
+    MissionStore,
+    MissionScheduler,
+    TaskMaterializer,
+    MissionEventLog,
+    validate_mission,
+    generate_mission_report,
+    outline_to_mission,
+    load_outline_file,
+    save_mission_file,
+)
 
 
 def _runner(config: ControllerConfig) -> LocalRunner:
@@ -161,6 +173,47 @@ def parser() -> argparse.ArgumentParser:
     doctor_cmd = commands.add_parser("doctor")
     doctor_cmd.add_argument("--json", action="store_true", dest="json_output")
     commands.add_parser("smoke-local")
+
+    # Mission orchestrator subcommand
+    mission_cmd = commands.add_parser("mission")
+    mission_sub = mission_cmd.add_subparsers(dest="mission_action", required=True)
+
+    m_validate = mission_sub.add_parser("validate")
+    m_validate.add_argument("mission_file", type=Path)
+
+    m_create = mission_sub.add_parser("create")
+    m_create.add_argument("mission_file", type=Path)
+
+    m_status = mission_sub.add_parser("status")
+    m_status.add_argument("mission_id")
+    m_status.add_argument("--json", action="store_true", dest="json_output")
+
+    m_graph = mission_sub.add_parser("graph")
+    m_graph.add_argument("mission_id")
+
+    m_run = mission_sub.add_parser("run")
+    m_run.add_argument("mission_id")
+    m_run_mode = m_run.add_mutually_exclusive_group(required=True)
+    m_run_mode.add_argument("--once", action="store_true")
+    m_run_mode.add_argument("--continuous", action="store_true")
+
+    m_pause = mission_sub.add_parser("pause")
+    m_pause.add_argument("mission_id")
+
+    m_resume = mission_sub.add_parser("resume")
+    m_resume.add_argument("mission_id")
+
+    m_cancel = mission_sub.add_parser("cancel")
+    m_cancel.add_argument("mission_id")
+
+    m_report = mission_sub.add_parser("report")
+    m_report.add_argument("mission_id")
+    m_report.add_argument("--json", action="store_true", dest="json_output")
+
+    m_plan = mission_sub.add_parser("plan")
+    m_plan.add_argument("outline_file", type=Path)
+    m_plan.add_argument("--output", type=Path, default=None)
+
     return result
 
 
@@ -519,6 +572,219 @@ def _smoke_local(settings: ControllerConfig) -> int:
         return 0 if success else 1
 
 
+def _mission_command(args: argparse.Namespace, settings: ControllerConfig) -> int:
+    """Handle all `mission` subcommands."""
+    settings.missions_root.mkdir(parents=True, exist_ok=True)
+    store = MissionStore(settings.missions_root)
+    queue = DurableQueue(settings.queue_root)
+    materializer = TaskMaterializer(queue, settings.reports_root)
+
+    action = args.mission_action
+
+    if action == "validate":
+        try:
+            definition = MissionDefinition.from_file(str(args.mission_file))
+        except (OSError, KeyError, ValueError) as exc:
+            print(f"ERROR loading mission file: {exc}", file=sys.stderr)
+            return 1
+        result = validate_mission(definition)
+        if result.valid:
+            print(f"OK: mission {definition.mission_id!r} is valid ({len(definition.tasks)} tasks)")
+            return 0
+        print(f"INVALID: {len(result.errors)} error(s) in {args.mission_file}")
+        for err in result.errors:
+            loc = f"task={err.task_id}" if err.task_id else "mission"
+            print(f"  [{err.code}] {loc}: {err.message}")
+        return 1
+
+    if action == "create":
+        try:
+            definition = MissionDefinition.from_file(str(args.mission_file))
+        except (OSError, KeyError, ValueError) as exc:
+            print(f"ERROR loading mission file: {exc}", file=sys.stderr)
+            return 1
+        result = validate_mission(definition)
+        if not result.valid:
+            print(f"INVALID: cannot create mission with {len(result.errors)} error(s)")
+            for err in result.errors:
+                loc = f"task={err.task_id}" if err.task_id else "mission"
+                print(f"  [{err.code}] {loc}: {err.message}")
+            return 1
+        import datetime
+        from .mission.models import (
+            MissionState, MissionTaskState, MissionTaskStatus,
+            MissionStatus, BudgetUsage,
+        )
+        if not definition.created_at:
+            definition.created_at = datetime.datetime.utcnow().isoformat() + "Z"
+        initial_task_states = {
+            t.task_id: MissionTaskState(task_id=t.task_id, status=MissionTaskStatus.pending)
+            for t in definition.tasks
+        }
+        initial_state = MissionState(
+            mission_id=definition.mission_id,
+            status=MissionStatus.pending,
+            task_states=initial_task_states,
+            events_path=str(settings.missions_root / "events" / f"{definition.mission_id}.jsonl"),
+        )
+        try:
+            store.create(definition, initial_state)
+        except FileExistsError:
+            print(f"ERROR: mission {definition.mission_id!r} already exists", file=sys.stderr)
+            return 1
+        print(f"OK: mission {definition.mission_id!r} created ({len(definition.tasks)} tasks)")
+        return 0
+
+    if action == "status":
+        try:
+            state = store.load_state(args.mission_id)
+            definition = store.load_definition(args.mission_id)
+        except FileNotFoundError:
+            print(f"ERROR: mission {args.mission_id!r} not found", file=sys.stderr)
+            return 1
+        from .mission.models import MissionTaskStatus
+        counts: dict[str, int] = {s.value: 0 for s in MissionTaskStatus}
+        for ts in state.task_states.values():
+            counts[ts.status.value] = counts.get(ts.status.value, 0) + 1
+        payload = {
+            "mission_id": state.mission_id,
+            "status": state.status.value,
+            "started_at": state.started_at,
+            "finished_at": state.finished_at,
+            "task_counts": counts,
+            "budget_usage": state.budget_usage.to_dict(),
+            "failure_reason": state.failure_reason,
+            "root_cause_task_ids": state.root_cause_task_ids,
+        }
+        if getattr(args, "json_output", False):
+            _print_json(payload)
+        else:
+            print(f"Mission:  {state.mission_id}")
+            print(f"Status:   {state.status.value}")
+            print(f"Tasks:    {len(state.task_states)} total")
+            for status_val, count in sorted(counts.items()):
+                if count:
+                    print(f"  {status_val}: {count}")
+        return 0
+
+    if action == "graph":
+        try:
+            state = store.load_state(args.mission_id)
+            definition = store.load_definition(args.mission_id)
+        except FileNotFoundError:
+            print(f"ERROR: mission {args.mission_id!r} not found", file=sys.stderr)
+            return 1
+        from .mission.graph import DependencyGraph
+        graph = DependencyGraph(definition, state)
+        print(graph.render_text())
+        return 0
+
+    if action == "run":
+        try:
+            state = store.load_state(args.mission_id)
+            definition = store.load_definition(args.mission_id)
+        except FileNotFoundError:
+            print(f"ERROR: mission {args.mission_id!r} not found", file=sys.stderr)
+            return 1
+        from .mission.models import MissionStatus
+        scheduler = MissionScheduler(
+            store=store,
+            queue=queue,
+            reports_root=settings.reports_root,
+            missions_root=settings.missions_root,
+            poll_interval_seconds=settings.mission_poll_interval_seconds,
+        )
+        if args.once:
+            status = scheduler.run_once(args.mission_id)
+            print(f"Mission status after one cycle: {status.value}")
+            return 0 if status in (MissionStatus.succeeded, MissionStatus.running, MissionStatus.pending) else 1
+        scheduler.run_continuous(args.mission_id)
+        return 0
+
+    if action == "pause":
+        try:
+            store.load_state(args.mission_id)
+        except FileNotFoundError:
+            print(f"ERROR: mission {args.mission_id!r} not found", file=sys.stderr)
+            return 1
+        scheduler = MissionScheduler(
+            store=store, queue=queue, reports_root=settings.reports_root,
+            missions_root=settings.missions_root,
+        )
+        scheduler.pause(args.mission_id)
+        print(f"OK: mission {args.mission_id!r} paused")
+        return 0
+
+    if action == "resume":
+        try:
+            store.load_state(args.mission_id)
+        except FileNotFoundError:
+            print(f"ERROR: mission {args.mission_id!r} not found", file=sys.stderr)
+            return 1
+        scheduler = MissionScheduler(
+            store=store, queue=queue, reports_root=settings.reports_root,
+            missions_root=settings.missions_root,
+        )
+        scheduler.resume(args.mission_id)
+        print(f"OK: mission {args.mission_id!r} resumed")
+        return 0
+
+    if action == "cancel":
+        try:
+            store.load_state(args.mission_id)
+        except FileNotFoundError:
+            print(f"ERROR: mission {args.mission_id!r} not found", file=sys.stderr)
+            return 1
+        scheduler = MissionScheduler(
+            store=store, queue=queue, reports_root=settings.reports_root,
+            missions_root=settings.missions_root,
+        )
+        scheduler.cancel(args.mission_id)
+        print(f"OK: mission {args.mission_id!r} cancelled")
+        return 0
+
+    if action == "report":
+        try:
+            state = store.load_state(args.mission_id)
+            definition = store.load_definition(args.mission_id)
+        except FileNotFoundError:
+            print(f"ERROR: mission {args.mission_id!r} not found", file=sys.stderr)
+            return 1
+        event_log = MissionEventLog(settings.missions_root / "events", args.mission_id)
+        report = generate_mission_report(definition, state, event_log)
+        saved_path = store.write_report(args.mission_id, report)
+        if getattr(args, "json_output", False):
+            _print_json(report)
+        else:
+            print(f"Mission:  {report['mission_id']}")
+            print(f"Status:   {report['mission_status']}")
+            print(f"Outcome:  {report['outcome']}")
+            print(f"Action:   {report['recommended_action']}")
+            print(f"Report:   {saved_path}")
+        return 0
+
+    if action == "plan":
+        try:
+            outline = load_outline_file(str(args.outline_file))
+        except (OSError, ValueError) as exc:
+            print(f"ERROR loading outline: {exc}", file=sys.stderr)
+            return 1
+        definition, result = outline_to_mission(outline)
+        if not result.valid:
+            print(f"Plan produced {len(result.errors)} validation error(s):")
+            for err in result.errors:
+                loc = f"task={err.task_id}" if err.task_id else "mission"
+                print(f"  [{err.code}] {loc}: {err.message}")
+            return 1
+        output_path = args.output or Path(f"{definition.mission_id}.json")
+        save_mission_file(definition, str(output_path))
+        print(f"OK: plan written to {output_path} ({len(definition.tasks)} tasks)")
+        return 0
+
+    print(f"Unknown mission action: {action}", file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     settings = ControllerConfig.from_json(args.config)
@@ -564,6 +830,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "smoke-local":
         return _smoke_local(settings)
+
+    if args.command == "mission":
+        return _mission_command(args, settings)
 
     controller = build(settings)
     if args.command == "run":

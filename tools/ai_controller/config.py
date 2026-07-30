@@ -40,6 +40,9 @@ class ControllerConfig:
     ollama_keep_alive: str = "5m"
     native_agent_allowed_commands: list[list[str]] = field(default_factory=list)
     native_agent_command_timeout_seconds: float = 120
+    # Mission orchestrator settings
+    mission_poll_interval_seconds: float = 10.0
+    mission_max_concurrent_tasks: int = 5
 
     def __post_init__(self) -> None:
         self.controller_root = Path(self.controller_root)
@@ -70,6 +73,10 @@ class ControllerConfig:
             raise ValueError("ollama_context_size must be positive")
         if not 0 <= self.ollama_temperature <= 2:
             raise ValueError("ollama_temperature must be between 0 and 2")
+        if self.mission_poll_interval_seconds <= 0:
+            raise ValueError("mission_poll_interval_seconds must be positive")
+        if self.mission_max_concurrent_tasks <= 0:
+            raise ValueError("mission_max_concurrent_tasks must be positive")
         if bool(self.ssh_host) != bool(self.ssh_key_path):
             raise ValueError("ssh_host and ssh_key_path must be configured together")
 
@@ -92,6 +99,10 @@ class ControllerConfig:
     @property
     def process_lock_path(self) -> Path:
         return self.controller_root / ".controller.lock"
+
+    @property
+    def missions_root(self) -> Path:
+        return self.controller_root / "missions"
 
     @classmethod
     def from_json(cls, path: Path) -> "ControllerConfig":
