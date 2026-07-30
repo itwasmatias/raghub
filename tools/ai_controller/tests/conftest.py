@@ -16,8 +16,10 @@ class FakeOllamaState:
     version_delay: float = 0.0
     tags_models: list[dict[str, Any]] = field(default_factory=lambda: [{"name": "qwen2.5-coder:3b"}])
     generate_queue: list[dict[str, Any]] = field(default_factory=list)
+    chat_queue: list[dict[str, Any]] = field(default_factory=list)
     request_log: list[dict[str, Any]] = field(default_factory=list)
     generate_requests: list[dict[str, Any]] = field(default_factory=list)
+    chat_requests: list[dict[str, Any]] = field(default_factory=list)
 
 
 class FakeOllamaServer(AbstractContextManager["FakeOllamaServer"]):
@@ -64,22 +66,43 @@ class FakeOllamaServer(AbstractContextManager["FakeOllamaServer"]):
                 self.server.state.request_log.append(
                     {"method": "POST", "path": self.path, "body": body}
                 )
-                if self.path != "/api/generate":
-                    self._send_json(404, {"error": "not found"})
+                if self.path == "/api/generate":
+                    self.server.state.generate_requests.append(json.loads(body or "{}"))
+                    if not self.server.state.generate_queue:
+                        self._send_json(200, {"response": "{}"})
+                        return
+                    response = self.server.state.generate_queue.pop(0)
+                    delay = response.get("delay", 0.0)
+                    if delay:
+                        time.sleep(delay)
+                    status = response.get("status", 200)
+                    if "raw" in response:
+                        self._send_raw(status, response["raw"])
+                        return
+                    self._send_json(status, response.get("body", {}))
                     return
-                self.server.state.generate_requests.append(json.loads(body or "{}"))
-                if not self.server.state.generate_queue:
-                    self._send_json(200, {"response": "{}"})
+                if self.path == "/api/chat":
+                    parsed = json.loads(body or "{}")
+                    self.server.state.chat_requests.append(parsed)
+                    if not self.server.state.chat_queue:
+                        # Default: empty finish response
+                        content = json.dumps({"thought_summary": "done", "action": {"tool": "finish", "arguments": {"success": False, "summary": "no response queued"}}})
+                        self._send_json(200, {"message": {"role": "assistant", "content": content}})
+                        return
+                    response = self.server.state.chat_queue.pop(0)
+                    delay = response.get("delay", 0.0)
+                    if delay:
+                        time.sleep(delay)
+                    status = response.get("status", 200)
+                    if "raw" in response:
+                        self._send_raw(status, response["raw"])
+                        return
+                    body_payload = response.get("body", {})
+                    if "content" in response:
+                        body_payload = {"message": {"role": "assistant", "content": response["content"]}}
+                    self._send_json(status, body_payload)
                     return
-                response = self.server.state.generate_queue.pop(0)
-                delay = response.get("delay", 0.0)
-                if delay:
-                    time.sleep(delay)
-                status = response.get("status", 200)
-                if "raw" in response:
-                    self._send_raw(status, response["raw"])
-                    return
-                self._send_json(status, response.get("body", {}))
+                self._send_json(404, {"error": "not found"})
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self._server.state = self.state  # type: ignore[attr-defined]

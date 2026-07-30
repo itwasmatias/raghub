@@ -28,11 +28,18 @@ class ControllerConfig:
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen2.5-coder:3b"
     ollama_request_timeout_seconds: float = 120
-    ollama_generation_timeout_seconds: float = 120
+    ollama_generation_timeout_seconds: float = 300
     ollama_context_size: int = 8192
     ollama_temperature: float = 0.2
     ollama_max_retries: int = 2
     ollama_max_output_chars: int = 200_000
+    # Native Ollama agent provider settings
+    native_agent_attempts: int = 0
+    ollama_max_agent_steps: int = 20
+    ollama_max_tool_failures: int = 5
+    ollama_keep_alive: str = "5m"
+    native_agent_allowed_commands: list[list[str]] = field(default_factory=list)
+    native_agent_command_timeout_seconds: float = 120
 
     def __post_init__(self) -> None:
         self.controller_root = Path(self.controller_root)
@@ -41,7 +48,10 @@ class ControllerConfig:
         for name in (
             "codex_attempts",
             "local_attempts",
+            "native_agent_attempts",
             "ollama_max_retries",
+            "ollama_max_agent_steps",
+            "ollama_max_tool_failures",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} cannot be negative")
@@ -52,6 +62,7 @@ class ControllerConfig:
             "orphan_after_seconds",
             "ollama_request_timeout_seconds",
             "ollama_generation_timeout_seconds",
+            "native_agent_command_timeout_seconds",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
