@@ -1,0 +1,341 @@
+"""
+Tests for reconciliation event emission.
+
+Verifies that:
+1. Legacy record adoption emits an event
+2. Legacy record rejection (metadata mismatch) emits an event
+3. Both-formats conflict detection emits an event
+4. New queue record creation emits an event
+5. Reconciliation classifications emit appropriate events
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from tools.ai_controller.mission.materializer import TaskMaterializer
+from tools.ai_controller.mission.events import MissionEventLog
+from tools.ai_controller.mission import make_legacy_queue_task_id
+from tools.ai_controller.mission.models import (
+    MissionState,
+    MissionStatus,
+    MissionTaskDefinition,
+    MissionTaskState,
+    MissionTaskStatus,
+)
+from tools.ai_controller.models import Task
+from tools.ai_controller.queue import DurableQueue
+
+
+@pytest.fixture
+def temp_queue(tmp_path: Path) -> DurableQueue:
+    return DurableQueue(tmp_path / "queue")
+
+
+@pytest.fixture
+def materializer(temp_queue: DurableQueue, tmp_path: Path) -> TaskMaterializer:
+    return TaskMaterializer(
+        temp_queue,
+        tmp_path / "reports",
+        events_dir=tmp_path / "events",
+    )
+
+
+@pytest.fixture
+def event_log(tmp_path: Path) -> MissionEventLog:
+    def _log(mission_id: str) -> MissionEventLog:
+        return MissionEventLog(tmp_path / "events", mission_id)
+    return _log
+
+
+class TestMaterializationEvents:
+    """Test that materialize() emits appropriate events."""
+
+    def test_legacy_adoption_emits_event(
+        self,
+        materializer: TaskMaterializer,
+        temp_queue: DurableQueue,
+        event_log,
+    ):
+        """Adopting a legacy record should emit a legacy_adopted event."""
+        mission_id = "mission-alpha"
+        task_id = "task-one"
+
+        # Create valid legacy record
+        legacy_queue_id = make_legacy_queue_task_id(mission_id, task_id)
+        legacy_task = Task(
+            id=legacy_queue_id,
+            title="Task",
+            prompt="Work",
+            base_ref="HEAD",
+            tests=[],
+            metadata={
+                "mission_id": mission_id,
+                "mission_task_id": task_id,
+            },
+        )
+        temp_queue.enqueue(legacy_task)
+
+        # Materialize (should adopt)
+        task_def = MissionTaskDefinition(
+            task_id=task_id,
+            title="Task",
+            prompt="Work",
+        )
+        mission_state = MissionState(
+            mission_id=mission_id,
+            status=MissionStatus.running,
+            task_states={},
+        )
+
+        result_id = materializer.materialize(mission_id, task_def, mission_state)
+        assert result_id == legacy_queue_id
+
+        # Check event was emitted
+        log = event_log(mission_id)
+        events = log.read_all()
+
+        adoption_events = [e for e in events if e.event_type == "legacy_adopted"]
+        assert len(adoption_events) == 1
+
+        event = adoption_events[0]
+        assert event.mission_id == mission_id
+        assert event.task_id == task_id
+        assert event.queue_task_id == legacy_queue_id
+
+    def test_legacy_rejection_emits_event(
+        self,
+        materializer: TaskMaterializer,
+        temp_queue: DurableQueue,
+        event_log,
+    ):
+        """Rejecting a legacy record (metadata mismatch) should emit legacy_rejected event."""
+        mission_id = "mission-beta"
+        task_id = "task-two"
+
+        # Create INVALID legacy record (wrong metadata)
+        legacy_queue_id = make_legacy_queue_task_id(mission_id, task_id)
+        legacy_task = Task(
+            id=legacy_queue_id,
+            title="Task",
+            prompt="Work",
+            base_ref="HEAD",
+            tests=[],
+            metadata={
+                "mission_id": "wrong-mission",  # WRONG
+                "mission_task_id": task_id,
+            },
+        )
+        temp_queue.enqueue(legacy_task)
+
+        # Materialize (should reject and create new)
+        task_def = MissionTaskDefinition(
+            task_id=task_id,
+            title="Task",
+            prompt="Work",
+        )
+        mission_state = MissionState(
+            mission_id=mission_id,
+            status=MissionStatus.running,
+            task_states={},
+        )
+
+        result_id = materializer.materialize(mission_id, task_def, mission_state)
+        current_id = materializer.make_queue_task_id(mission_id, task_id)
+        assert result_id == current_id  # New record, not legacy
+
+        # Check rejection event was emitted
+        log = event_log(mission_id)
+        events = log.read_all()
+
+        rejection_events = [e for e in events if e.event_type == "legacy_rejected"]
+        assert len(rejection_events) == 1
+
+        event = rejection_events[0]
+        assert event.mission_id == mission_id
+        assert event.task_id == task_id
+        assert event.metadata.get("legacy_queue_id") == legacy_queue_id
+        assert "metadata" in event.reason.lower() or "mismatch" in event.reason.lower()
+
+    def test_both_formats_conflict_emits_event(
+        self,
+        materializer: TaskMaterializer,
+        temp_queue: DurableQueue,
+        event_log,
+    ):
+        """When both legacy and current records exist, emit conflict event."""
+        mission_id = "mission-gamma"
+        task_id = "task-conflict"
+
+        # Create both legacy and current records
+        legacy_id = make_legacy_queue_task_id(mission_id, task_id)
+        current_id = materializer.make_queue_task_id(mission_id, task_id)
+
+        legacy_task = Task(
+            id=legacy_id,
+            title="Task",
+            prompt="Work",
+            base_ref="HEAD",
+            tests=[],
+            metadata={
+                "mission_id": mission_id,
+                "mission_task_id": task_id,
+            },
+        )
+        current_task = Task(
+            id=current_id,
+            title="Task",
+            prompt="Work",
+            base_ref="HEAD",
+            tests=[],
+            metadata={
+                "mission_id": mission_id,
+                "mission_task_id": task_id,
+            },
+        )
+
+        temp_queue.enqueue(legacy_task)
+        temp_queue.enqueue(current_task)
+
+        # Materialize
+        task_def = MissionTaskDefinition(
+            task_id=task_id,
+            title="Task",
+            prompt="Work",
+        )
+        mission_state = MissionState(
+            mission_id=mission_id,
+            status=MissionStatus.running,
+            task_states={},
+        )
+
+        materializer.materialize(mission_id, task_def, mission_state)
+
+        # Check conflict event was emitted
+        log = event_log(mission_id)
+        events = log.read_all()
+
+        conflict_events = [e for e in events if e.event_type == "both_formats_found"]
+        assert len(conflict_events) == 1
+
+        event = conflict_events[0]
+        assert event.mission_id == mission_id
+        assert event.task_id == task_id
+        assert event.metadata.get("current_queue_id") == current_id
+        assert event.metadata.get("legacy_queue_id") == legacy_id
+
+    def test_new_record_creation_emits_event(
+        self,
+        materializer: TaskMaterializer,
+        event_log,
+    ):
+        """Creating a new queue record should emit queue_created event."""
+        mission_id = "mission-delta"
+        task_id = "task-new"
+
+        task_def = MissionTaskDefinition(
+            task_id=task_id,
+            title="Task",
+            prompt="Work",
+        )
+        mission_state = MissionState(
+            mission_id=mission_id,
+            status=MissionStatus.running,
+            task_states={},
+        )
+
+        queue_id = materializer.materialize(mission_id, task_def, mission_state)
+
+        # Check creation event was emitted
+        log = event_log(mission_id)
+        events = log.read_all()
+
+        creation_events = [e for e in events if e.event_type == "queue_created"]
+        assert len(creation_events) == 1
+
+        event = creation_events[0]
+        assert event.mission_id == mission_id
+        assert event.task_id == task_id
+        assert event.queue_task_id == queue_id
+
+
+class TestReconciliationEvents:
+    """Test that reconcile_task() emits appropriate events."""
+
+    def test_eligible_missing_classification_emits_event(
+        self,
+        materializer: TaskMaterializer,
+        event_log,
+    ):
+        """Missing queue record eligible for recreation should emit event."""
+        mission_id = "mission-epsilon"
+        task_id = "task-missing"
+        queue_id = materializer.make_queue_task_id(mission_id, task_id)
+
+        # Reconcile a missing task
+        info = materializer.reconcile_task(
+            mission_id,
+            task_id,
+            queue_id,
+            Path("/tmp/reports"),
+        )
+
+        assert info["classification"] == "eligible_missing"
+
+        # Check event was emitted
+        log = event_log(mission_id)
+        events = log.read_all()
+
+        reconcile_events = [e for e in events if e.event_type == "reconcile_eligible_missing"]
+        assert len(reconcile_events) == 1
+
+        event = reconcile_events[0]
+        assert event.mission_id == mission_id
+        assert event.task_id == task_id
+        assert event.queue_task_id == queue_id
+        assert event.metadata.get("classification") == "eligible_missing"
+
+    def test_paused_classification_emits_event(
+        self,
+        materializer: TaskMaterializer,
+        event_log,
+    ):
+        """Paused mission classification should emit event."""
+        mission_id = "mission-zeta"
+        task_id = "task-paused"
+        queue_id = materializer.make_queue_task_id(mission_id, task_id)
+
+        mission_state = MissionState(
+            mission_id=mission_id,
+            status=MissionStatus.paused,
+            task_states={},
+        )
+        task_state = MissionTaskState(
+            task_id=task_id,
+            status=MissionTaskStatus.queued,
+            queue_task_id=queue_id,
+        )
+
+        info = materializer.reconcile_task(
+            mission_id,
+            task_id,
+            queue_id,
+            Path("/tmp/reports"),
+            mission_state=mission_state,
+            task_state=task_state,
+        )
+
+        assert info["classification"] == "paused"
+
+        # Check event was emitted
+        log = event_log(mission_id)
+        events = log.read_all()
+
+        reconcile_events = [e for e in events if e.event_type == "reconcile_paused"]
+        assert len(reconcile_events) == 1
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

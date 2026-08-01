@@ -214,6 +214,14 @@ def parser() -> argparse.ArgumentParser:
     m_plan.add_argument("outline_file", type=Path)
     m_plan.add_argument("--output", type=Path, default=None)
 
+    m_migrate = mission_sub.add_parser("migrate-legacy-records")
+    m_migrate.add_argument("mission_id")
+    m_migrate_mode = m_migrate.add_mutually_exclusive_group(required=True)
+    m_migrate_mode.add_argument("--scan", action="store_true", help="Read-only discovery of legacy records")
+    m_migrate_mode.add_argument("--plan", action="store_true", dest="plan_migration", help="Deterministic action proposal")
+    m_migrate_mode.add_argument("--apply", action="store_true", help="Safe mutation (requires explicit flag)")
+    m_migrate.add_argument("--json", action="store_true", dest="json_output")
+
     return result
 
 
@@ -780,6 +788,116 @@ def _mission_command(args: argparse.Namespace, settings: ControllerConfig) -> in
         save_mission_file(definition, str(output_path))
         print(f"OK: plan written to {output_path} ({len(definition.tasks)} tasks)")
         return 0
+
+    if action == "migrate-legacy-records":
+        from .mission.migration import (
+            scan_mission_migration,
+            plan_mission_migration,
+            apply_mission_migration,
+        )
+
+        try:
+            # Verify mission exists
+            store.load_state(args.mission_id)
+            store.load_definition(args.mission_id)
+        except FileNotFoundError:
+            print(f"ERROR: mission {args.mission_id!r} not found", file=sys.stderr)
+            return 1
+
+        # Scan mode (read-only discovery)
+        if args.scan:
+            scan_results = scan_mission_migration(args.mission_id, store, queue)
+
+            if getattr(args, "json_output", False):
+                _print_json({"scan_results": scan_results})
+                return 0
+
+            if not scan_results:
+                print(f"OK: no legacy records found for mission {args.mission_id!r}")
+                return 0
+
+            print(f"Mission: {args.mission_id}")
+            print(f"Found {len(scan_results)} task(s) with migration considerations:\n")
+
+            for result in scan_results:
+                print(f"  Task: {result['task_id']}")
+                print(f"    Classification: {result['classification']}")
+                print(f"    Legacy exists:  {result['legacy_exists']}")
+                print(f"    Current exists: {result['current_exists']}")
+                if result.get("persisted_linkage"):
+                    print(f"    Persisted link: {result['persisted_linkage']}")
+                if result.get("metadata_valid") is not None:
+                    print(f"    Metadata valid: {result['metadata_valid']}")
+                print()
+
+            return 0
+
+        # Plan mode (deterministic action proposal)
+        if getattr(args, "plan_migration", False):
+            scan_results = scan_mission_migration(args.mission_id, store, queue)
+            plan = plan_mission_migration(scan_results)
+
+            if getattr(args, "json_output", False):
+                _print_json({"plan": plan})
+                return 0
+
+            if not plan:
+                print(f"OK: no migration actions needed for mission {args.mission_id!r}")
+                return 0
+
+            print(f"Mission: {args.mission_id}")
+            print(f"Proposed {len(plan)} migration action(s):\n")
+
+            for action_item in plan:
+                action_type = action_item["action"]
+                task_id = action_item["task_id"]
+                reason = action_item["reason"]
+
+                print(f"  [{action_type}] {task_id}")
+                print(f"    Reason: {reason}")
+                if action_item.get("queue_task_id"):
+                    print(f"    Queue ID: {action_item['queue_task_id']}")
+                if action_item.get("legacy_queue_id"):
+                    print(f"    Legacy ID: {action_item['legacy_queue_id']}")
+                print()
+
+            print("Run with --apply to execute these actions")
+            return 0
+
+        # Apply mode (safe mutation)
+        if args.apply:
+            scan_results = scan_mission_migration(args.mission_id, store, queue)
+            plan = plan_mission_migration(scan_results)
+
+            if not plan:
+                print(f"OK: no migration actions needed for mission {args.mission_id!r}")
+                return 0
+
+            apply_result = apply_mission_migration(args.mission_id, plan, store, queue)
+
+            if getattr(args, "json_output", False):
+                _print_json(apply_result)
+                return 0 if apply_result["success"] else 1
+
+            print(f"Mission: {args.mission_id}")
+            print(f"Applied {apply_result['actions_applied']} migration action(s)")
+
+            if apply_result["warnings"]:
+                print(f"\nWarnings ({len(apply_result['warnings'])}):")
+                for warning in apply_result["warnings"]:
+                    print(f"  {warning}")
+
+            if apply_result["errors"]:
+                print(f"\nErrors ({len(apply_result['errors'])}):")
+                for error in apply_result["errors"]:
+                    print(f"  {error}")
+
+            if apply_result["success"]:
+                print("\nOK: migration completed successfully")
+                return 0
+            else:
+                print("\nFAIL: migration encountered errors")
+                return 1
 
     print(f"Unknown mission action: {action}", file=sys.stderr)
     return 1

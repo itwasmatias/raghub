@@ -81,7 +81,8 @@ class MissionScheduler:
         self._reports_root = Path(reports_root)
         self._missions_root = Path(missions_root)
         self._poll_interval = poll_interval_seconds
-        self._materializer = TaskMaterializer(queue, reports_root)
+        events_dir = Path(missions_root) / "events"
+        self._materializer = TaskMaterializer(queue, reports_root, events_dir=events_dir)
 
     # ------------------------------------------------------------------
     # Public interface
@@ -431,7 +432,12 @@ class MissionScheduler:
 
             try:
                 info = self._materializer.reconcile_task(
-                    state.mission_id, tid, ts.queue_task_id, self._reports_root
+                    state.mission_id,
+                    tid,
+                    ts.queue_task_id,
+                    self._reports_root,
+                    mission_state=state,
+                    task_state=ts,
                 )
             except Exception as exc:
                 logger.error(
@@ -447,7 +453,17 @@ class MissionScheduler:
                 continue
 
             queue_status: str = info["queue_status"]
+            classification: str = info.get("classification", "eligible_missing")
             report: dict | None = info["report"]
+
+            if classification in {"paused", "cancelled"}:
+                logger.info(
+                    "skip reconciliation for paused/cancelled task mission=%s task=%s classification=%s",
+                    state.mission_id,
+                    tid,
+                    classification,
+                )
+                continue
 
             if report is not None:
                 report_status = report.get("status", "")
@@ -541,36 +557,43 @@ class MissionScheduler:
                 pass
 
             elif queue_status == "missing":
-                # Task vanished from queue without a report — mark as lost/failed.
-                logger.warning(
-                    "task lost from queue without report mission=%s task=%s qid=%s",
-                    state.mission_id,
-                    tid,
-                    ts.queue_task_id,
-                )
-                updated[tid] = MissionTaskState(
-                    task_id=ts.task_id,
-                    status=MissionTaskStatus.failed,
-                    queue_task_id=ts.queue_task_id,
-                    report_path=ts.report_path,
-                    worktree_path=ts.worktree_path,
-                    attempt_count=ts.attempt_count,
-                    failure_reason="task disappeared from queue without a report (lost worker?)",
-                    queued_at=ts.queued_at,
-                    started_at=ts.started_at,
-                    finished_at=_now(),
-                    files_changed=ts.files_changed,
-                    test_results=ts.test_results,
-                )
-                new_events.append(
-                    make_event(
-                        "task_lost",
+                if classification == "eligible_missing":
+                    logger.warning(
+                        "task lost from queue without report mission=%s task=%s qid=%s",
                         state.mission_id,
-                        task_id=tid,
-                        queue_task_id=ts.queue_task_id,
-                        reason="missing from queue",
+                        tid,
+                        ts.queue_task_id,
                     )
-                )
+                    updated[tid] = MissionTaskState(
+                        task_id=ts.task_id,
+                        status=MissionTaskStatus.failed,
+                        queue_task_id=ts.queue_task_id,
+                        report_path=ts.report_path,
+                        worktree_path=ts.worktree_path,
+                        attempt_count=ts.attempt_count,
+                        failure_reason="task disappeared from queue without a report (lost worker?)",
+                        queued_at=ts.queued_at,
+                        started_at=ts.started_at,
+                        finished_at=_now(),
+                        files_changed=ts.files_changed,
+                        test_results=ts.test_results,
+                    )
+                    new_events.append(
+                        make_event(
+                            "task_lost",
+                            state.mission_id,
+                            task_id=tid,
+                            queue_task_id=ts.queue_task_id,
+                            reason="missing from queue",
+                        )
+                    )
+                else:
+                    logger.info(
+                        "reconcile preserved task mission=%s task=%s classification=%s",
+                        state.mission_id,
+                        tid,
+                        classification,
+                    )
 
         new_state = MissionState(
             mission_id=state.mission_id,
