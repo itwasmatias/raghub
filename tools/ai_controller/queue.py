@@ -17,11 +17,12 @@ def atomic_json(path: Path, payload: dict) -> None:
 
 
 class DurableQueue:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, create: bool = True) -> None:
         self.root = Path(root)
         for name in ("pending", "running", "succeeded", "failed", "invalid"):
             setattr(self, name, self.root / name)
-            (self.root / name).mkdir(parents=True, exist_ok=True)
+            if create:
+                (self.root / name).mkdir(parents=True, exist_ok=True)
         self.lock_path = self.root / ".queue.lock"
 
     def enqueue(self, task: Task) -> Path:

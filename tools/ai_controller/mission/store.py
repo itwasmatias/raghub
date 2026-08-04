@@ -31,6 +31,7 @@ import os
 from pathlib import Path
 
 from tools.ai_controller._locking import FileLock
+from tools.ai_controller.reports import report_lock_path
 from .models import MissionDefinition, MissionState, MissionStatus
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,20 @@ _STATUS_DIRS: list[str] = [
     "succeeded",
     "failed",
     "cancelled",
+    "budget_exhausted",
 ]
+
+
+class MissionStateConflictError(ValueError):
+    """Raised when one mission has more than one state envelope."""
+
+    def __init__(self, mission_id: str, candidates: list[tuple[MissionStatus, Path]]):
+        self.mission_id = mission_id
+        self.candidates = candidates
+        locations = ",".join(path.as_posix() for _, path in candidates)
+        super().__init__(
+            f"mission has multiple state envelopes: {mission_id}: {locations}"
+        )
 
 
 def _atomic_json(path: Path, payload: dict) -> None:
@@ -61,10 +75,11 @@ class MissionStore:
     concurrent schedulers never corrupt the directory structure.
     """
 
-    def __init__(self, missions_root: Path) -> None:
+    def __init__(self, missions_root: Path, *, create: bool = True) -> None:
         self._root = Path(missions_root)
         self._lock = FileLock(self._root / ".store.lock")
-        self.ensure_dirs()
+        if create:
+            self.ensure_dirs()
 
     # ------------------------------------------------------------------
     # Initialisation
@@ -126,11 +141,22 @@ class MissionStore:
             result is used for mutation decisions; reading without the lock is
             safe for informational purposes.
         """
+        candidates = self.find_mission_candidates(mission_id)
+        if len(candidates) > 1:
+            raise MissionStateConflictError(mission_id, candidates)
+        return candidates[0] if candidates else None
+
+    def find_mission_candidates(
+        self,
+        mission_id: str,
+    ) -> list[tuple[MissionStatus, Path]]:
+        """Return every status envelope candidate for *mission_id*."""
+        candidates: list[tuple[MissionStatus, Path]] = []
         for name in _STATUS_DIRS:
             path = self._root / name / f"{mission_id}.json"
             if path.exists():
-                return MissionStatus(name), path
-        return None
+                candidates.append((MissionStatus(name), path))
+        return candidates
 
     def load_state(self, mission_id: str) -> MissionState:
         """Load the current ``MissionState`` for *mission_id*.
@@ -255,7 +281,8 @@ class MissionStore:
     def write_report(self, mission_id: str, report: dict) -> Path:
         """Write *report* to ``reports/{mission_id}.json`` atomically."""
         path = self._root / "reports" / f"{mission_id}.json"
-        _atomic_json(path, report)
+        with FileLock(report_lock_path(path.parent)):
+            _atomic_json(path, report)
         logger.info("mission report written mission_id=%s path=%s", mission_id, path)
         return path
 

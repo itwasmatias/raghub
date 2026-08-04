@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ._locking import FileLock
 from .queue import atomic_json
+
+
+def report_lock_path(root: Path) -> Path:
+    return Path(root) / ".reports.lock"
 
 
 class ReportStore:
@@ -12,5 +17,6 @@ class ReportStore:
 
     def write(self, task_id: str, payload: dict) -> Path:
         path = self.root / f"{task_id}.json"
-        atomic_json(path, payload)
+        with FileLock(report_lock_path(self.root)):
+            atomic_json(path, payload)
         return path

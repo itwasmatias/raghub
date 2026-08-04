@@ -34,6 +34,25 @@ _QUEUE_STATES: list[str] = ["pending", "running", "succeeded", "failed", "invali
 
 # Versioned canonical input for mission-task queue identity generation.
 _IDENTITY_VERSION = "mission-task-v1"
+RESERVED_MISSION_METADATA_FIELDS = frozenset(
+    {
+        "mission_id",
+        "mission_task_id",
+        "depends_on",
+        "queue_task_id",
+        "id",
+        "provider",
+        "provider_preference",
+        "provider_fallback",
+        "provider_policy",
+        "controller_context",
+    }
+)
+
+
+def reserved_metadata_collisions(task_def: MissionTaskDefinition) -> set[str]:
+    """Return task metadata keys owned by mission/controller authority."""
+    return RESERVED_MISSION_METADATA_FIELDS.intersection(task_def.metadata)
 
 
 def _sanitize_segment(value: str) -> str:
@@ -353,10 +372,10 @@ class TaskMaterializer:
         # Step 3 — no existing record found, build and enqueue using current format.
         queue_task_id = current_queue_id
         metadata: dict = {
+            **task_def.metadata,
             "mission_id": mission_id,
             "mission_task_id": task_def.task_id,
             "depends_on": list(task_def.depends_on),
-            **task_def.metadata,
         }
 
         controller_task = Task(

@@ -264,6 +264,8 @@ class Controller:
             report = {
                 "controller_version": __version__,
                 "task_id": task.id,
+                "mission_id": task.metadata.get("mission_id"),
+                "mission_task_id": task.metadata.get("mission_task_id"),
                 "title": task.title,
                 "original_task_prompt": task.prompt,
                 "status": "succeeded" if success else "failed",

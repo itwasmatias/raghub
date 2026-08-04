@@ -214,6 +214,16 @@ def parser() -> argparse.ArgumentParser:
     m_plan.add_argument("outline_file", type=Path)
     m_plan.add_argument("--output", type=Path, default=None)
 
+    m_repair = mission_sub.add_parser("repair")
+    m_repair.add_argument("mission_id")
+    m_repair.add_argument(
+        "--apply",
+        metavar="ACTION_ID",
+        dest="apply_action_id",
+        help="Apply exactly one SAFE_REPAIR action by stable action ID",
+    )
+    m_repair.add_argument("--json", action="store_true", dest="json_output")
+
     m_migrate = mission_sub.add_parser("migrate-legacy-records")
     m_migrate.add_argument("mission_id")
     m_migrate_mode = m_migrate.add_mutually_exclusive_group(required=True)
@@ -564,7 +574,12 @@ def _smoke_local(settings: ControllerConfig) -> int:
 
         # 11. Write report to persistent location
         report_path = settings.reports_root / f"{task.id}.json"
-        report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        from .reports import report_lock_path
+        with FileLock(report_lock_path(settings.reports_root)):
+            report_path.write_text(
+                json.dumps(report, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
         print(f"\n  Report: {report_path}")
         print(f"  Ledger: {settings.experience_path}")
 
@@ -582,12 +597,20 @@ def _smoke_local(settings: ControllerConfig) -> int:
 
 def _mission_command(args: argparse.Namespace, settings: ControllerConfig) -> int:
     """Handle all `mission` subcommands."""
-    settings.missions_root.mkdir(parents=True, exist_ok=True)
-    store = MissionStore(settings.missions_root)
-    queue = DurableQueue(settings.queue_root)
-    materializer = TaskMaterializer(queue, settings.reports_root)
-
     action = args.mission_action
+    repair_dry_run = (
+        action == "repair"
+        and getattr(args, "apply_action_id", None) is None
+    )
+    store = MissionStore(
+        settings.missions_root,
+        create=not repair_dry_run,
+    )
+    queue = DurableQueue(
+        settings.queue_root,
+        create=not repair_dry_run,
+    )
+    materializer = TaskMaterializer(queue, settings.reports_root)
 
     if action == "validate":
         try:
@@ -788,6 +811,95 @@ def _mission_command(args: argparse.Namespace, settings: ControllerConfig) -> in
         save_mission_file(definition, str(output_path))
         print(f"OK: plan written to {output_path} ({len(definition.tasks)} tasks)")
         return 0
+
+    if action == "repair":
+        from .mission.repair import (
+            RepairApplyStatus,
+            RepairClassification,
+            apply_mission_repair,
+            plan_mission_repairs,
+        )
+
+        try:
+            actions = plan_mission_repairs(
+                args.mission_id,
+                store,
+                queue,
+                settings.reports_root,
+            )
+        except FileNotFoundError:
+            print(f"ERROR: mission {args.mission_id!r} not found", file=sys.stderr)
+            return 1
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(
+                f"ERROR: could not plan repairs for {args.mission_id!r}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+
+        apply_action_id = getattr(args, "apply_action_id", None)
+        if apply_action_id is None:
+            payload = {
+                "mode": "dry-run",
+                "mission_id": args.mission_id,
+                "actions": [item.to_dict() for item in actions],
+            }
+            if getattr(args, "json_output", False):
+                _print_json(payload)
+                return 0
+
+            print(f"DRY-RUN: mission {args.mission_id}")
+            for item in actions:
+                print(
+                    f"{item.action_id}  {item.mission_id}  {item.task_id}  "
+                    f"{item.classification.value}  {item.proposed_action.value}"
+                )
+                print(f"  Reason: {item.reason}")
+            return 0
+
+        selected = next(
+            (item for item in actions if item.action_id == apply_action_id),
+            None,
+        )
+        if selected is None:
+            print(
+                f"ERROR: repair action {apply_action_id!r} was not found in the current plan",
+                file=sys.stderr,
+            )
+            return 1
+        if selected.classification != RepairClassification.SAFE_REPAIR:
+            print(
+                f"ERROR: repair action {apply_action_id!r} is not safe to apply "
+                f"({selected.classification.value})",
+                file=sys.stderr,
+            )
+            return 1
+
+        result = apply_mission_repair(
+            selected,
+            store,
+            queue,
+            settings.reports_root,
+            settings.missions_root,
+        )
+        payload = {
+            "mode": "apply",
+            "mission_id": args.mission_id,
+            "action": selected.to_dict(),
+            "result": result.to_dict(),
+        }
+        if getattr(args, "json_output", False):
+            _print_json(payload)
+        else:
+            print(
+                f"{result.status.value}: {selected.action_id} "
+                f"{selected.mission_id}/{selected.task_id}"
+            )
+            print(f"  Reason: {result.reason}")
+        return 0 if result.status in {
+            RepairApplyStatus.APPLIED,
+            RepairApplyStatus.NO_LONGER_NEEDED,
+        } else 1
 
     if action == "migrate-legacy-records":
         from .mission.migration import (

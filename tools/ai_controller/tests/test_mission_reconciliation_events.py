@@ -11,12 +11,18 @@ Verifies that:
 
 from __future__ import annotations
 
+import os
+import threading
 from pathlib import Path
 
 import pytest
 
 from tools.ai_controller.mission.materializer import TaskMaterializer
-from tools.ai_controller.mission.events import MissionEventLog
+from tools.ai_controller.mission.events import (
+    EventLogCorruptionError,
+    MissionEventLog,
+    make_event,
+)
 from tools.ai_controller.mission import make_legacy_queue_task_id
 from tools.ai_controller.mission.models import (
     MissionState,
@@ -296,7 +302,6 @@ class TestReconciliationEvents:
         assert event.task_id == task_id
         assert event.queue_task_id == queue_id
         assert event.metadata.get("classification") == "eligible_missing"
-
     def test_paused_classification_emits_event(
         self,
         materializer: TaskMaterializer,
@@ -335,6 +340,111 @@ class TestReconciliationEvents:
 
         reconcile_events = [e for e in events if e.event_type == "reconcile_paused"]
         assert len(reconcile_events) == 1
+
+
+def test_append_rejects_partial_tail_after_restart(tmp_path: Path):
+    events_dir = tmp_path / "events"
+    events_dir.mkdir()
+    path = events_dir / "restart.jsonl"
+    path.write_bytes(b'{"event_type":"task_ready"}\n{"event_type":')
+    log = MissionEventLog(events_dir, "restart")
+
+    with pytest.raises(EventLogCorruptionError):
+        log.append(
+            make_event("task_enqueued", "restart", task_id="task-a")
+        )
+
+    assert path.read_bytes().endswith(b'{"event_type":')
+
+
+def test_append_locked_is_bound_to_instance_thread_and_active_scope(
+    tmp_path: Path,
+):
+    first = MissionEventLog(tmp_path / "events", "first")
+    second = MissionEventLog(tmp_path / "events", "second")
+    foreign_errors: list[BaseException] = []
+    foreign_done = threading.Event()
+    first_event = make_event("task_enqueued", "first", task_id="task-a")
+
+    with first.locked() as token:
+        def append_from_foreign_thread() -> None:
+            try:
+                first.append_locked(first_event, token)
+            except BaseException as exc:
+                foreign_errors.append(exc)
+            finally:
+                foreign_done.set()
+
+        thread = threading.Thread(target=append_from_foreign_thread)
+        thread.start()
+        thread.join(timeout=1)
+        assert foreign_done.is_set()
+        assert len(foreign_errors) == 1
+        assert isinstance(foreign_errors[0], RuntimeError)
+        assert not first._log_path.exists()
+
+        with pytest.raises(RuntimeError):
+            second.append_locked(
+                make_event("task_enqueued", "second", task_id="task-a"),
+                token,
+            )
+
+        first.append_locked(first_event, token)
+
+    with pytest.raises(RuntimeError):
+        first.append_locked(first_event, token)
+
+    with pytest.raises(RuntimeError):
+        first.append_locked(first_event, object())
+
+    assert [event.event_type for event in first.read_all()] == ["task_enqueued"]
+    assert not second._log_path.exists()
+
+
+def test_nested_event_scopes_keep_exact_tokens_active_until_each_exit(
+    tmp_path: Path,
+):
+    log = MissionEventLog(tmp_path / "events", "nested")
+
+    with log.locked() as outer:
+        with log.locked() as inner:
+            log.append_locked(make_event("inner", "nested"), inner)
+            log.append_locked(make_event("outer-during-inner", "nested"), outer)
+        with pytest.raises(RuntimeError):
+            log.append_locked(make_event("expired-inner", "nested"), inner)
+        log.append_locked(make_event("outer-after-inner", "nested"), outer)
+
+    assert [event.event_type for event in log.read_all()] == [
+        "inner",
+        "outer-during-inner",
+        "outer-after-inner",
+    ]
+
+
+def test_lock_held_append_validates_tail_flushes_and_fsyncs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    log = MissionEventLog(tmp_path / "events", "durable")
+    fsync_calls = 0
+    original_fsync = os.fsync
+
+    def track_fsync(fd: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        original_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", track_fsync)
+    with log.locked() as token:
+        log.append_locked(make_event("first", "durable"), token)
+        assert fsync_calls == 1
+        log._log_path.write_bytes(
+            log._log_path.read_bytes() + b'{"event_type":'
+        )
+        with pytest.raises(EventLogCorruptionError):
+            log.append_locked(make_event("second", "durable"), token)
+
+    assert fsync_calls == 1
 
 
 if __name__ == "__main__":

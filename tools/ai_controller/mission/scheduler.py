@@ -22,13 +22,16 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+from tools.ai_controller._locking import FileLock
 from tools.ai_controller.queue import DurableQueue
+from tools.ai_controller.reports import report_lock_path
 from .events import MissionEventLog, make_event
 from .graph import DependencyGraph
-from .materializer import TaskMaterializer
+from .materializer import TaskMaterializer, make_legacy_queue_task_id
 from .models import (
     ApprovalPolicy,
     BudgetUsage,
@@ -43,6 +46,101 @@ from .models import (
 from .store import MissionStore
 
 logger = logging.getLogger(__name__)
+
+
+def completion_report_error(
+    report: dict,
+    *,
+    mission_id: str,
+    mission_task_id: str,
+    queue_task_id: str,
+    required_tests: list[list[str]] | None = None,
+) -> str | None:
+    """Return why a controller report cannot prove scheduler completion."""
+    required = {
+        "status",
+        "task_id",
+        "mission_id",
+        "mission_task_id",
+        "attempts",
+        "tests",
+        "files_changed",
+        "changes",
+        "started_at",
+        "finished_at",
+    }
+    missing = sorted(required.difference(report))
+    if missing:
+        return "completion report is missing required fields: " + ",".join(missing)
+    if report.get("status") != "succeeded":
+        return "completion report does not record succeeded status"
+    if report.get("task_id") != queue_task_id:
+        return "completion report queue task identity does not match"
+    if report.get("mission_id") != mission_id:
+        return "completion report mission identity does not match"
+    if report.get("mission_task_id") != mission_task_id:
+        return "completion report mission task identity does not match"
+
+    attempts = report.get("attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return "completion report has no provider result"
+    final_attempt = attempts[-1]
+    if (
+        not isinstance(final_attempt, dict)
+        or not isinstance(final_attempt.get("provider"), str)
+        or not final_attempt["provider"]
+        or final_attempt.get("success") is not True
+        or final_attempt.get("timed_out", False) is not False
+    ):
+        return "completion report does not prove provider success"
+
+    tests = report.get("tests")
+    if not isinstance(tests, list) or not tests:
+        return "completion report does not prove verifier success"
+    required_commands = required_tests or []
+    executed_commands: list[list[str]] = []
+    for test in tests:
+        if (
+            not isinstance(test, dict)
+            or not isinstance(test.get("argv"), list)
+            or not test["argv"]
+            or any(not isinstance(arg, str) or not arg for arg in test["argv"])
+            or not isinstance(test.get("exit_code"), int)
+            or isinstance(test.get("exit_code"), bool)
+            or test["exit_code"] != 0
+            or test.get("timed_out", False) is not False
+        ):
+            return "completion report does not prove verifier success"
+        executed_commands.append(test["argv"])
+    if any(command not in executed_commands for command in required_commands):
+        return "completion report lacks task-required verification evidence"
+
+    files_changed = report.get("files_changed")
+    changes = report.get("changes")
+    if (
+        not isinstance(files_changed, list)
+        or not files_changed
+        or any(not isinstance(path, str) or not path for path in files_changed)
+        or not isinstance(changes, list)
+        or not changes
+    ):
+        return "completion report does not contain a verified result"
+
+    parsed_times: dict[str, datetime] = {}
+    for field in ("started_at", "finished_at"):
+        value = report.get(field)
+        if not isinstance(value, str) or not value:
+            return f"completion report {field} is invalid"
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return f"completion report {field} is invalid"
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return f"completion report {field} is not timezone-aware"
+        parsed_times[field] = parsed
+    if parsed_times["finished_at"] < parsed_times["started_at"]:
+        return "completion report finished_at precedes started_at"
+    return None
 
 # Statuses treated as "task is no longer progressing forward".
 _TERMINAL_TASK_STATUSES = {
@@ -75,13 +173,18 @@ class MissionScheduler:
         reports_root: Path,
         missions_root: Path,
         poll_interval_seconds: float = 10.0,
+        emit_materializer_events: bool = True,
     ) -> None:
         self._store = store
         self._queue = queue
         self._reports_root = Path(reports_root)
         self._missions_root = Path(missions_root)
         self._poll_interval = poll_interval_seconds
-        events_dir = Path(missions_root) / "events"
+        events_dir = (
+            Path(missions_root) / "events"
+            if emit_materializer_events
+            else None
+        )
         self._materializer = TaskMaterializer(queue, reports_root, events_dir=events_dir)
 
     # ------------------------------------------------------------------
@@ -90,12 +193,32 @@ class MissionScheduler:
 
     def run_once(self, mission_id: str) -> MissionStatus:
         """Execute one full scheduling cycle and return the resulting status."""
-        definition = self._store.load_definition(mission_id)
-        state = self._store.load_state(mission_id)
-
         event_log = MissionEventLog(
             self._missions_root / "events", mission_id
         )
+        # Global causal lock order shared with repair:
+        # mission store -> durable queue -> report evidence -> mission event.
+        with (
+            self._store._lock,
+            FileLock(self._queue.lock_path),
+            FileLock(report_lock_path(self._reports_root)),
+            event_log.locked() as event_token,
+        ):
+            return self._run_once_locked(
+                mission_id, event_log, event_token
+            )
+
+    def _run_once_locked(
+        self,
+        mission_id: str,
+        event_log: MissionEventLog,
+        event_token: object,
+    ) -> MissionStatus:
+        """Run one cycle while all authoritative causal locks are held."""
+        definition = self._store.load_definition(mission_id)
+        state = self._store.load_state(mission_id)
+
+        durable_events = list(event_log.read_snapshot_locked().events)
         new_events: list[MissionEvent] = []
 
         # Mark as running the first time we cycle.
@@ -121,12 +244,77 @@ class MissionScheduler:
         if state.status == MissionStatus.paused:
             self._store.update_state(mission_id, state)
             for ev in new_events:
-                event_log.append(ev)
+                event_log.append_locked(ev, event_token)
             return state.status
 
         # --- Step 2-3: reconcile task states ---
-        state, reconcile_events = self._reconcile_tasks(definition, state)
+        blocked_completion_tasks = self._incomplete_completion_repairs(
+            durable_events
+        )
+        preserved_tasks = {
+            task_id: state.task_states[task_id]
+            for task_id in blocked_completion_tasks
+            if task_id in state.task_states
+        }
+        reconcile_state = replace(
+            state,
+            task_states={
+                task_id: task_state
+                for task_id, task_state in state.task_states.items()
+                if task_id not in blocked_completion_tasks
+            },
+        )
+        state, reconcile_events = self._reconcile_tasks(
+            definition, reconcile_state
+        )
+        state.task_states.update(preserved_tasks)
         new_events.extend(reconcile_events)
+        success_events = [
+            event
+            for event in new_events
+            if event.event_type == "task_succeeded"
+        ]
+        for event in success_events:
+            if not any(
+                existing.event_type == "task_succeeded"
+                and existing.task_id == event.task_id
+                and existing.queue_task_id == event.queue_task_id
+                for existing in durable_events
+            ):
+                event_log.append_locked(event, event_token)
+                durable_events.append(event)
+        new_events = [
+            event
+            for event in new_events
+            if event.event_type != "task_succeeded"
+        ]
+        if success_events:
+            self._store.update_state(mission_id, state)
+            persisted_state = self._store.load_state(mission_id)
+            durable_events = list(
+                event_log.read_snapshot_locked().events
+            )
+            for event in success_events:
+                persisted_task = persisted_state.task_states.get(
+                    event.task_id or ""
+                )
+                if (
+                    persisted_task is None
+                    or persisted_task.status
+                    != MissionTaskStatus.succeeded
+                    or persisted_task.queue_task_id
+                    != event.queue_task_id
+                    or not any(
+                        durable.event_type == "task_succeeded"
+                        and durable.task_id == event.task_id
+                        and durable.queue_task_id == event.queue_task_id
+                        for durable in durable_events
+                    )
+                ):
+                    raise RuntimeError(
+                        "durable task completion and success evidence disagree"
+                    )
+            state = persisted_state
 
         # --- Step 3b: mark blocked tasks ---
         state, block_events = self._mark_blocked_tasks(definition, state)
@@ -183,7 +371,7 @@ class MissionScheduler:
                 )
             )
             for ev in new_events:
-                event_log.append(ev)
+                event_log.append_locked(ev, event_token)
             logger.info(
                 "mission reached terminal state mission_id=%s status=%s",
                 mission_id,
@@ -192,7 +380,9 @@ class MissionScheduler:
             return terminal_status
 
         # --- Step 6: find ready tasks ---
-        ready_task_ids = self._compute_ready_tasks(definition, state)
+        ready_task_ids = self._compute_ready_tasks(
+            definition, state, durable_events
+        )
 
         # --- Step 7: enqueue eligible tasks ---
         budget_exceeded = self._check_budgets(definition, state)
@@ -256,9 +446,47 @@ class MissionScheduler:
 
         # --- Step 9: append events ---
         for ev in new_events:
-            event_log.append(ev)
+            event_log.append_locked(ev, event_token)
 
         return state.status
+
+    @staticmethod
+    def _incomplete_completion_repairs(
+        events: list[MissionEvent],
+    ) -> set[str]:
+        """Return tasks whose repair intent lacks durable success evidence."""
+        applied_ids = {
+            event.metadata.get("action_id")
+            for event in events
+            if event.event_type == "repair_applied"
+        }
+        expired_ids = {
+            event.metadata.get("action_id")
+            for event in events
+            if event.event_type == "repair_expired"
+        }
+        blocked: set[str] = set()
+        for index, event in enumerate(events):
+            if (
+                event.event_type != "repair_started"
+                or event.task_id is None
+                or event.metadata.get("repair_action")
+                != "COMPLETE_FROM_DURABLE_SUCCESS"
+                or event.metadata.get("action_id") in applied_ids
+            ):
+                continue
+            if event.metadata.get("action_id") in expired_ids:
+                blocked.add(event.task_id)
+                continue
+            has_success = any(
+                later.event_type == "task_succeeded"
+                and later.task_id == event.task_id
+                and later.queue_task_id == event.queue_task_id
+                for later in events[index + 1 :]
+            )
+            if not has_success:
+                blocked.add(event.task_id)
+        return blocked
 
     def run_continuous(self, mission_id: str) -> None:
         """Loop ``run_once`` until the mission reaches a terminal state."""
@@ -410,6 +638,8 @@ class MissionScheduler:
         self,
         definition: MissionDefinition,
         state: MissionState,
+        *,
+        report_overrides: dict[str, dict] | None = None,
     ) -> tuple[MissionState, list[MissionEvent]]:
         """Update task states based on current queue and report files.
 
@@ -431,14 +661,30 @@ class MissionScheduler:
                 continue
 
             try:
-                info = self._materializer.reconcile_task(
-                    state.mission_id,
-                    tid,
-                    ts.queue_task_id,
-                    self._reports_root,
-                    mission_state=state,
-                    task_state=ts,
-                )
+                if (
+                    report_overrides is not None
+                    and tid in report_overrides
+                ):
+                    queue_status = (
+                        self._materializer.queue_task_exists_in(
+                            ts.queue_task_id
+                        )
+                        or "missing"
+                    )
+                    info = {
+                        "queue_status": queue_status,
+                        "classification": "already_materialized",
+                        "report": report_overrides[tid],
+                    }
+                else:
+                    info = self._materializer.reconcile_task(
+                        state.mission_id,
+                        tid,
+                        ts.queue_task_id,
+                        self._reports_root,
+                        mission_state=state,
+                        task_state=ts,
+                    )
             except Exception as exc:
                 logger.error(
                     "reconcile_task error mission=%s task=%s: %s",
@@ -468,6 +714,30 @@ class MissionScheduler:
             if report is not None:
                 report_status = report.get("status", "")
                 if report_status == "succeeded":
+                    report_error = completion_report_error(
+                        report,
+                        mission_id=state.mission_id,
+                        mission_task_id=tid,
+                        queue_task_id=ts.queue_task_id,
+                        required_tests=(
+                            next(
+                                (
+                                    task.tests
+                                    for task in definition.tasks
+                                    if task.task_id == tid
+                                ),
+                                [],
+                            )
+                        ),
+                    )
+                    if report_error is not None:
+                        logger.warning(
+                            "completion report rejected mission=%s task=%s: %s",
+                            state.mission_id,
+                            tid,
+                            report_error,
+                        )
+                        continue
                     updated[tid] = MissionTaskState(
                         task_id=ts.task_id,
                         status=MissionTaskStatus.succeeded,
@@ -614,6 +884,7 @@ class MissionScheduler:
         self,
         definition: MissionDefinition,
         state: MissionState,
+        durable_events: list[MissionEvent] | None = None,
     ) -> list[str]:
         """Return task IDs that are ready to be enqueued.
 
@@ -625,6 +896,19 @@ class MissionScheduler:
         for tid in graph.ready_tasks():
             task_def = _task_def_by_id(definition, tid)
             if task_def is None:
+                continue
+            if durable_events is not None and any(
+                not any(
+                    self._is_exact_prerequisite_success(
+                        event,
+                        definition.mission_id,
+                        dependency,
+                        state.task_states[dependency],
+                    )
+                    for event in durable_events
+                )
+                for dependency in task_def.depends_on
+            ):
                 continue
             if task_def.approval_policy in (
                 ApprovalPolicy.approval_required_before_queue,
@@ -661,6 +945,40 @@ class MissionScheduler:
                 continue
             ready.append(tid)
         return ready
+
+    def _is_exact_prerequisite_success(
+        self,
+        event: MissionEvent,
+        mission_id: str,
+        mission_task_id: str,
+        task_state: MissionTaskState,
+    ) -> bool:
+        accepted_queue_ids = {
+            self._materializer.make_queue_task_id(
+                mission_id, mission_task_id
+            ),
+            make_legacy_queue_task_id(mission_id, mission_task_id),
+        }
+        metadata_identities = {
+            "mission_id": mission_id,
+            "mission_task_id": mission_task_id,
+            "queue_task_id": event.queue_task_id,
+        }
+        return (
+            event.event_type == "task_succeeded"
+            and event.mission_id == mission_id
+            and event.task_id == mission_task_id
+            and isinstance(event.queue_task_id, str)
+            and bool(event.queue_task_id)
+            and event.queue_task_id in accepted_queue_ids
+            and task_state.status == MissionTaskStatus.succeeded
+            and task_state.queue_task_id == event.queue_task_id
+            and all(
+                key not in event.metadata
+                or event.metadata.get(key) == expected
+                for key, expected in metadata_identities.items()
+            )
+        )
 
     def _check_budgets(
         self,
