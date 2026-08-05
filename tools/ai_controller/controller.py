@@ -266,6 +266,7 @@ class Controller:
                 "task_id": task.id,
                 "mission_id": task.metadata.get("mission_id"),
                 "mission_task_id": task.metadata.get("mission_task_id"),
+                "mission_attempt": task.metadata.get("mission_attempt"),
                 "title": task.title,
                 "original_task_prompt": task.prompt,
                 "status": "succeeded" if success else "failed",

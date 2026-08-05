@@ -83,9 +83,22 @@ from sports.features.builders.trend_builder import TrendFeatureBuilder
 from sports.features.facade import FeatureFacade
 from sports.features.registry import FeatureRegistry
 from web_ui import create_feature_ui_instance
+from tools.ai_controller.operations_api import (
+    ControllerOperations,
+    create_operations_blueprint,
+    validate_bind_address,
+)
 
 
 load_dotenv(Path(__file__).with_name(".env"), override=True)
+
+
+def _controller_routes_enabled() -> bool:
+    return os.getenv("RAGHUB_CONTROLLER_ENABLED", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 def create_app(
@@ -101,8 +114,31 @@ def create_app(
     compute_repository: ComputeJobRepository | None = None,
     worker_token: str | None = None,
     overview_service: OverviewService | None = None,
+    controller_operations: ControllerOperations | None = None,
 ):
     app = Flask(__name__)
+    if controller_operations is not None or _controller_routes_enabled():
+        if controller_operations is None:
+            controller_root = Path(
+                os.getenv("RAGHUB_CONTROLLER_ROOT", "data/controller")
+            )
+            controller_operations = ControllerOperations(
+                missions_root=controller_root / "missions",
+                queue_root=controller_root / "queue",
+                reports_root=controller_root / "reports",
+                approvals_root=controller_root / "approvals",
+                proposal_ttl_seconds=int(
+                    os.getenv("RAGHUB_CONTROLLER_PROPOSAL_TTL_SECONDS", "900")
+                ),
+                allowed_origins=tuple(
+                    origin.strip()
+                    for origin in os.getenv(
+                        "RAGHUB_CONTROLLER_ALLOWED_ORIGINS", ""
+                    ).split(",")
+                    if origin.strip()
+                ),
+            )
+        app.register_blueprint(create_operations_blueprint(controller_operations))
     if os.getenv("SIP_TRUST_PROXY", "false").strip().lower() in {"1", "true", "yes"}:
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
     version = Path("VERSION").read_text(encoding="utf-8").strip()
@@ -2449,12 +2485,23 @@ def create_app(
 app = create_app()
 
 
-if __name__ == "__main__":
+def _run_main_application() -> None:
     load_dotenv(Path(__file__).with_name(".env"))
     personal = PersonalEditionService.from_environment()
+    if _controller_routes_enabled():
+        validate_bind_address(
+            personal.settings.host,
+            tailscale_address=os.getenv(
+                "RAGHUB_CONTROLLER_TAILSCALE_ADDRESS"
+            ),
+        )
     app.run(
         host=personal.settings.host,
         port=personal.settings.port,
         debug=False,
         use_reloader=False,
     )
+
+
+if __name__ == "__main__":
+    _run_main_application()

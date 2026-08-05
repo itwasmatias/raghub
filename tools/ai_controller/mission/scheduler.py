@@ -20,14 +20,17 @@ Scheduling cycle (``run_once``):
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from tools.ai_controller._locking import FileLock
-from tools.ai_controller.queue import DurableQueue
+from tools.ai_controller.queue import DurableQueue, atomic_json as queue_atomic_json
+from tools.ai_controller.models import Task
 from tools.ai_controller.reports import report_lock_path
 from .events import MissionEventLog, make_event
 from .graph import DependencyGraph
@@ -157,6 +160,7 @@ _TERMINAL_MISSION_STATUSES = {
     MissionStatus.cancelled,
     MissionStatus.budget_exhausted,
 }
+_QUEUE_STATES = ("pending", "running", "succeeded", "failed", "invalid")
 
 
 def _now() -> str:
@@ -265,7 +269,7 @@ class MissionScheduler:
             },
         )
         state, reconcile_events = self._reconcile_tasks(
-            definition, reconcile_state
+            definition, reconcile_state, durable_events=durable_events
         )
         state.task_states.update(preserved_tasks)
         new_events.extend(reconcile_events)
@@ -630,6 +634,344 @@ class MissionScheduler:
         event_log.append(make_event("mission_cancelled", mission_id, reason="operator request"))
         logger.info("mission cancelled mission_id=%s", mission_id)
 
+    @staticmethod
+    def _retry_payload(
+        mission_id: str,
+        task_def: MissionTaskDefinition,
+        queue_id: str,
+        *,
+        attempt_number: int,
+    ) -> dict:
+        metadata = {
+            **task_def.metadata,
+            "mission_id": mission_id,
+            "mission_task_id": task_def.task_id,
+            "depends_on": list(task_def.depends_on),
+        }
+        if attempt_number > 1:
+            metadata["mission_attempt"] = attempt_number
+        return Task(
+            id=queue_id,
+            title=task_def.title,
+            prompt=task_def.prompt,
+            base_ref=task_def.base_ref,
+            tests=list(task_def.tests),
+            max_attempts=task_def.max_attempts,
+            metadata=metadata,
+        ).to_dict()
+
+    def _retry_queue_records(
+        self,
+        mission_id: str,
+        task_def: MissionTaskDefinition,
+        task_state: MissionTaskState,
+        *,
+        allow_pending_previous: bool = False,
+    ) -> tuple[str, list[tuple[str, Path, dict]]]:
+        """Return one owned retry record or fail closed on ambiguous evidence."""
+        current_id = self._materializer.make_queue_task_id(
+            mission_id, task_def.task_id
+        )
+        legacy_id = make_legacy_queue_task_id(mission_id, task_def.task_id)
+        identities = {current_id, legacy_id}
+        if (
+            task_state.queue_task_id is not None
+            and task_state.queue_task_id not in identities
+        ):
+            raise ValueError("mission task has a non-deterministic queue identity")
+
+        records: list[tuple[str, Path, dict]] = []
+        for state_name in _QUEUE_STATES:
+            directory = getattr(self._queue, state_name)
+            for path in sorted(directory.glob("*.json")):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError) as exc:
+                    if path.stem in identities:
+                        raise ValueError(
+                            "retry queue evidence is malformed"
+                        ) from exc
+                    continue
+                if not isinstance(payload, dict):
+                    if path.stem in identities:
+                        raise ValueError("retry queue payload is not an object")
+                    continue
+                metadata = payload.get("metadata")
+                owns_task = (
+                    isinstance(metadata, dict)
+                    and metadata.get("mission_id") == mission_id
+                    and metadata.get("mission_task_id") == task_def.task_id
+                )
+                if path.stem in identities or owns_task:
+                    if path.stem not in identities:
+                        raise ValueError(
+                            "retry queue record has a foreign identity"
+                        )
+                    records.append((state_name, path, payload))
+
+        if len(records) > 1:
+            raise ValueError(
+                "retry queue identity occurs in multiple locations"
+            )
+        if not records:
+            return current_id, records
+
+        state_name, path, payload = records[0]
+        if payload.get("id") != path.stem:
+            raise ValueError("retry queue payload identity does not match location")
+        expected = self._retry_payload(
+            mission_id,
+            task_def,
+            path.stem,
+            attempt_number=task_state.attempt_count,
+        )
+        retry_expected = self._retry_payload(
+            mission_id,
+            task_def,
+            path.stem,
+            attempt_number=task_state.attempt_count + 1,
+        )
+        if payload != expected and payload != retry_expected:
+            raise ValueError(
+                "retry queue payload is not the exact controller task"
+            )
+        if (
+            state_name == "pending"
+            and payload != retry_expected
+            and not (allow_pending_previous and payload == expected)
+        ):
+            raise ValueError(
+                "pending retry queue record lacks its bound retry attempt"
+            )
+        return path.stem, records
+
+    def retry_queue_ownership_error(
+        self,
+        mission_id: str,
+        task_def: MissionTaskDefinition,
+        task_state: MissionTaskState,
+    ) -> str | None:
+        """Expose the scheduler's ownership check for proposal validation."""
+        try:
+            self._retry_queue_records(mission_id, task_def, task_state)
+        except ValueError as exc:
+            return str(exc)
+        return None
+
+    def _archive_retry_report(self, queue_id: str, attempt_number: int) -> None:
+        current = self._reports_root / f"{queue_id}.json"
+        if not current.exists():
+            return
+        history = self._reports_root / "history"
+        destination = history / f"{queue_id}.attempt-{attempt_number}.json"
+        if destination.exists():
+            raise ValueError("retry report history already contains this attempt")
+        history.mkdir(parents=True, exist_ok=True)
+        os.replace(current, destination)
+
+    def retry_task(
+        self,
+        mission_id: str,
+        task_id: str,
+        *,
+        recovery_action_id: str | None = None,
+    ) -> str:
+        """Requeue one failed task through the existing queue identity authority."""
+        event_log = MissionEventLog(
+            self._missions_root / "events", mission_id
+        )
+        with (
+            self._store._lock,
+            FileLock(self._queue.lock_path),
+            FileLock(report_lock_path(self._reports_root)),
+            event_log.locked() as event_token,
+        ):
+            definition = self._store.load_definition(mission_id)
+            state = self._store.load_state(mission_id)
+            task_def = next(
+                (item for item in definition.tasks if item.task_id == task_id),
+                None,
+            )
+            task_state = state.task_states.get(task_id)
+            if task_def is None or task_state is None:
+                raise KeyError(f"mission task not found: {task_id}")
+            if state.status != MissionStatus.running:
+                raise ValueError(
+                    f"mission does not permit task retry: {mission_id}"
+                )
+            queue_id, records = self._retry_queue_records(
+                mission_id,
+                task_def,
+                task_state,
+                allow_pending_previous=recovery_action_id is not None,
+            )
+            pending_record = (
+                records[0]
+                if len(records) == 1 and records[0][0] == "pending"
+                else None
+            )
+            if (
+                recovery_action_id
+                and task_state.status == MissionTaskStatus.queued
+                and pending_record is not None
+                and task_state.queue_task_id == queue_id
+            ):
+                if not any(
+                    event.event_type == "task_retry_queued"
+                    and event.task_id == task_id
+                    and event.queue_task_id == task_state.queue_task_id
+                    and event.metadata.get("attempt_number")
+                    == task_state.attempt_count + 1
+                    and event.metadata.get("controller_action_id")
+                    == recovery_action_id
+                    for event in event_log.read_snapshot_locked().events
+                ):
+                    event_log.append_locked(
+                        make_event(
+                            "task_retry_queued",
+                            mission_id,
+                            task_id=task_id,
+                            queue_task_id=task_state.queue_task_id,
+                            metadata={
+                                "attempt_number": task_state.attempt_count + 1,
+                                "max_attempts": task_def.max_attempts,
+                                "controller_action_id": recovery_action_id,
+                                "recovered_interrupted_retry": True,
+                            },
+                        ),
+                        event_token,
+                    )
+                return task_state.queue_task_id
+            if task_state.status != MissionTaskStatus.failed:
+                raise ValueError(f"mission task is not retryable: {task_id}")
+            if (
+                task_state.attempt_count >= task_def.max_attempts
+                or state.budget_usage.total_attempts
+                >= definition.budgets.max_total_attempts
+            ):
+                raise ValueError(f"mission task retry budget exhausted: {task_id}")
+            durable_events = list(
+                event_log.read_snapshot_locked().events
+            )
+            for dependency in task_def.depends_on:
+                dependency_state = state.task_states.get(dependency)
+                if dependency_state is None or not any(
+                    self._is_exact_prerequisite_success(
+                        event,
+                        mission_id,
+                        dependency,
+                        dependency_state,
+                    )
+                    for event in durable_events
+                ):
+                    raise ValueError(
+                        f"mission task prerequisite is not durably satisfied: "
+                        f"{dependency}"
+                    )
+
+            if records and records[0][0] in {"pending", "running"} and not (
+                recovery_action_id
+                and records[0][0] == "pending"
+                and records[0][2]
+                in (
+                    self._retry_payload(
+                        mission_id,
+                        task_def,
+                        queue_id,
+                        attempt_number=task_state.attempt_count,
+                    ),
+                    self._retry_payload(
+                        mission_id,
+                        task_def,
+                        queue_id,
+                        attempt_number=task_state.attempt_count + 1,
+                    ),
+                )
+            ):
+                raise ValueError("mission task already has active queue work")
+
+            if records:
+                state_name, source, _ = records[0]
+                if state_name == "pending" and recovery_action_id:
+                    queue_atomic_json(
+                        source,
+                        self._retry_payload(
+                            mission_id,
+                            task_def,
+                            queue_id,
+                            attempt_number=task_state.attempt_count + 1,
+                        ),
+                    )
+                elif state_name not in {"failed", "invalid"}:
+                    raise ValueError("retry queue record is not terminal")
+                else:
+                    self._archive_retry_report(
+                        queue_id, task_state.attempt_count
+                    )
+                    destination = self._queue.pending / source.name
+                    source.replace(destination)
+                    queue_atomic_json(
+                        destination,
+                        self._retry_payload(
+                            mission_id,
+                            task_def,
+                            queue_id,
+                            attempt_number=task_state.attempt_count + 1,
+                        ),
+                    )
+            else:
+                self._archive_retry_report(
+                    task_state.queue_task_id or queue_id,
+                    task_state.attempt_count,
+                )
+                state.task_states[task_id] = replace(
+                    task_state,
+                    queue_task_id=None,
+                )
+                queue_id = self._materializer.materialize(
+                    mission_id, task_def, state
+                )
+                queue_atomic_json(
+                    self._queue.pending / f"{queue_id}.json",
+                    self._retry_payload(
+                        mission_id,
+                        task_def,
+                        queue_id,
+                        attempt_number=task_state.attempt_count + 1,
+                    ),
+                )
+
+            state.task_states[task_id] = MissionTaskState(
+                task_id=task_state.task_id,
+                status=MissionTaskStatus.queued,
+                queue_task_id=queue_id,
+                report_path=task_state.report_path,
+                worktree_path=task_state.worktree_path,
+                attempt_count=task_state.attempt_count,
+                failure_reason=None,
+                queued_at=_now(),
+                started_at=None,
+                finished_at=None,
+                files_changed=task_state.files_changed,
+                test_results=task_state.test_results,
+            )
+            self._store.update_state(mission_id, state)
+            event_log.append_locked(
+                make_event(
+                    "task_retry_queued",
+                    mission_id,
+                    task_id=task_id,
+                    queue_task_id=queue_id,
+                    metadata={
+                        "attempt_number": task_state.attempt_count + 1,
+                        "max_attempts": task_def.max_attempts,
+                        "controller_action_id": recovery_action_id,
+                    },
+                ),
+                event_token,
+            )
+            return queue_id
+
     # ------------------------------------------------------------------
     # Internal scheduling helpers
     # ------------------------------------------------------------------
@@ -640,6 +982,7 @@ class MissionScheduler:
         state: MissionState,
         *,
         report_overrides: dict[str, dict] | None = None,
+        durable_events: list[MissionEvent] | None = None,
     ) -> tuple[MissionState, list[MissionEvent]]:
         """Update task states based on current queue and report files.
 
@@ -701,6 +1044,27 @@ class MissionScheduler:
             queue_status: str = info["queue_status"]
             classification: str = info.get("classification", "eligible_missing")
             report: dict | None = info["report"]
+
+            expected_retry_attempt = self._retry_attempt(
+                durable_events or [], tid, ts.queue_task_id
+            )
+            if (
+                report is not None
+                and expected_retry_attempt is not None
+                and (
+                    report.get("task_id") != ts.queue_task_id
+                    or report.get("mission_id") != state.mission_id
+                    or report.get("mission_task_id") != tid
+                    or report.get("mission_attempt")
+                    != expected_retry_attempt
+                )
+            ):
+                logger.warning(
+                    "ignoring report from another retry attempt mission=%s task=%s",
+                    state.mission_id,
+                    tid,
+                )
+                report = None
 
             if classification in {"paused", "cancelled"}:
                 logger.info(
@@ -879,6 +1243,24 @@ class MissionScheduler:
             report_path=state.report_path,
         )
         return new_state, new_events
+
+    @staticmethod
+    def _retry_attempt(
+        events: list[MissionEvent], task_id: str, queue_id: str
+    ) -> int | None:
+        attempts = [
+            event.metadata.get("attempt_number")
+            for event in events
+            if event.event_type == "task_retry_queued"
+            and event.task_id == task_id
+            and event.queue_task_id == queue_id
+            and isinstance(event.metadata.get("attempt_number"), int)
+            and not isinstance(event.metadata.get("attempt_number"), bool)
+            and event.metadata["attempt_number"] > 0
+        ]
+        if not attempts:
+            return None
+        return attempts[-1]
 
     def _compute_ready_tasks(
         self,

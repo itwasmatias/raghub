@@ -11,13 +11,14 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import math
 import os
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from tools.ai_controller._locking import FileLock
 from .models import MissionEvent
@@ -27,6 +28,126 @@ logger = logging.getLogger(__name__)
 
 class EventLogCorruptionError(ValueError):
     """Raised when durable event bytes are not a complete valid JSONL log."""
+
+
+_EVENT_FIELDS = {
+    "event_type",
+    "timestamp",
+    "mission_id",
+    "task_id",
+    "reason",
+    "queue_task_id",
+    "report_path",
+    "provider",
+    "metadata",
+}
+_TASK_IDENTITY_EVENTS = {
+    "repair_started",
+    "repair_applied",
+    "repair_expired",
+}
+_QUEUE_IDENTITY_EVENTS = {
+    "task_enqueued",
+    "task_running",
+    "task_succeeded",
+    "task_failed",
+    "task_lost",
+    "task_retry_queued",
+    *_TASK_IDENTITY_EVENTS,
+}
+
+
+def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise TypeError(f"duplicate field {key!r}")
+        result[key] = value
+    return result
+
+
+def _validate_json_value(value: Any) -> None:
+    """Reject values that cannot form one finite, unambiguous JSON event."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise TypeError("event JSON values must be finite")
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_json_value(item)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("event metadata keys must be strings")
+            _validate_json_value(item)
+        return
+    raise TypeError("event contains a non-JSON value")
+
+
+def _event_from_data(
+    data: dict[str, Any],
+    *,
+    expected_mission_id: str | None = None,
+) -> MissionEvent:
+    required = {"event_type", "timestamp", "mission_id"}
+    if required - set(data) or set(data) - _EVENT_FIELDS:
+        raise TypeError("event record has missing or unknown fields")
+    event_type = data["event_type"]
+    timestamp = data["timestamp"]
+    mission_id = data["mission_id"]
+    metadata = data.get("metadata", {})
+    if (
+        not isinstance(event_type, str)
+        or not event_type
+        or event_type != event_type.strip()
+        or not isinstance(timestamp, str)
+        or not timestamp
+        or not isinstance(mission_id, str)
+        or not mission_id
+        or not isinstance(metadata, dict)
+        or (
+            expected_mission_id is not None
+            and mission_id != expected_mission_id
+        )
+    ):
+        raise TypeError("event record has invalid base fields")
+    parsed_time = datetime.fromisoformat(timestamp)
+    if parsed_time.tzinfo is None or parsed_time.utcoffset() is None:
+        raise TypeError("event timestamp must include a timezone")
+    task_id = data.get("task_id")
+    queue_task_id = data.get("queue_task_id")
+    if (
+        event_type.startswith("task_") or event_type in _TASK_IDENTITY_EVENTS
+    ) and (not isinstance(task_id, str) or not task_id):
+        raise TypeError("task event requires a mission task ID")
+    if event_type in _QUEUE_IDENTITY_EVENTS and (
+        not isinstance(queue_task_id, str) or not queue_task_id
+    ):
+        raise TypeError("task event requires a queue identity")
+    for field in (
+        "task_id",
+        "reason",
+        "queue_task_id",
+        "report_path",
+        "provider",
+    ):
+        if data.get(field) is not None and not isinstance(data[field], str):
+            raise TypeError(f"event field {field} has invalid type")
+    _validate_json_value(metadata)
+    return MissionEvent(
+        event_type=event_type,
+        timestamp=timestamp,
+        mission_id=mission_id,
+        task_id=task_id,
+        reason=data.get("reason"),
+        queue_task_id=queue_task_id,
+        report_path=data.get("report_path"),
+        provider=data.get("provider"),
+        metadata=dict(metadata),
+    )
 
 
 @dataclass(frozen=True)
@@ -71,6 +192,13 @@ class MissionEventLog:
     """
 
     def __init__(self, events_dir: Path, mission_id: str) -> None:
+        if (
+            not isinstance(mission_id, str)
+            or not mission_id
+            or mission_id != mission_id.strip()
+            or Path(f"{mission_id}.jsonl").name != f"{mission_id}.jsonl"
+        ):
+            raise EventLogCorruptionError("event log mission owner is invalid")
         self._events_dir = Path(events_dir)
         self._mission_id = mission_id
         self._log_path = self._events_dir / f"{mission_id}.jsonl"
@@ -84,6 +212,8 @@ class MissionEventLog:
 
     def append(self, event: MissionEvent) -> None:
         """Append *event* to the JSONL file under an exclusive lock."""
+        self._validate_owner_path()
+        self._validate_event(event)
         self._events_dir.mkdir(parents=True, exist_ok=True)
         with self.locked() as token:
             self.append_locked(event, token)
@@ -119,9 +249,13 @@ class MissionEventLog:
     def append_locked(self, event: MissionEvent, token: object) -> None:
         """Append while this instance owns its authoritative lock."""
         self._require_active_scope(token)
+        self._validate_owner_path()
+        self._validate_event(event)
         self._events_dir.mkdir(parents=True, exist_ok=True)
         self.read_snapshot_locked()
-        line = json.dumps(event.to_dict(), ensure_ascii=False) + "\n"
+        line = json.dumps(
+            event.to_dict(), ensure_ascii=False, allow_nan=False
+        ) + "\n"
         with self._log_path.open("ab") as fh:
             fh.write(line.encode("utf-8"))
             fh.flush()
@@ -145,6 +279,7 @@ class MissionEventLog:
 
     def read_snapshot(self) -> EventSnapshot:
         """Read, hash, and parse exactly one immutable byte snapshot."""
+        self._validate_owner_path()
         try:
             raw = self._log_path.read_bytes()
         except FileNotFoundError:
@@ -182,27 +317,40 @@ class MissionEventLog:
                     f"event log has an empty record at line {lineno}: {self._log_path}"
                 )
             try:
-                data = json.loads(line)
+                data = json.loads(line, object_pairs_hook=_strict_object)
                 if not isinstance(data, dict):
                     raise TypeError("event record is not an object")
                 events.append(
-                    MissionEvent(
-                        event_type=data.get("event_type", ""),
-                        timestamp=data.get("timestamp", ""),
-                        mission_id=data.get("mission_id", self._mission_id),
-                        task_id=data.get("task_id"),
-                        reason=data.get("reason"),
-                        queue_task_id=data.get("queue_task_id"),
-                        report_path=data.get("report_path"),
-                        provider=data.get("provider"),
-                        metadata=dict(data.get("metadata", {})),
+                    _event_from_data(
+                        data,
+                        expected_mission_id=self._mission_id,
                     )
                 )
-            except (json.JSONDecodeError, TypeError, KeyError) as exc:
+            except (json.JSONDecodeError, TypeError, KeyError, ValueError) as exc:
                 raise EventLogCorruptionError(
                     f"malformed event at line {lineno} in {self._log_path}: {exc}"
                 ) from exc
         return EventSnapshot(tuple(events), revision, raw)
+
+    def _validate_event(self, event: MissionEvent) -> None:
+        if not isinstance(event, MissionEvent):
+            raise EventLogCorruptionError("event is not a MissionEvent")
+        try:
+            _event_from_data(
+                event.to_dict(),
+                expected_mission_id=self._mission_id,
+            )
+        except (TypeError, ValueError) as exc:
+            raise EventLogCorruptionError(
+                f"event is invalid for {self._log_path}: {exc}"
+            ) from exc
+
+    def _validate_owner_path(self) -> None:
+        expected = self._events_dir / f"{self._mission_id}.jsonl"
+        if self._log_path != expected or self._log_path.stem != self._mission_id:
+            raise EventLogCorruptionError(
+                "event log path does not match its immutable mission owner"
+            )
 
     def last_event_of_type(self, event_type: str) -> MissionEvent | None:
         """Return the most recent event whose ``event_type`` matches *event_type*."""

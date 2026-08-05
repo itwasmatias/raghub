@@ -28,7 +28,11 @@ class DurableQueue:
     def enqueue(self, task: Task) -> Path:
         with FileLock(self.lock_path):
             if any((directory / f"{task.id}.json").exists() for directory in (
-                self.pending, self.running, self.succeeded, self.failed
+                self.pending,
+                self.running,
+                self.succeeded,
+                self.failed,
+                self.invalid,
             )):
                 raise FileExistsError(f"task already exists: {task.id}")
             destination = self.pending / f"{task.id}.json"

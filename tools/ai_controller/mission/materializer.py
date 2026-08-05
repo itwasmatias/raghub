@@ -137,7 +137,7 @@ class TaskMaterializer:
 
             log = MissionEventLog(self._events_dir, mission_id)
             log.append(event)
-        except (OSError, PermissionError) as exc:
+        except (OSError, PermissionError, ValueError) as exc:
             # Event emission failure should not break materialization
             logger.warning(
                 "failed to emit event type=%s mission=%s: %s",

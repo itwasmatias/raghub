@@ -12,7 +12,11 @@ from pathlib import Path
 import pytest
 
 from tools.ai_controller._locking import FileLock
-from tools.ai_controller.mission.events import MissionEventLog, make_event
+from tools.ai_controller.mission.events import (
+    EventLogCorruptionError,
+    MissionEventLog,
+    make_event,
+)
 from tools.ai_controller.mission.materializer import (
     TaskMaterializer,
     make_legacy_queue_task_id,
@@ -1034,6 +1038,9 @@ def test_terminal_mission_event_blocks_rematerialization(tmp_path: Path):
             "task_lost",
             definition.mission_id,
             task_id="task-a",
+            queue_task_id=TaskMaterializer(
+                queue, reports
+            ).make_queue_task_id(definition.mission_id, "task-a"),
         )
     )
 
@@ -1471,6 +1478,19 @@ def test_scheduler_requires_exact_prerequisite_success_identity(
     case: str,
     event_kwargs: dict,
 ):
+    if case in {
+        "wrong mission_id",
+        "missing mission_id",
+        "missing mission_task_id",
+        "missing queue_task_id",
+        "event from another mission file",
+    }:
+        with pytest.raises(EventLogCorruptionError):
+            _run_scheduler_with_prerequisite_event(
+                tmp_path,
+                **event_kwargs,
+            )
+        return
     if case == "unrelated deterministic queue ID":
         queue = DurableQueue(tmp_path / "controller" / "queue")
         event_kwargs["queue_task_id"] = TaskMaterializer(
@@ -2925,6 +2945,20 @@ def test_incomplete_or_conflicting_repair_started_never_authorizes_recovery(
             queue, reports, definition, action.task_id
         )
 
+    if invalid_binding in {
+        "wrong mission_id",
+        "missing mission_id",
+        "missing mission_task_id",
+        "missing queue_task_id",
+    }:
+        with pytest.raises(EventLogCorruptionError):
+            _append_repair_started(
+                missions,
+                action,
+                metadata=metadata,
+                **event_kwargs,
+            )
+        return
     if invalid_binding not in {
         "no repair_started",
         "historical repair_started",

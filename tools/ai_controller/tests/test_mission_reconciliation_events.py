@@ -11,6 +11,7 @@ Verifies that:
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 from pathlib import Path
@@ -364,7 +365,12 @@ def test_append_locked_is_bound_to_instance_thread_and_active_scope(
     second = MissionEventLog(tmp_path / "events", "second")
     foreign_errors: list[BaseException] = []
     foreign_done = threading.Event()
-    first_event = make_event("task_enqueued", "first", task_id="task-a")
+    first_event = make_event(
+        "task_enqueued",
+        "first",
+        task_id="task-a",
+        queue_task_id="queue-task-a",
+    )
 
     with first.locked() as token:
         def append_from_foreign_thread() -> None:
@@ -385,7 +391,12 @@ def test_append_locked_is_bound_to_instance_thread_and_active_scope(
 
         with pytest.raises(RuntimeError):
             second.append_locked(
-                make_event("task_enqueued", "second", task_id="task-a"),
+                make_event(
+                    "task_enqueued",
+                    "second",
+                    task_id="task-a",
+                    queue_task_id="queue-task-a",
+                ),
                 token,
             )
 
@@ -445,6 +456,50 @@ def test_lock_held_append_validates_tail_flushes_and_fsyncs(
             log.append_locked(make_event("second", "durable"), token)
 
     assert fsync_calls == 1
+
+
+def test_foreign_mission_append_writes_zero_bytes(tmp_path: Path):
+    log = MissionEventLog(tmp_path / "events", "mission-alpha")
+
+    with pytest.raises(EventLogCorruptionError):
+        log.append(make_event("external", "mission-beta"))
+
+    assert not log._log_path.exists()
+
+
+@pytest.mark.parametrize(
+    "mission_ids",
+    [
+        ["mission-beta"],
+        ["mission-alpha", "mission-beta"],
+        ["mission-beta", "mission-alpha"],
+    ],
+)
+def test_foreign_historical_event_makes_owned_snapshot_corrupt(
+    tmp_path: Path,
+    mission_ids: list[str],
+):
+    log = MissionEventLog(tmp_path / "events", "mission-alpha")
+    log._events_dir.mkdir(parents=True)
+    log._log_path.write_text(
+        "".join(
+            json.dumps(make_event("external", mission_id).to_dict()) + "\n"
+            for mission_id in mission_ids
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(EventLogCorruptionError):
+        log.read_snapshot()
+
+
+def test_event_log_owner_cannot_differ_from_path_basename(tmp_path: Path):
+    events_dir = tmp_path / "events"
+    log = MissionEventLog(events_dir, "mission-alpha")
+    log._log_path = events_dir / "mission-beta.jsonl"
+
+    with pytest.raises(EventLogCorruptionError):
+        log.read_snapshot()
 
 
 if __name__ == "__main__":
