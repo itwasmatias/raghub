@@ -124,3 +124,9 @@ If the answer is no, reconsider the design.
 ---
 
 *"Knowledge grows through connection. RAGHub exists to build those connections."*
+
+## Long-Term AI Operating System Vision
+
+The canonical federated AI operating system vision is documented in:
+
+`RAGHUB_AI_OS_VISION.md`

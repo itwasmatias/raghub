@@ -314,3 +314,9 @@ Outcome evaluation, calibration, and research memory
 Observed source facts, derived analytical claims, model forecasts, qualitative
 context, and historical replay data retain distinct labels. Empty live sources
 remain empty; they are never replaced with fictional production rows.
+
+## Federated AI Operating System Direction
+
+RAGHub's canonical long-term architecture, including its Fedora and Windows compute nodes, iPhone command center, persistent workers, host supervisors, and capability broker, is documented in:
+
+`RAGHUB_AI_OS_VISION.md`
