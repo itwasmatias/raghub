@@ -140,7 +140,7 @@ class NodeRegistry:
         nodes = list(self._nodes.values())
 
         if not include_stale:
-            nodes = [n for n in nodes if not self._is_stale(n)]
+            nodes = [n for n in nodes if not self.is_stale(n)]
 
         if status_filter is not None:
             nodes = [n for n in nodes if n.status == status_filter]
@@ -172,7 +172,7 @@ class NodeRegistry:
 
         # Filter by staleness
         if not include_stale:
-            nodes = [n for n in nodes if not self._is_stale(n)]
+            nodes = [n for n in nodes if not self.is_stale(n)]
 
         # Filter by status
         if status_filter is not None:
@@ -212,7 +212,7 @@ class NodeRegistry:
         Returns:
             List of NodeRecords that are considered stale.
         """
-        return [node for node in self._nodes.values() if self._is_stale(node)]
+        return [node for node in self._nodes.values() if self.is_stale(node)]
 
     def mark_stale_nodes_offline(self) -> int:
         """
@@ -231,7 +231,7 @@ class NodeRegistry:
 
         return count
 
-    def _is_stale(self, node: NodeRecord) -> bool:
+    def is_stale(self, node: NodeRecord) -> bool:
         """
         Check if a node is stale based on its last_seen timestamp.
 
@@ -244,6 +244,10 @@ class NodeRegistry:
         last_seen = normalize_last_seen(node.last_seen)
         time_since_last_seen = datetime.now(timezone.utc) - last_seen
         return time_since_last_seen > self._stale_threshold
+
+    def _is_stale(self, node: NodeRecord) -> bool:
+        """Compatibility wrapper for the public stale-node check."""
+        return self.is_stale(node)
 
     def count(self) -> int:
         """

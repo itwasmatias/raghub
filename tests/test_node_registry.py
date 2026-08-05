@@ -309,6 +309,19 @@ def test_registry_detect_stale_nodes(fedora_node):
     assert stale[0].node_id == "fedora-1"
 
 
+def test_registry_is_stale_public_method(fedora_node):
+    """The public stale-node check reports fresh and stale records."""
+    registry = NodeRegistry(stale_threshold_seconds=1)
+    registry.register(fedora_node)
+
+    assert registry.is_stale(fedora_node) is False
+
+    fedora_node.last_seen = datetime.now(timezone.utc) - timedelta(seconds=2)
+
+    assert registry.is_stale(fedora_node) is True
+    assert registry._is_stale(fedora_node) is True
+
+
 def test_registry_mark_stale_nodes_offline(fedora_node):
     """Test marking stale nodes as offline."""
     registry = NodeRegistry(stale_threshold_seconds=1)
