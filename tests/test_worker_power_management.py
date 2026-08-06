@@ -24,6 +24,7 @@ from federation import (
     PowerConflictError,
     PowerCoordinator,
     PowerCorruptionError,
+    PowerExecutionAuthorizationAuthority,
     PowerPolicy,
     PowerProposal,
     PowerRefusalError,
@@ -158,6 +159,7 @@ def make_coordinator(
         controller_authority="controller-1",
         integrity_authority="integrity-key-1",
         integrity_key=key,
+        execution_authorization_authority=PowerExecutionAuthorizationAuthority(key),
         adapters={adapter.adapter_id: adapter},
         clock=clock or MutableClock(),
     )
@@ -617,6 +619,9 @@ def test_corrupt_evidence_is_rejected_without_modification(tmp_path, attack):
             controller_authority="controller-1",
             integrity_authority="integrity-key-1",
             integrity_key=KEY,
+            execution_authorization_authority=(
+                PowerExecutionAuthorizationAuthority(KEY)
+            ),
             adapters={adapter.adapter_id: adapter},
             clock=MutableClock(),
         )

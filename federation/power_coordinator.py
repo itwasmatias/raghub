@@ -1,12 +1,12 @@
 """Authenticated durable coordination for governed worker power actions."""
 
-import fcntl
 import json
 import os
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
+from federation.file_lock import fcntl
 from federation.integrity import authentication_tag, authenticates, require_integrity_key
 from federation.power_action import (
     POWER_PROPOSAL_DOMAIN,
@@ -26,6 +26,7 @@ from federation.power_action import (
     timestamp,
 )
 from federation.power_adapter import (
+    PowerExecutionAuthorizationAuthority,
     PowerConflictError,
     PowerCorruptionError,
     PowerRefusalError,
@@ -103,6 +104,7 @@ class PowerCoordinator:
         controller_authority,
         integrity_authority,
         integrity_key,
+        execution_authorization_authority,
         adapters,
         clock,
     ):
@@ -124,6 +126,16 @@ class PowerCoordinator:
             "integrity_authority",
         )
         self._integrity_key = require_integrity_key(integrity_key)
+        if type(
+            execution_authorization_authority,
+        ) is not PowerExecutionAuthorizationAuthority:
+            raise TypeError(
+                "execution_authorization_authority must be a "
+                "PowerExecutionAuthorizationAuthority"
+            )
+        self._execution_authorization_authority = (
+            execution_authorization_authority
+        )
         self.adapters = dict(adapters)
         if any(
             key != getattr(adapter, "adapter_id", None)
@@ -451,11 +463,28 @@ class PowerCoordinator:
                 execution_attempt=attempt,
             )
             try:
-                result = adapter.attempt(
-                    proposal.action,
-                    proposal.worker_id,
-                    proposal.component_id,
-                )
+                if getattr(adapter, "requires_execution_authorization", False):
+                    result = adapter.attempt_authorized(
+                        self._execution_authorization_authority.issue(
+                            proposal_id=proposal.proposal_id,
+                            adapter_id=component.adapter_id,
+                            worker_id=proposal.worker_id,
+                            component_id=proposal.component_id,
+                            action=proposal.action,
+                            policy_version=proposal.policy_version,
+                            controller_authority=self.controller_authority,
+                            integrity_authority=self.integrity_authority,
+                            authorization_sequence=attempt,
+                            issued_at=now,
+                            expires_at=snapshot.authorization_expiration,
+                        )
+                    )
+                else:
+                    result = adapter.attempt(
+                        proposal.action,
+                        proposal.worker_id,
+                        proposal.component_id,
+                    )
             except PowerRefusalError as exc:
                 self._append(
                     handle,
@@ -468,18 +497,35 @@ class PowerCoordinator:
                     reason=str(exc),
                 )
             else:
-                self._append(
-                    handle,
-                    records,
-                    event_type=(
+                if getattr(adapter, "requires_execution_authorization", False):
+                    from federation.windows_display_adapter import (
+                        WindowsDisplayResult,
+                    )
+
+                    if not isinstance(result, WindowsDisplayResult):
+                        raise TypeError(
+                            "enforced power adapter must return WindowsDisplayResult"
+                        )
+                    event_type = "succeeded" if result.succeeded else "failed"
+                    result_value = result.code.value
+                    reason = None if result.succeeded else result.reason
+                else:
+                    event_type = (
                         "reconciliation_required"
                         if result == "reconciliation_required"
                         else "succeeded"
-                    ),
+                    )
+                    result_value = result
+                    reason = None
+                self._append(
+                    handle,
+                    records,
+                    event_type=event_type,
                     proposal=proposal,
                     adapter_identity=component.adapter_id,
                     execution_attempt=attempt,
-                    result=result,
+                    result=result_value,
+                    reason=reason,
                 )
             return self._rebuild(records)["snapshots"][proposal_id]
 

@@ -54,10 +54,19 @@ from federation.power_action import (
 from federation.power_adapter import (
     DisabledFedoraPowerAdapter,
     DisabledWindowsPowerAdapter,
+    PowerExecutionAuthorization,
+    PowerExecutionAuthorizationAuthority,
     PowerConflictError,
     PowerCorruptionError,
     PowerRefusalError,
     RecordingPowerAdapter,
+)
+from federation.windows_display_adapter import (
+    HeartbeatWorkerStateProbe,
+    WindowsDisplayAdapter,
+    WindowsDisplayDeployment,
+    WindowsDisplayFailureCode,
+    WindowsDisplayResult,
 )
 from federation.power_coordinator import PowerCoordinator
 from federation.registry import NodeRegistry
@@ -109,10 +118,17 @@ __all__ = [
     "PowerStatus",
     "DisabledFedoraPowerAdapter",
     "DisabledWindowsPowerAdapter",
+    "PowerExecutionAuthorization",
+    "PowerExecutionAuthorizationAuthority",
     "PowerConflictError",
     "PowerCorruptionError",
     "PowerRefusalError",
     "RecordingPowerAdapter",
+    "WindowsDisplayAdapter",
+    "HeartbeatWorkerStateProbe",
+    "WindowsDisplayDeployment",
+    "WindowsDisplayFailureCode",
+    "WindowsDisplayResult",
     "PowerCoordinator",
     # Task Routing
     "AuthorizationLevel",

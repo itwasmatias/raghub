@@ -1,12 +1,13 @@
 """Durable provenance records for successful routing assignments."""
 
-import fcntl
+
 import hashlib
 import hmac
 import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from federation.file_lock import fcntl
 from federation.task_assignment import TaskAssignment
 from federation.integrity import (
     authentication_tag,

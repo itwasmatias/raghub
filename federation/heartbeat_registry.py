@@ -1,6 +1,6 @@
 """Append-only authenticated worker heartbeat and lease registry."""
 
-import fcntl
+
 import hmac
 import json
 import os
@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+from federation.file_lock import fcntl
 from federation.heartbeat import (
     GENESIS_AUTHENTICATION_TAG,
     HEARTBEAT_SUBMISSION_DOMAIN,

@@ -1,6 +1,6 @@
 """Lock-protected durable task-dispatch state machine."""
 
-import fcntl
+
 import hashlib
 import json
 import os
@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from federation.file_lock import fcntl
 from federation.assignment_registry import (
     AssignmentCorruptionError,
     DurableAssignmentRegistry,
