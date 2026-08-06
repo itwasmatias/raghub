@@ -26,6 +26,7 @@ from federation.integrity import (
     authenticates,
     require_integrity_key,
 )
+from federation.heartbeat_registry import HeartbeatRegistry
 from federation.task_request import AuthorizationLevel
 
 
@@ -93,6 +94,10 @@ class DispatchTerminalStateError(DispatchError):
 
 class DispatchOfferExpiredError(DispatchTerminalStateError):
     """Raised when expiration wins at the response boundary."""
+
+
+class DispatchWorkerUnavailableError(DispatchError):
+    """Raised when a new offer targets a worker without a live lease."""
 
 
 @dataclass(slots=True, frozen=True)
@@ -178,6 +183,7 @@ class TaskDispatchCoordinator:
         assignment_store: DurableAssignmentRegistry,
         dispatch_store_path,
         integrity_key: bytes,
+        heartbeat_registry: HeartbeatRegistry,
         clock: Clock | None = None,
     ):
         self._coordinator_node_id = _require_identifier(
@@ -193,7 +199,15 @@ class TaskDispatchCoordinator:
             )
         if clock is not None and not callable(clock):
             raise TypeError("clock must be callable")
+        if type(heartbeat_registry) is not HeartbeatRegistry:
+            raise TypeError("heartbeat_registry must be a HeartbeatRegistry")
+        if not heartbeat_registry._integrity_key_matches(self._integrity_key):
+            raise ValueError(
+                "heartbeat_registry and dispatch persistence must use "
+                "the same integrity key",
+            )
         self.assignment_store = assignment_store
+        self._heartbeat_registry = heartbeat_registry
         self._path = Path(dispatch_store_path)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._last_observed_at = None
@@ -221,6 +235,15 @@ class TaskDispatchCoordinator:
         if expires_at <= now:
             raise ValueError("expires_at must be after creation time")
         deterministic_id = _offer_id(assignment)
+        if not self._path.exists() and not (
+            self._heartbeat_registry.is_routing_eligible(
+                assignment.worker_node_id,
+            )
+        ):
+            raise DispatchWorkerUnavailableError(
+                f"Worker {assignment.worker_node_id!r} is not available "
+                "for a new dispatch offer",
+            )
 
         def mutate(handle, snapshot):
             existing = snapshot.offers.get(deterministic_id)
@@ -232,6 +255,13 @@ class TaskDispatchCoordinator:
                     return existing
                 raise DispatchOfferConflictError(
                     "deterministic offer identity conflicts with existing evidence",
+                )
+            if not self._heartbeat_registry.is_routing_eligible(
+                assignment.worker_node_id,
+            ):
+                raise DispatchWorkerUnavailableError(
+                    f"Worker {assignment.worker_node_id!r} is not available "
+                    "for a new dispatch offer",
                 )
             task_key = (assignment.mission_id, assignment.task_id)
             if task_key in snapshot.offer_ids_by_task:

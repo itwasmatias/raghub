@@ -56,6 +56,7 @@ def test_read_only_inspection_of_missing_store_creates_nothing(tmp_path):
         assignment_store=coordinator.assignment_store,
         dispatch_store_path=missing,
         integrity_key=INTEGRITY_KEY,
+        heartbeat_registry=coordinator._heartbeat_registry,
         clock=MutableClock(),
     )
 

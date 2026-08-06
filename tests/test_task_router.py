@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from federation import (
+    Heartbeat,
+    HeartbeatRegistry,
     NodeCapability,
     NodeRecord,
     NodeRegistry,
@@ -16,6 +18,29 @@ from federation import (
 from federation.assignment_registry import DurableAssignmentRegistry
 
 
+ROUTER_NOW = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+ROUTER_KEY = b"task-router-heartbeat-test-integrity-key"
+
+
+def online_heartbeat(worker_id):
+    return Heartbeat.authenticated(
+        worker_id=worker_id,
+        registry_id="task-router-tests",
+        sequence=1,
+        session_id="boot-1",
+        worker_timestamp=ROUTER_NOW,
+        health="healthy",
+        power_capabilities=(),
+        requested_power_state="active",
+        sleep_reason=None,
+        expected_wake_time=None,
+        wake_method=None,
+        active_work_checkpointed=False,
+        previous_authentication_tag="0" * 64,
+        integrity_key=ROUTER_KEY,
+    )
+
+
 @pytest.fixture
 def registry():
     """Create a fresh NodeRegistry for each test."""
@@ -23,9 +48,29 @@ def registry():
 
 
 @pytest.fixture
-def router(registry):
+def heartbeat_registry(tmp_path, registry, monkeypatch):
+    """Create authoritative online evidence when a test registers a node."""
+    liveness = HeartbeatRegistry(
+        tmp_path / "heartbeats.jsonl",
+        registry_id="task-router-tests",
+        node_registry=registry,
+        integrity_key=ROUTER_KEY,
+        clock=lambda: ROUTER_NOW,
+    )
+    register = registry.register
+
+    def register_online(node):
+        register(node)
+        liveness.record(online_heartbeat(node.node_id))
+
+    monkeypatch.setattr(registry, "register", register_online)
+    return liveness
+
+
+@pytest.fixture
+def router(registry, heartbeat_registry):
     """Create a TaskRouter with the registry."""
-    return TaskRouter(registry)
+    return TaskRouter(registry, heartbeat_registry=heartbeat_registry)
 
 
 @pytest.fixture
@@ -68,16 +113,52 @@ def storage_node():
     )
 
 
-def test_task_router_creation(registry):
+def test_task_router_creation(registry, heartbeat_registry):
     """Test creating a task router."""
-    router = TaskRouter(registry)
+    router = TaskRouter(registry, heartbeat_registry=heartbeat_registry)
     assert router._registry is registry
+    assert router._heartbeat_registry is heartbeat_registry
 
 
-def test_task_router_requires_registry():
+def test_task_router_requires_registry(heartbeat_registry):
     """Test that registry is required."""
     with pytest.raises(TypeError, match="registry"):
-        TaskRouter("not a registry")
+        TaskRouter("not a registry", heartbeat_registry=heartbeat_registry)
+
+
+def test_task_router_requires_authoritative_heartbeat_registry(registry):
+    class FabricatedHeartbeatRegistry(HeartbeatRegistry):
+        def __init__(self):
+            pass
+
+    with pytest.raises(TypeError, match="heartbeat_registry"):
+        TaskRouter(registry)
+    with pytest.raises(TypeError, match="HeartbeatRegistry"):
+        TaskRouter(registry, heartbeat_registry=None)
+    with pytest.raises(TypeError, match="HeartbeatRegistry"):
+        TaskRouter(registry, heartbeat_registry=object())
+    with pytest.raises(TypeError, match="HeartbeatRegistry"):
+        TaskRouter(
+            registry,
+            heartbeat_registry=FabricatedHeartbeatRegistry(),
+        )
+
+
+def test_task_router_rejects_heartbeat_registry_for_another_node_registry(
+    tmp_path,
+    registry,
+):
+    unrelated = NodeRegistry()
+    heartbeat_registry = HeartbeatRegistry(
+        tmp_path / "heartbeats.jsonl",
+        registry_id="task-router-tests",
+        node_registry=unrelated,
+        integrity_key=ROUTER_KEY,
+        clock=lambda: ROUTER_NOW,
+    )
+
+    with pytest.raises(ValueError, match="authoritative"):
+        TaskRouter(registry, heartbeat_registry=heartbeat_registry)
 
 
 def test_task_router_simple_routing(router, registry, python_node):
@@ -261,7 +342,7 @@ def test_task_router_deterministic_ranking_by_node_id(router, registry):
     assert decisions[0].assigned_node_id == "a-node"
 
 
-def test_task_router_is_independent_of_registration_order():
+def test_task_router_is_independent_of_registration_order(tmp_path):
     """Routing and exclusions are stable across registration orders."""
     capabilities_by_node = {
         "a-eligible": {"python_execution"},
@@ -270,7 +351,7 @@ def test_task_router_is_independent_of_registration_order():
         "z-offline": {"python_execution"},
     }
 
-    def route_with_order(node_ids):
+    def route_with_order(node_ids, evidence_name):
         registry = NodeRegistry(stale_threshold_seconds=300)
         for node_id in node_ids:
             node = NodeRecord(
@@ -285,17 +366,29 @@ def test_task_router_is_independent_of_registration_order():
             registry.register(node)
             if node_id == "z-offline":
                 node.mark_offline()
+        heartbeat_registry = HeartbeatRegistry(
+            tmp_path / evidence_name,
+            registry_id="task-router-tests",
+            node_registry=registry,
+            integrity_key=ROUTER_KEY,
+            clock=lambda: ROUTER_NOW,
+        )
+        for node in registry.list_nodes():
+            heartbeat_registry.record(online_heartbeat(node.node_id))
 
         request = TaskRequest(
             task_id="task-1",
             mission_id="mission-1",
             required_capabilities={NodeCapability("python_execution")},
         )
-        return TaskRouter(registry).route(request)
+        return TaskRouter(
+            registry,
+            heartbeat_registry=heartbeat_registry,
+        ).route(request)
 
     node_ids = list(capabilities_by_node)
-    forward = route_with_order(node_ids)
-    reverse = route_with_order(reversed(node_ids))
+    forward = route_with_order(node_ids, "forward-heartbeats.jsonl")
+    reverse = route_with_order(reversed(node_ids), "reverse-heartbeats.jsonl")
 
     assert forward.assigned_node_id == reverse.assigned_node_id == "a-eligible"
     assert [
@@ -533,6 +626,7 @@ def test_task_router_multiple_preferred_matches(router, registry, storage_node):
 def test_router_records_successful_assignment_in_authoritative_store(
     tmp_path,
     registry,
+    heartbeat_registry,
     python_node,
 ):
     registry.register(python_node)
@@ -541,7 +635,11 @@ def test_router_records_successful_assignment_in_authoritative_store(
         coordinator_node_id="coordinator-1",
         integrity_key=b"task-router-authoritative-store-test-key",
     )
-    router = TaskRouter(registry, assignment_store=assignments)
+    router = TaskRouter(
+        registry,
+        heartbeat_registry=heartbeat_registry,
+        assignment_store=assignments,
+    )
     request = TaskRequest(
         task_id="task-authoritative",
         mission_id="mission-authoritative",
@@ -557,13 +655,21 @@ def test_router_records_successful_assignment_in_authoritative_store(
     assert resolved.worker_node_id == python_node.node_id
 
 
-def test_router_does_not_record_failed_routing(tmp_path, registry):
+def test_router_does_not_record_failed_routing(
+    tmp_path,
+    registry,
+    heartbeat_registry,
+):
     assignments = DurableAssignmentRegistry(
         tmp_path / "assignments.jsonl",
         coordinator_node_id="coordinator-1",
         integrity_key=b"task-router-authoritative-store-test-key",
     )
-    decision = TaskRouter(registry, assignment_store=assignments).route(
+    decision = TaskRouter(
+        registry,
+        heartbeat_registry=heartbeat_registry,
+        assignment_store=assignments,
+    ).route(
         TaskRequest(task_id="task-none", mission_id="mission-none"),
     )
 

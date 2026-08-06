@@ -15,7 +15,10 @@ from federation.assignment_registry import (
 )
 from federation.capability import NodeCapability
 from federation.dispatch_offer import DispatchEventType, DispatchStatus
+from federation.heartbeat import Heartbeat
+from federation.heartbeat_registry import HeartbeatRegistry
 from federation.node_record import NodeRecord
+from federation.registry import NodeRegistry
 from federation.task_assignment import TaskAssignment
 from federation.task_dispatcher import (
     DispatchCorruptionError,
@@ -66,8 +69,57 @@ def make_assignment(
     return TaskAssignment(task_request=request, assigned_node=worker), coordinator_id
 
 
+def build_liveness(
+    path,
+    *,
+    worker_ids=("worker-1",),
+    clock=None,
+    key=INTEGRITY_KEY,
+    record=True,
+):
+    nodes = NodeRegistry(stale_threshold_seconds=10**9)
+    for worker_id in worker_ids:
+        nodes.register(
+            NodeRecord(
+                node_id=worker_id,
+                hostname=f"{worker_id}.local",
+                operating_system="Fedora",
+                capabilities={NodeCapability("python_execution")},
+            ),
+        )
+    liveness = HeartbeatRegistry(
+        Path(path) / "heartbeats.jsonl",
+        registry_id="task-dispatch-tests",
+        node_registry=nodes,
+        integrity_key=key,
+        clock=clock or MutableClock(),
+    )
+    if record:
+        for worker_id in worker_ids:
+            liveness.record(
+                Heartbeat.authenticated(
+                    worker_id=worker_id,
+                    registry_id="task-dispatch-tests",
+                    sequence=1,
+                    session_id="boot-1",
+                    worker_timestamp=START,
+                    health="healthy",
+                    power_capabilities=(),
+                    requested_power_state="active",
+                    sleep_reason=None,
+                    expected_wake_time=None,
+                    wake_method=None,
+                    active_work_checkpointed=False,
+                    previous_authentication_tag="0" * 64,
+                    integrity_key=key,
+                ),
+            )
+    return liveness
+
+
 def build_coordinator(tmp_path, clock=None, **assignment_overrides):
     assignment, coordinator_id = make_assignment(**assignment_overrides)
+    coordinator_clock = clock or MutableClock()
     assignments = DurableAssignmentRegistry(
         tmp_path / "assignments.jsonl",
         coordinator_node_id=coordinator_id,
@@ -79,7 +131,12 @@ def build_coordinator(tmp_path, clock=None, **assignment_overrides):
         assignment_store=assignments,
         dispatch_store_path=tmp_path / "dispatch.jsonl",
         integrity_key=INTEGRITY_KEY,
-        clock=clock or MutableClock(),
+        heartbeat_registry=build_liveness(
+            tmp_path,
+            worker_ids=(assignment.node_id,),
+            clock=coordinator_clock,
+        ),
+        clock=coordinator_clock,
     )
     return coordinator, authoritative
 
@@ -204,6 +261,48 @@ def test_integrity_key_is_explicit_bytes_and_shared_by_both_stores(tmp_path):
             assignment_store=store,
             dispatch_store_path=tmp_path / "dispatch.jsonl",
             integrity_key=WRONG_INTEGRITY_KEY,
+            heartbeat_registry=build_liveness(
+                tmp_path / "wrong-key",
+                key=WRONG_INTEGRITY_KEY,
+            ),
+        )
+
+
+def test_dispatch_coordinator_requires_authoritative_heartbeat_registry(tmp_path):
+    class FabricatedHeartbeatRegistry(HeartbeatRegistry):
+        def __init__(self):
+            pass
+
+    store = DurableAssignmentRegistry(
+        tmp_path / "assignments.jsonl",
+        coordinator_node_id="coordinator-1",
+        integrity_key=INTEGRITY_KEY,
+    )
+    kwargs = {
+        "assignment_store": store,
+        "dispatch_store_path": tmp_path / "dispatch.jsonl",
+        "integrity_key": INTEGRITY_KEY,
+    }
+
+    with pytest.raises(TypeError, match="heartbeat_registry"):
+        TaskDispatchCoordinator("coordinator-1", **kwargs)
+    with pytest.raises(TypeError, match="HeartbeatRegistry"):
+        TaskDispatchCoordinator(
+            "coordinator-1",
+            heartbeat_registry=None,
+            **kwargs,
+        )
+    with pytest.raises(TypeError, match="HeartbeatRegistry"):
+        TaskDispatchCoordinator(
+            "coordinator-1",
+            heartbeat_registry=object(),
+            **kwargs,
+        )
+    with pytest.raises(TypeError, match="HeartbeatRegistry"):
+        TaskDispatchCoordinator(
+            "coordinator-1",
+            heartbeat_registry=FabricatedHeartbeatRegistry(),
+            **kwargs,
         )
 
 
@@ -243,6 +342,7 @@ def test_foreign_coordinator_assignment_is_rejected(tmp_path):
         assignment_store=foreign_store,
         dispatch_store_path=tmp_path / "dispatch.jsonl",
         integrity_key=INTEGRITY_KEY,
+        heartbeat_registry=build_liveness(tmp_path),
         clock=MutableClock(),
     )
 
@@ -260,6 +360,7 @@ def test_offered_and_terminal_state_survive_restart(tmp_path):
         assignment_store=coordinator.assignment_store,
         dispatch_store_path=tmp_path / "dispatch.jsonl",
         integrity_key=INTEGRITY_KEY,
+        heartbeat_registry=coordinator._heartbeat_registry,
         clock=clock,
     )
     assert restarted.inspect_offer(offered.offer_id) == offered
@@ -273,6 +374,7 @@ def test_offered_and_terminal_state_survive_restart(tmp_path):
         assignment_store=coordinator.assignment_store,
         dispatch_store_path=tmp_path / "dispatch.jsonl",
         integrity_key=INTEGRITY_KEY,
+        heartbeat_registry=coordinator._heartbeat_registry,
         clock=clock,
     )
     assert restarted_again.inspect_offer(offered.offer_id) == accepted
@@ -287,6 +389,7 @@ def test_identical_creation_after_restart_is_idempotent(tmp_path):
         assignment_store=coordinator.assignment_store,
         dispatch_store_path=tmp_path / "dispatch.jsonl",
         integrity_key=INTEGRITY_KEY,
+        heartbeat_registry=coordinator._heartbeat_registry,
         clock=MutableClock(),
     )
 
@@ -418,6 +521,12 @@ def _race_transition(path, assignment_id, offer_id, action, barrier, results, ke
         assignment_store=store,
         dispatch_store_path=Path(path) / "dispatch.jsonl",
         integrity_key=key,
+        heartbeat_registry=build_liveness(
+            path,
+            clock=clock,
+            key=key,
+            record=False,
+        ),
         clock=clock,
     )
     barrier.wait()
@@ -483,6 +592,11 @@ def _race_create(path, assignment_id, barrier, results, key):
         assignment_store=store,
         dispatch_store_path=Path(path) / "dispatch.jsonl",
         integrity_key=key,
+        heartbeat_registry=build_liveness(
+            path,
+            key=key,
+            record=False,
+        ),
         clock=MutableClock(),
     )
     barrier.wait()
@@ -670,6 +784,11 @@ def test_wrong_key_restart_fails_closed_and_preserves_original_bytes(tmp_path):
         assignment_store=wrong_store,
         dispatch_store_path=dispatch_path,
         integrity_key=WRONG_INTEGRITY_KEY,
+        heartbeat_registry=build_liveness(
+            tmp_path,
+            key=WRONG_INTEGRITY_KEY,
+            record=False,
+        ),
         clock=MutableClock(),
     )
 

@@ -11,6 +11,7 @@ from federation.routing_decision import ExcludedNode, RoutingDecision, RoutingOu
 from federation.task_assignment import TaskAssignment
 from federation.task_request import TaskRequest
 from federation.assignment_registry import DurableAssignmentRegistry
+from federation.heartbeat_registry import HeartbeatRegistry
 
 
 class TaskRouter:
@@ -25,6 +26,7 @@ class TaskRouter:
         self,
         registry: NodeRegistry,
         *,
+        heartbeat_registry: HeartbeatRegistry,
         assignment_store: DurableAssignmentRegistry | None = None,
     ):
         """
@@ -42,8 +44,15 @@ class TaskRouter:
             raise TypeError(
                 "assignment_store must be a DurableAssignmentRegistry or None",
             )
+        if type(heartbeat_registry) is not HeartbeatRegistry:
+            raise TypeError("heartbeat_registry must be a HeartbeatRegistry")
+        if heartbeat_registry.node_registry is not registry:
+            raise ValueError(
+                "heartbeat_registry must be authoritative for registry",
+            )
         self._registry = registry
         self._assignment_store = assignment_store
+        self._heartbeat_registry = heartbeat_registry
 
     def route(self, task_request: TaskRequest) -> RoutingDecision:
         """
@@ -77,6 +86,17 @@ class TaskRouter:
         eligible_nodes: list[NodeRecord] = []
 
         for node in all_nodes:
+            lease = self._heartbeat_registry.inspect(node.node_id)
+            if lease is None or not lease.routing_eligible:
+                state = "unreported" if lease is None else lease.state.value
+                excluded_nodes.append(
+                    ExcludedNode(
+                        node_id=node.node_id,
+                        reason=f"Worker liveness is {state}, not online",
+                    ),
+                )
+                continue
+
             # Check if node is stale
             if self._registry.is_stale(node):
                 excluded_nodes.append(
@@ -127,8 +147,9 @@ class TaskRouter:
                 ),
             )
 
-        # Select the best node (deterministically)
-        selected_node = min(
+        # Rank deterministically, then revalidate the selected worker immediately
+        # before creating an assignment.
+        ranked_nodes = sorted(
             eligible_nodes,
             key=lambda node: (
                 -sum(
@@ -138,6 +159,33 @@ class TaskRouter:
                 node.node_id,
             ),
         )
+        selected_node = None
+        for candidate in ranked_nodes:
+            lease = self._heartbeat_registry.inspect(candidate.node_id)
+            if lease is not None and lease.routing_eligible:
+                selected_node = candidate
+                break
+            state = "unreported" if lease is None else lease.state.value
+            excluded_nodes.append(
+                ExcludedNode(
+                    node_id=candidate.node_id,
+                    reason=f"Worker liveness is {state}, not online",
+                ),
+            )
+
+        if selected_node is None:
+            return RoutingDecision(
+                task_request=task_request,
+                outcome=RoutingOutcome.NO_ELIGIBLE_NODES,
+                assignment=None,
+                required_capabilities_matched=set(),
+                preferred_capabilities_matched=set(),
+                excluded_nodes=excluded_nodes,
+                explanation=(
+                    f"No eligible nodes found for task {task_request.task_id}. "
+                    f"{len(excluded_nodes)} nodes were excluded."
+                ),
+            )
 
         # Calculate matched capabilities
         required_matched = set(task_request.required_capabilities)

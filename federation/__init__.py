@@ -23,6 +23,21 @@ from federation.dispatch_offer import (
     DispatchStatus,
 )
 from federation.node_record import NodeRecord, NodeStatus
+from federation.heartbeat import Heartbeat
+from federation.heartbeat_registry import (
+    HeartbeatAuthenticationError,
+    HeartbeatConflictError,
+    HeartbeatCorruptionError,
+    HeartbeatError,
+    HeartbeatRegistry,
+)
+from federation.worker_lease import HEARTBEAT_INTERVAL, WORKER_LEASE_DURATION
+from federation.worker_liveness import (
+    LivenessState,
+    PowerCapability,
+    PowerState,
+    WorkerLease,
+)
 from federation.registry import NodeRegistry
 from federation.routing_decision import ExcludedNode, RoutingDecision, RoutingOutcome
 from federation.task_assignment import TaskAssignment
@@ -34,6 +49,7 @@ from federation.task_dispatcher import (
     DispatchOfferExpiredError,
     DispatchOfferNotFoundError,
     DispatchTerminalStateError,
+    DispatchWorkerUnavailableError,
     TaskDispatchCoordinator,
 )
 from federation.task_request import AuthorizationLevel, TaskRequest
@@ -46,6 +62,18 @@ __all__ = [
     "NodeRecord",
     "NodeStatus",
     "NodeRegistry",
+    "Heartbeat",
+    "HeartbeatError",
+    "HeartbeatAuthenticationError",
+    "HeartbeatConflictError",
+    "HeartbeatCorruptionError",
+    "HeartbeatRegistry",
+    "HEARTBEAT_INTERVAL",
+    "WORKER_LEASE_DURATION",
+    "LivenessState",
+    "PowerCapability",
+    "PowerState",
+    "WorkerLease",
     # Task Routing
     "AuthorizationLevel",
     "TaskRequest",
@@ -73,5 +101,6 @@ __all__ = [
     "DispatchOfferExpiredError",
     "DispatchOfferNotFoundError",
     "DispatchTerminalStateError",
+    "DispatchWorkerUnavailableError",
     "TaskDispatchCoordinator",
 ]
