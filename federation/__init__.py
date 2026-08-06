@@ -38,6 +38,28 @@ from federation.worker_liveness import (
     PowerState,
     WorkerLease,
 )
+from federation.power_action import (
+    ApprovalType,
+    ComponentKind,
+    GovernedPowerComponent,
+    OperationsPowerRecord,
+    PowerAction,
+    PowerApproval,
+    PowerAuditEvent,
+    PowerPolicy,
+    PowerProposal,
+    PowerSnapshot,
+    PowerStatus,
+)
+from federation.power_adapter import (
+    DisabledFedoraPowerAdapter,
+    DisabledWindowsPowerAdapter,
+    PowerConflictError,
+    PowerCorruptionError,
+    PowerRefusalError,
+    RecordingPowerAdapter,
+)
+from federation.power_coordinator import PowerCoordinator
 from federation.registry import NodeRegistry
 from federation.routing_decision import ExcludedNode, RoutingDecision, RoutingOutcome
 from federation.task_assignment import TaskAssignment
@@ -74,6 +96,24 @@ __all__ = [
     "PowerCapability",
     "PowerState",
     "WorkerLease",
+    "ApprovalType",
+    "ComponentKind",
+    "GovernedPowerComponent",
+    "OperationsPowerRecord",
+    "PowerAction",
+    "PowerApproval",
+    "PowerAuditEvent",
+    "PowerPolicy",
+    "PowerProposal",
+    "PowerSnapshot",
+    "PowerStatus",
+    "DisabledFedoraPowerAdapter",
+    "DisabledWindowsPowerAdapter",
+    "PowerConflictError",
+    "PowerCorruptionError",
+    "PowerRefusalError",
+    "RecordingPowerAdapter",
+    "PowerCoordinator",
     # Task Routing
     "AuthorizationLevel",
     "TaskRequest",
