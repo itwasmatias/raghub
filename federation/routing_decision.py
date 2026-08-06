@@ -56,6 +56,7 @@ class RoutingDecision:
     preferred_capabilities_matched: set[NodeCapability] = field(default_factory=set)
     excluded_nodes: list[ExcludedNode] = field(default_factory=list)
     explanation: str = ""
+    assignment_id: str | None = None
 
     def __post_init__(self) -> None:
         """Validate routing decision fields."""
@@ -88,6 +89,15 @@ class RoutingDecision:
                 raise ValueError(
                     "assignment must be None when outcome is NO_ELIGIBLE_NODES",
                 )
+            if self.assignment_id is not None:
+                raise ValueError(
+                    "assignment_id must be None when outcome is NO_ELIGIBLE_NODES",
+                )
+
+        if self.assignment_id is not None and (
+            not isinstance(self.assignment_id, str) or not self.assignment_id.strip()
+        ):
+            raise ValueError("assignment_id must be a non-empty string or None")
 
         # Validate required_capabilities_matched
         try:
