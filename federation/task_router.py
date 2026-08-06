@@ -10,6 +10,7 @@ from federation.registry import NodeRegistry
 from federation.routing_decision import ExcludedNode, RoutingDecision, RoutingOutcome
 from federation.task_assignment import TaskAssignment
 from federation.task_request import TaskRequest
+from federation.assignment_registry import DurableAssignmentRegistry
 
 
 class TaskRouter:
@@ -20,7 +21,12 @@ class TaskRouter:
     be routed without actually executing them.
     """
 
-    def __init__(self, registry: NodeRegistry):
+    def __init__(
+        self,
+        registry: NodeRegistry,
+        *,
+        assignment_store: DurableAssignmentRegistry | None = None,
+    ):
         """
         Initialize the task router.
 
@@ -29,7 +35,15 @@ class TaskRouter:
         """
         if not isinstance(registry, NodeRegistry):
             raise TypeError("registry must be a NodeRegistry")
+        if assignment_store is not None and not isinstance(
+            assignment_store,
+            DurableAssignmentRegistry,
+        ):
+            raise TypeError(
+                "assignment_store must be a DurableAssignmentRegistry or None",
+            )
         self._registry = registry
+        self._assignment_store = assignment_store
 
     def route(self, task_request: TaskRequest) -> RoutingDecision:
         """
@@ -138,6 +152,9 @@ class TaskRouter:
             task_request=task_request,
             assigned_node=selected_node,
         )
+        assignment_id = None
+        if self._assignment_store is not None:
+            assignment_id = self._assignment_store.record(assignment).assignment_id
 
         # Generate explanation
         explanation = (
@@ -154,4 +171,5 @@ class TaskRouter:
             preferred_capabilities_matched=preferred_matched,
             excluded_nodes=excluded_nodes,
             explanation=explanation,
+            assignment_id=assignment_id,
         )

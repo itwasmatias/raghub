@@ -13,6 +13,7 @@ from federation import (
     TaskRequest,
     TaskRouter,
 )
+from federation.assignment_registry import DurableAssignmentRegistry
 
 
 @pytest.fixture
@@ -527,6 +528,47 @@ def test_task_router_multiple_preferred_matches(router, registry, storage_node):
         NodeCapability("persistent_storage") in decision.preferred_capabilities_matched
     )
     assert NodeCapability("gpu_available") not in decision.preferred_capabilities_matched
+
+
+def test_router_records_successful_assignment_in_authoritative_store(
+    tmp_path,
+    registry,
+    python_node,
+):
+    registry.register(python_node)
+    assignments = DurableAssignmentRegistry(
+        tmp_path / "assignments.jsonl",
+        coordinator_node_id="coordinator-1",
+        integrity_key=b"task-router-authoritative-store-test-key",
+    )
+    router = TaskRouter(registry, assignment_store=assignments)
+    request = TaskRequest(
+        task_id="task-authoritative",
+        mission_id="mission-authoritative",
+        required_capabilities={NodeCapability("python_execution")},
+    )
+
+    decision = router.route(request)
+
+    assert decision.assignment_id is not None
+    resolved = assignments.resolve(decision.assignment_id)
+    assert resolved.task_id == request.task_id
+    assert resolved.mission_id == request.mission_id
+    assert resolved.worker_node_id == python_node.node_id
+
+
+def test_router_does_not_record_failed_routing(tmp_path, registry):
+    assignments = DurableAssignmentRegistry(
+        tmp_path / "assignments.jsonl",
+        coordinator_node_id="coordinator-1",
+        integrity_key=b"task-router-authoritative-store-test-key",
+    )
+    decision = TaskRouter(registry, assignment_store=assignments).route(
+        TaskRequest(task_id="task-none", mission_id="mission-none"),
+    )
+
+    assert decision.assignment_id is None
+    assert not (tmp_path / "assignments.jsonl").exists()
 
 
 def test_task_router_ranking_prefers_more_preferred_matches(router, registry):
