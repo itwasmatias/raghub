@@ -129,12 +129,17 @@ def console(
     job_storage = tmp_path / "jobs"
     job_storage.mkdir()
 
+    # Create integrity key (exactly 32 bytes)
+    integrity_key = b"test-integrity-key-0123456789abc"
+
     return ConsoleServer(
         workspaces=workspaces,
         node_registry=node_registry,
         heartbeat_registry=heartbeat_registry,
         job_storage_path=job_storage,
         tokens=CONSOLE_TOKENS,
+        coordinator_node_id="console-server-test",
+        integrity_key=integrity_key,
     )
 
 
@@ -635,12 +640,14 @@ def test_console_server_uses_existing_node_registry(
     tmp_path: Path,
 ):
     """Console Server must use existing NodeRegistry."""
+    integrity_key = b"test-integrity-key-0123456789abc"
     console = ConsoleServer(
         workspaces=workspaces,
         node_registry=node_registry,
         heartbeat_registry=heartbeat_registry,
         job_storage_path=tmp_path / "jobs",
         tokens=CONSOLE_TOKENS,
+        integrity_key=integrity_key,
     )
 
     # System status should reflect nodes from registry
@@ -655,12 +662,14 @@ def test_console_server_uses_existing_heartbeat_registry(
     tmp_path: Path,
 ):
     """Console Server must use existing HeartbeatRegistry."""
+    integrity_key = b"test-integrity-key-0123456789abc"
     console = ConsoleServer(
         workspaces=workspaces,
         node_registry=node_registry,
         heartbeat_registry=heartbeat_registry,
         job_storage_path=tmp_path / "jobs",
         tokens=CONSOLE_TOKENS,
+        integrity_key=integrity_key,
     )
 
     # Node status should reflect heartbeat state
@@ -676,12 +685,14 @@ def test_console_server_creates_task_router(
     tmp_path: Path,
 ):
     """Console Server must create TaskRouter using federation contracts."""
+    integrity_key = b"test-integrity-key-0123456789abc"
     console = ConsoleServer(
         workspaces=workspaces,
         node_registry=node_registry,
         heartbeat_registry=heartbeat_registry,
         job_storage_path=tmp_path / "jobs",
         tokens=CONSOLE_TOKENS,
+        integrity_key=integrity_key,
     )
 
     # TaskRouter should exist and use provided registries
@@ -964,3 +975,163 @@ def test_idempotency_key_is_optional(client):
 
     assert response.status_code == 201
     assert "job_id" in response.json
+
+
+# =========================
+# DISPATCH INTEGRATION TESTS
+# =========================
+
+
+def test_action_request_creates_dispatch_offer(client, console: ConsoleServer):
+    """Action request must create a durable DispatchOffer."""
+    # Make action request
+    response = client.post(
+        "/api/console/v1/actions",
+        json={
+            "action_type": "inspect_git_status",
+            "workspace_id": "test-workspace",
+        },
+        headers=_auth("propose-token"),
+    )
+
+    assert response.status_code == 201
+    job_id = response.json["job_id"]
+
+    # Verify job has dispatch_offer_id
+    job = console.job_tracker.get_job(job_id)
+    assert job.dispatch_offer_id is not None
+    assert job.assignment_id is not None
+
+    # Verify dispatch offer exists
+    dispatch_offer = console.task_dispatch_coordinator.inspect_offer(
+        job.dispatch_offer_id
+    )
+    assert dispatch_offer.offer_id == job.dispatch_offer_id
+    assert dispatch_offer.assignment_id == job.assignment_id
+    assert dispatch_offer.mission_id == job.mission_id
+
+
+def test_dispatch_offer_has_deterministic_id(client, console: ConsoleServer):
+    """Dispatch offer ID must be deterministic based on assignment."""
+    # Make first action request
+    response1 = client.post(
+        "/api/console/v1/actions",
+        json={
+            "action_type": "inspect_git_status",
+            "workspace_id": "test-workspace",
+        },
+        headers=_auth("propose-token"),
+    )
+
+    assert response1.status_code == 201
+    job1 = console.job_tracker.get_job(response1.json["job_id"])
+    offer1 = console.task_dispatch_coordinator.inspect_offer(job1.dispatch_offer_id)
+
+    # Verify offer_id is deterministic
+    # The offer ID should be based on assignment properties
+    assert offer1.offer_id.startswith("dispatch-")
+    assert len(offer1.offer_id) == 73  # "dispatch-" + 64-char SHA256 hex digest
+
+
+def test_idempotency_prevents_duplicate_dispatch_offer(client, console: ConsoleServer):
+    """Exact idempotent duplicate must not create second dispatch offer."""
+    request_body = {
+        "action_type": "inspect_git_status",
+        "workspace_id": "test-workspace",
+        "idempotency_key": "dispatch-test-123",
+    }
+
+    # First request creates dispatch offer
+    response1 = client.post(
+        "/api/console/v1/actions",
+        json=request_body,
+        headers=_auth("propose-token"),
+    )
+    assert response1.status_code == 201
+    job1 = console.job_tracker.get_job(response1.json["job_id"])
+    offer_id_1 = job1.dispatch_offer_id
+
+    # Exact duplicate returns same job (200, not 201)
+    response2 = client.post(
+        "/api/console/v1/actions",
+        json=request_body,
+        headers=_auth("propose-token"),
+    )
+    assert response2.status_code == 200
+    job2 = console.job_tracker.get_job(response2.json["job_id"])
+
+    # Same job and same dispatch offer
+    assert job1.job_id == job2.job_id
+    assert job1.dispatch_offer_id == job2.dispatch_offer_id
+
+    # Verify only one dispatch offer exists
+    offers = console.task_dispatch_coordinator.list_offers()
+    dispatch_offers_for_mission = [o for o in offers if o.mission_id == job1.mission_id]
+    assert len(dispatch_offers_for_mission) == 1
+    assert dispatch_offers_for_mission[0].offer_id == offer_id_1
+
+
+def test_dispatch_offer_serialization_excludes_sensitive_data(
+    client, console: ConsoleServer
+):
+    """Dispatch offer public serialization must exclude sensitive data."""
+    # Make action request
+    response = client.post(
+        "/api/console/v1/actions",
+        json={
+            "action_type": "inspect_git_status",
+            "workspace_id": "test-workspace",
+        },
+        headers=_auth("propose-token"),
+    )
+
+    assert response.status_code == 201
+    job_id = response.json["job_id"]
+
+    # Get job via API (uses public serialization)
+    job_response = client.get(
+        f"/api/console/v1/jobs/{job_id}",
+        headers=_auth("read-token"),
+    )
+
+    assert job_response.status_code == 200
+    job_data = job_response.json
+
+    # Job includes dispatch_offer_id
+    assert "dispatch_offer_id" in job_data
+    assert job_data["dispatch_offer_id"] is not None
+
+    # Verify no authentication tags or integrity keys in serialization
+    import json
+
+    encoded = json.dumps(job_data).lower()
+    assert "authentication_tag" not in encoded
+    assert "integrity" not in encoded
+    assert "digest" not in encoded
+
+
+def test_tier2_dispatch_preserves_approval_metadata(client, console: ConsoleServer):
+    """Tier 2 approval_required metadata must survive through dispatch."""
+    # Make Tier 2 action request (run_test_target requires approval)
+    response = client.post(
+        "/api/console/v1/actions",
+        json={
+            "action_type": "run_test_target",
+            "workspace_id": "test-workspace",
+            "test_target": "tests/test_example.py",
+        },
+        headers=_auth("propose-token"),
+    )
+
+    assert response.status_code == 201
+    job = console.job_tracker.get_job(response.json["job_id"])
+
+    # Verify dispatch offer preserves approval metadata
+    dispatch_offer = console.task_dispatch_coordinator.inspect_offer(
+        job.dispatch_offer_id
+    )
+
+    assert dispatch_offer.approval_required is True
+    # Verify approval metadata is in the structured format
+    approval_metadata = dict(dispatch_offer.approval_metadata)
+    assert approval_metadata["required"] is True

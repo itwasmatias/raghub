@@ -5,14 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
 from flask import Blueprint, g, request
 
+from federation.assignment_registry import DurableAssignmentRegistry
 from federation.heartbeat_registry import HeartbeatRegistry
 from federation.registry import NodeRegistry
+from federation.task_dispatcher import TaskDispatchCoordinator
 from federation.task_request import TaskRequest
 from federation.task_router import TaskRouter
 from tools.ai_controller.operations_api.auth import Principal, authenticate
@@ -47,6 +49,8 @@ class ConsoleServer:
         heartbeat_registry: HeartbeatRegistry,
         job_storage_path: Path,
         tokens: dict[str, dict[str, Any]],
+        coordinator_node_id: str = "console-server-v0.1",
+        integrity_key: bytes,
         server_id: str = "console-server-v0.1",
         now: Callable[[], datetime] = _utc_now,
     ):
@@ -59,6 +63,8 @@ class ConsoleServer:
             heartbeat_registry: Heartbeat registry for liveness
             job_storage_path: Path for job storage
             tokens: Authentication tokens
+            coordinator_node_id: Node ID for this coordinator
+            integrity_key: Integrity key for dispatch authentication (32 bytes)
             server_id: Server identifier
             now: Clock function for testing
         """
@@ -81,13 +87,35 @@ class ConsoleServer:
         self.job_tracker = JobTracker(job_storage_path)
         self.tokens = tokens
         self.server_id = server_id
+        self.coordinator_node_id = coordinator_node_id
+        self.integrity_key = integrity_key
         self.now = now
         self.action_catalog = ActionCatalog()
+
+        # Create durable assignment registry
+        assignment_store_path = job_storage_path.parent / "assignments.jsonl"
+        self.assignment_store = DurableAssignmentRegistry(
+            assignment_store_path,
+            coordinator_node_id=coordinator_node_id,
+            integrity_key=integrity_key,
+        )
+
+        # Create task dispatch coordinator
+        dispatch_store_path = job_storage_path.parent / "dispatch.jsonl"
+        self.task_dispatch_coordinator = TaskDispatchCoordinator(
+            coordinator_node_id,
+            assignment_store=self.assignment_store,
+            dispatch_store_path=dispatch_store_path,
+            integrity_key=integrity_key,
+            heartbeat_registry=heartbeat_registry,
+            clock=now,
+        )
 
         # Create task router using existing federation contracts
         self.task_router = TaskRouter(
             node_registry,
             heartbeat_registry=heartbeat_registry,
+            assignment_store=self.assignment_store,
         )
 
     def system_status(self) -> dict[str, Any]:
@@ -302,7 +330,7 @@ def create_console_blueprint(console: ConsoleServer) -> Blueprint:
             existing_job = console.job_tracker.find_by_idempotency_key(idempotency_key)
             if existing_job:
                 if existing_job.request_fingerprint == request_fingerprint:
-                    # Exact duplicate - return existing job
+                    # Exact duplicate - return existing job with routing_outcome
                     return {
                         "job_id": existing_job.job_id,
                         "action_id": existing_job.action_id,
@@ -314,6 +342,7 @@ def create_console_blueprint(console: ConsoleServer) -> Blueprint:
                         "approval_required": spec.approval_required,
                         "authorization_level": spec.authorization_level.value,
                         "target_node_id": existing_job.target_node_id,
+                        "routing_outcome": "success" if existing_job.assignment_id else "no_eligible_nodes",
                     }, 200
                 else:
                     # Same key, different request - reject
@@ -344,7 +373,20 @@ def create_console_blueprint(console: ConsoleServer) -> Blueprint:
         # Route through existing TaskRouter
         routing_decision = console.task_router.route(task_request)
 
-        # Create job with routing information
+        # Create dispatch offer for successful routing
+        dispatch_offer_id = None
+        if routing_decision.assignment_id is not None:
+            # Calculate expiration (default: 5 minutes from now)
+            expires_at = console.now() + timedelta(minutes=5)
+
+            dispatch_offer = console.task_dispatch_coordinator.create_offer(
+                assignment_id=routing_decision.assignment_id,
+                actor_node_id=console.coordinator_node_id,
+                expires_at=expires_at,
+            )
+            dispatch_offer_id = dispatch_offer.offer_id
+
+        # Create job with routing and dispatch information
         job = console.job_tracker.create_job(
             action_type=action_type.value,
             workspace_id=workspace_id,
@@ -355,6 +397,8 @@ def create_console_blueprint(console: ConsoleServer) -> Blueprint:
                 if routing_decision.assignment
                 else None
             ),
+            assignment_id=routing_decision.assignment_id,
+            dispatch_offer_id=dispatch_offer_id,
             idempotency_key=idempotency_key,
             request_fingerprint=request_fingerprint,
         )
