@@ -55,6 +55,8 @@ class JobRecord:
     created_at: str
     created_by: str
     status: JobStatus
+    assignment_id: str | None = None
+    dispatch_offer_id: str | None = None
     idempotency_key: str | None = None
     request_fingerprint: str | None = None
     started_at: str | None = None
@@ -78,6 +80,8 @@ class JobRecord:
             "created_at": self.created_at,
             "created_by": self.created_by,
             "status": self.status.value,
+            "assignment_id": self.assignment_id,
+            "dispatch_offer_id": self.dispatch_offer_id,
             "idempotency_key": self.idempotency_key,
             "request_fingerprint": self.request_fingerprint,
             "started_at": self.started_at,
@@ -119,6 +123,8 @@ class JobTracker:
         *,
         target_node_id: str | None = None,
         mission_id: str | None = None,
+        assignment_id: str | None = None,
+        dispatch_offer_id: str | None = None,
         idempotency_key: str | None = None,
         request_fingerprint: str | None = None,
     ) -> JobRecord:
@@ -131,6 +137,8 @@ class JobTracker:
             created_by: Principal who created the job
             target_node_id: Optional target node
             mission_id: Optional mission identifier
+            assignment_id: Optional routing assignment ID
+            dispatch_offer_id: Optional dispatch offer ID
             idempotency_key: Optional idempotency key for deduplication
             request_fingerprint: Optional fingerprint of request parameters
 
@@ -151,6 +159,8 @@ class JobTracker:
             created_at=now,
             created_by=created_by,
             status=JobStatus.PENDING,
+            assignment_id=assignment_id,
+            dispatch_offer_id=dispatch_offer_id,
             idempotency_key=idempotency_key,
             request_fingerprint=request_fingerprint,
         )
@@ -186,6 +196,8 @@ class JobTracker:
             created_at=data["created_at"],
             created_by=data["created_by"],
             status=JobStatus(data["status"]),
+            assignment_id=data.get("assignment_id"),
+            dispatch_offer_id=data.get("dispatch_offer_id"),
             idempotency_key=data.get("idempotency_key"),
             request_fingerprint=data.get("request_fingerprint"),
             started_at=data.get("started_at"),
@@ -319,6 +331,8 @@ class JobTracker:
                         created_at=data["created_at"],
                         created_by=data["created_by"],
                         status=JobStatus(data["status"]),
+                        assignment_id=data.get("assignment_id"),
+                        dispatch_offer_id=data.get("dispatch_offer_id"),
                         idempotency_key=data.get("idempotency_key"),
                         request_fingerprint=data.get("request_fingerprint"),
                         started_at=data.get("started_at"),
