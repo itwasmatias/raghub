@@ -128,6 +128,44 @@ class ExecutionPreference:
         return matches[0]
 
 
+@dataclass(frozen=True, slots=True)
+class BudgetRoutingEvidence:
+    """Immutable policy and decision evidence attached to one routing result."""
+
+    policy: BudgetPolicy
+    preference: ExecutionPreference
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class BudgetRoutingGovernance:
+    """Immutable metadata/policy composition consumed by TaskRouter."""
+
+    metadata: tuple[tuple[str, WorkerProviderMetadata], ...]
+    policy: BudgetPolicy
+
+    def __init__(self, metadata_by_node, policy):
+        if not isinstance(metadata_by_node, dict):
+            raise TypeError("metadata_by_node must be a dict")
+        if type(policy) is not BudgetPolicy:
+            raise TypeError("policy must be a BudgetPolicy")
+        items = []
+        for node_id, value in metadata_by_node.items():
+            node_id = _identifier(node_id, "metadata node_id")
+            if type(value) is not WorkerProviderMetadata:
+                raise TypeError("metadata values must be WorkerProviderMetadata")
+            if value.node_id != node_id:
+                raise ValueError("metadata identity does not match mapping key")
+            items.append((node_id, value))
+        object.__setattr__(self, "metadata", tuple(sorted(items)))
+        object.__setattr__(self, "policy", policy)
+
+    def evaluate(self, task_request, nodes):
+        preference = WorkerBudgetGovernor().evaluate(
+            task_request, nodes, dict(self.metadata), self.policy
+        )
+        return BudgetRoutingEvidence(self.policy, preference)
+
+
 class WorkerBudgetGovernor:
     """Evaluate policy after core node status, capability, and authority checks."""
 

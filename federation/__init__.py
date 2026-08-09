@@ -101,6 +101,8 @@ from federation.worker_execution import (
 from federation.worker_governance import (
     BudgetDecision,
     BudgetPolicy,
+    BudgetRoutingEvidence,
+    BudgetRoutingGovernance,
     ExecutionLocality,
     ExecutionPreference,
     GovernedWorker,
@@ -198,6 +200,8 @@ __all__ = [
     "WorkerExecutionStatus",
     "BudgetDecision",
     "BudgetPolicy",
+    "BudgetRoutingEvidence",
+    "BudgetRoutingGovernance",
     "ExecutionLocality",
     "ExecutionPreference",
     "GovernedWorker",

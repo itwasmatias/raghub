@@ -12,6 +12,7 @@ from federation.task_assignment import TaskAssignment
 from federation.task_request import TaskRequest
 from federation.assignment_registry import DurableAssignmentRegistry
 from federation.heartbeat_registry import HeartbeatRegistry
+from federation.worker_governance import BudgetRoutingGovernance
 
 
 class TaskRouter:
@@ -28,6 +29,7 @@ class TaskRouter:
         *,
         heartbeat_registry: HeartbeatRegistry,
         assignment_store: DurableAssignmentRegistry | None = None,
+        budget_governance: BudgetRoutingGovernance | None = None,
     ):
         """
         Initialize the task router.
@@ -50,9 +52,16 @@ class TaskRouter:
             raise ValueError(
                 "heartbeat_registry must be authoritative for registry",
             )
+        if budget_governance is not None and type(
+            budget_governance
+        ) is not BudgetRoutingGovernance:
+            raise TypeError(
+                "budget_governance must be BudgetRoutingGovernance or None"
+            )
         self._registry = registry
         self._assignment_store = assignment_store
         self._heartbeat_registry = heartbeat_registry
+        self._budget_governance = budget_governance
 
     def route(self, task_request: TaskRequest) -> RoutingDecision:
         """
@@ -77,6 +86,19 @@ class TaskRouter:
         all_nodes = sorted(
             self._registry.list_nodes(),
             key=lambda node: node.node_id,
+        )
+        budget_evidence = (
+            None
+            if self._budget_governance is None
+            else self._budget_governance.evaluate(task_request, all_nodes)
+        )
+        budget_decisions = (
+            {}
+            if budget_evidence is None
+            else {
+                item.node_id: item
+                for item in budget_evidence.preference.decisions
+            }
         )
 
         # Track excluded nodes for explanation
@@ -130,6 +152,20 @@ class TaskRouter:
                 )
                 continue
 
+            if budget_evidence is not None:
+                governed = budget_decisions[node.node_id]
+                if not governed.eligible:
+                    excluded_nodes.append(
+                        ExcludedNode(
+                            node_id=node.node_id,
+                            reason=(
+                                "Budget governance excluded worker: "
+                                + ", ".join(governed.reasons)
+                            ),
+                        ),
+                    )
+                    continue
+
             eligible_nodes.append(node)
 
         # If no eligible nodes, return NO_ELIGIBLE_NODES outcome
@@ -145,20 +181,30 @@ class TaskRouter:
                     f"No eligible nodes found for task {task_request.task_id}. "
                     f"{len(excluded_nodes)} nodes were excluded."
                 ),
+                budget_evidence=budget_evidence,
             )
 
         # Rank deterministically, then revalidate the selected worker immediately
         # before creating an assignment.
-        ranked_nodes = sorted(
-            eligible_nodes,
-            key=lambda node: (
-                -sum(
-                    node.has_capability(capability)
-                    for capability in task_request.preferred_capabilities
+        if budget_evidence is None:
+            ranked_nodes = sorted(
+                eligible_nodes,
+                key=lambda node: (
+                    -sum(
+                        node.has_capability(capability)
+                        for capability in task_request.preferred_capabilities
+                    ),
+                    node.node_id,
                 ),
-                node.node_id,
-            ),
-        )
+            )
+        else:
+            rank = {
+                item.node_id: index
+                for index, item in enumerate(
+                    budget_evidence.preference.eligible_workers
+                )
+            }
+            ranked_nodes = sorted(eligible_nodes, key=lambda node: rank[node.node_id])
         selected_node = None
         for candidate in ranked_nodes:
             lease = self._heartbeat_registry.inspect(candidate.node_id)
@@ -185,6 +231,7 @@ class TaskRouter:
                     f"No eligible nodes found for task {task_request.task_id}. "
                     f"{len(excluded_nodes)} nodes were excluded."
                 ),
+                budget_evidence=budget_evidence,
             )
 
         # Calculate matched capabilities
@@ -220,4 +267,5 @@ class TaskRouter:
             excluded_nodes=excluded_nodes,
             explanation=explanation,
             assignment_id=assignment_id,
+            budget_evidence=budget_evidence,
         )
