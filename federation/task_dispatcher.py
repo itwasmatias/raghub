@@ -682,12 +682,30 @@ class TaskDispatchCoordinator:
             or not isinstance(record["approval_metadata"], dict)
         ):
             raise DispatchCorruptionError("dispatch evidence has invalid field types")
-        if set(record["authorization_metadata"]) != {"level"} or set(
-            record["approval_metadata"],
-        ) != {"required"}:
+        authorization_metadata = record["authorization_metadata"]
+        approval_metadata = record["approval_metadata"]
+
+        if set(authorization_metadata) not in (
+            {"level"},
+            {"level", "execution_fingerprint"},
+        ) or set(approval_metadata) != {"required"}:
             raise DispatchCorruptionError("dispatch metadata schema is invalid")
-        if not isinstance(record["authorization_metadata"]["level"], str) or (
-            not isinstance(record["approval_metadata"]["required"], bool)
+
+        if not isinstance(authorization_metadata["level"], str) or (
+            not isinstance(approval_metadata["required"], bool)
+        ):
+            raise DispatchCorruptionError("dispatch metadata types are invalid")
+
+        execution_fingerprint = authorization_metadata.get(
+            "execution_fingerprint"
+        )
+        if execution_fingerprint is not None and (
+            not isinstance(execution_fingerprint, str)
+            or len(execution_fingerprint) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in execution_fingerprint
+            )
         ):
             raise DispatchCorruptionError("dispatch metadata types are invalid")
         if record["predecessor_digest"] != predecessor:

@@ -4,6 +4,7 @@ from .app import ConsoleServer, create_console_blueprint
 from .actions import ActionCatalog, ActionType
 from .jobs import JobStatus, JobTracker
 from .workspaces import WorkspaceRegistry
+from .runtime import ConsoleActionExecutionRuntime
 
 __all__ = [
     "ConsoleServer",
@@ -13,4 +14,5 @@ __all__ = [
     "JobStatus",
     "JobTracker",
     "WorkspaceRegistry",
+    "ConsoleActionExecutionRuntime",
 ]

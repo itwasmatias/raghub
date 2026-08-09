@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -35,16 +37,10 @@ class ActionSpec:
     """
     Specification for a governed action.
 
-    Approval Workflow (v0.1 Limitation):
-        Actions with approval_required=True are classified as "Tier 2" and
-        create jobs in PENDING state. The approval_required flag is exposed
-        via the API response, but actual approval enforcement is OUT OF SCOPE
-        for Console Server v0.1.
-
-        Jobs remain in PENDING state until a hypothetical external approval
-        workflow (not implemented) advances them. This is an architectural
-        boundary: Console Server handles action requests and routing, but
-        does NOT implement approval state transitions or execution runtime.
+    Runtime boundary:
+        Console Action Execution Runtime v0.1 executes only the Tier-1
+        ``inspect_git_status`` action. Approval-required actions remain PENDING;
+        this runtime does not invent or advance approval evidence.
     """
 
     action_type: ActionType
@@ -225,3 +221,32 @@ class ActionCatalog:
             )
 
         return requested_timeout
+
+
+def execution_fingerprint(
+    *,
+    action_type: ActionType | str,
+    workspace_id: str,
+    timeout_seconds: int,
+    immutable_parameters: dict | None = None,
+) -> str:
+    """Return the canonical identity of one governed execution request."""
+    action = ActionType(action_type).value
+    if not isinstance(workspace_id, str) or not workspace_id.strip():
+        raise ValueError("workspace_id must be a non-empty string")
+    if not isinstance(timeout_seconds, int) or isinstance(timeout_seconds, bool):
+        raise TypeError("timeout_seconds must be an integer")
+    parameters = immutable_parameters or {}
+    if not isinstance(parameters, dict):
+        raise TypeError("immutable_parameters must be a dictionary")
+    payload = {
+        "schema_version": 1,
+        "action_type": action,
+        "workspace_id": workspace_id,
+        "timeout_seconds": timeout_seconds,
+        "immutable_parameters": parameters,
+    }
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()

@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -11,15 +15,20 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import fcntl
+
+
+class JobCorruptionError(ValueError):
+    """Raised when durable job evidence cannot be decoded safely."""
+
 
 class JobStatus(str, Enum):
     """
     Job lifecycle states.
 
-    Note: For approval-required actions (Tier 2), jobs remain in PENDING until
-    a hypothetical external approval workflow advances them. Approval enforcement
-    is out of scope for v0.1 - the Console Server creates jobs and performs
-    routing but does not implement execution runtime or approval state transitions.
+    Tier-1 ``inspect_git_status`` jobs may execute through the governed runtime.
+    Approval-required actions remain PENDING because approval state transitions
+    are intentionally outside Console Action Execution Runtime v0.1.
     """
 
     PENDING = "pending"  # Created, not yet started (or awaiting approval for Tier 2)
@@ -28,6 +37,7 @@ class JobStatus(str, Enum):
     FAILED = "failed"  # Failed with error
     TIMEOUT = "timeout"  # Exceeded timeout
     CANCELLED = "cancelled"  # Cancelled before completion
+    RECONCILIATION_REQUIRED = "reconciliation_required"  # Outcome is ambiguous
 
 
 _TERMINAL_STATES = {
@@ -35,6 +45,7 @@ _TERMINAL_STATES = {
     JobStatus.FAILED,
     JobStatus.TIMEOUT,
     JobStatus.CANCELLED,
+    JobStatus.RECONCILIATION_REQUIRED,
 }
 
 
@@ -55,10 +66,13 @@ class JobRecord:
     created_at: str
     created_by: str
     status: JobStatus
+    task_id: str | None = None
+    timeout_seconds: int | None = None
     assignment_id: str | None = None
     dispatch_offer_id: str | None = None
     idempotency_key: str | None = None
     request_fingerprint: str | None = None
+    execution_fingerprint: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
     duration_ms: int | None = None
@@ -66,6 +80,8 @@ class JobRecord:
     stdout: str | None = None
     stderr: str | None = None
     truncated: bool = False
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
     failure_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -77,6 +93,8 @@ class JobRecord:
             "workspace_id": self.workspace_id,
             "target_node_id": self.target_node_id,
             "mission_id": self.mission_id,
+            "task_id": self.task_id,
+            "timeout_seconds": self.timeout_seconds,
             "created_at": self.created_at,
             "created_by": self.created_by,
             "status": self.status.value,
@@ -84,6 +102,7 @@ class JobRecord:
             "dispatch_offer_id": self.dispatch_offer_id,
             "idempotency_key": self.idempotency_key,
             "request_fingerprint": self.request_fingerprint,
+            "execution_fingerprint": self.execution_fingerprint,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "duration_ms": self.duration_ms,
@@ -91,6 +110,8 @@ class JobRecord:
             "stdout": self.stdout,
             "stderr": self.stderr,
             "truncated": self.truncated,
+            "stdout_truncated": self.stdout_truncated,
+            "stderr_truncated": self.stderr_truncated,
             "failure_reason": self.failure_reason,
         }
 
@@ -114,6 +135,9 @@ class JobTracker:
 
         self._storage_path = storage_path
         self._storage_path.mkdir(parents=True, exist_ok=True)
+        self._thread_lock = threading.RLock()
+        self._transaction_state = threading.local()
+        self._lock_path = self._storage_path / ".jobs.lock"
 
     def create_job(
         self,
@@ -123,10 +147,13 @@ class JobTracker:
         *,
         target_node_id: str | None = None,
         mission_id: str | None = None,
+        task_id: str | None = None,
+        timeout_seconds: int | None = None,
         assignment_id: str | None = None,
         dispatch_offer_id: str | None = None,
         idempotency_key: str | None = None,
         request_fingerprint: str | None = None,
+        execution_fingerprint: str | None = None,
     ) -> JobRecord:
         """
         Create a new job record.
@@ -145,28 +172,30 @@ class JobTracker:
         Returns:
             JobRecord for the created job
         """
-        job_id = f"job-{uuid4().hex}"
-        action_id = f"action-{uuid4().hex}"
-        now = datetime.now(timezone.utc).isoformat()
-
-        job = JobRecord(
-            job_id=job_id,
-            action_id=action_id,
-            action_type=action_type,
-            workspace_id=workspace_id,
-            target_node_id=target_node_id,
-            mission_id=mission_id,
-            created_at=now,
-            created_by=created_by,
-            status=JobStatus.PENDING,
-            assignment_id=assignment_id,
-            dispatch_offer_id=dispatch_offer_id,
-            idempotency_key=idempotency_key,
-            request_fingerprint=request_fingerprint,
-        )
-
-        self._save(job)
-        return job
+        with self.transaction():
+            job_id = f"job-{uuid4().hex}"
+            action_id = f"action-{uuid4().hex}"
+            now = datetime.now(timezone.utc).isoformat()
+            job = JobRecord(
+                job_id=job_id,
+                action_id=action_id,
+                action_type=action_type,
+                workspace_id=workspace_id,
+                target_node_id=target_node_id,
+                mission_id=mission_id,
+                task_id=task_id,
+                timeout_seconds=timeout_seconds,
+                created_at=now,
+                created_by=created_by,
+                status=JobStatus.PENDING,
+                assignment_id=assignment_id,
+                dispatch_offer_id=dispatch_offer_id,
+                idempotency_key=idempotency_key,
+                request_fingerprint=request_fingerprint,
+                execution_fingerprint=execution_fingerprint,
+            )
+            self._save_unlocked(job)
+            return job
 
     def get_job(self, job_id: str) -> JobRecord:
         """
@@ -181,11 +210,20 @@ class JobTracker:
         Raises:
             ValueError: If job not found
         """
-        job_path = self._storage_path / f"{job_id}.json"
-        if not job_path.exists():
-            raise ValueError(f"Job not found: {job_id}")
+        with self.transaction():
+            job_path = self._storage_path / f"{job_id}.json"
+            if not job_path.exists():
+                raise ValueError(f"Job not found: {job_id}")
+            try:
+                data = json.loads(job_path.read_text(encoding="utf-8"))
+                return self._record_from_data(data)
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                raise JobCorruptionError(
+                    f"Authoritative job record is corrupt: {job_id}"
+                ) from exc
 
-        data = json.loads(job_path.read_text(encoding="utf-8"))
+    @staticmethod
+    def _record_from_data(data: dict[str, Any]) -> JobRecord:
         return JobRecord(
             job_id=data["job_id"],
             action_id=data["action_id"],
@@ -193,6 +231,8 @@ class JobTracker:
             workspace_id=data["workspace_id"],
             target_node_id=data.get("target_node_id"),
             mission_id=data.get("mission_id"),
+            task_id=data.get("task_id"),
+            timeout_seconds=data.get("timeout_seconds"),
             created_at=data["created_at"],
             created_by=data["created_by"],
             status=JobStatus(data["status"]),
@@ -200,6 +240,7 @@ class JobTracker:
             dispatch_offer_id=data.get("dispatch_offer_id"),
             idempotency_key=data.get("idempotency_key"),
             request_fingerprint=data.get("request_fingerprint"),
+            execution_fingerprint=data.get("execution_fingerprint"),
             started_at=data.get("started_at"),
             finished_at=data.get("finished_at"),
             duration_ms=data.get("duration_ms"),
@@ -207,6 +248,12 @@ class JobTracker:
             stdout=data.get("stdout"),
             stderr=data.get("stderr"),
             truncated=data.get("truncated", False),
+            stdout_truncated=data.get(
+                "stdout_truncated", data.get("truncated", False)
+            ),
+            stderr_truncated=data.get(
+                "stderr_truncated", data.get("truncated", False)
+            ),
             failure_reason=data.get("failure_reason"),
         )
 
@@ -222,6 +269,8 @@ class JobTracker:
         stdout: str | None = None,
         stderr: str | None = None,
         truncated: bool = False,
+        stdout_truncated: bool = False,
+        stderr_truncated: bool = False,
         failure_reason: str | None = None,
     ) -> JobRecord:
         """
@@ -245,25 +294,29 @@ class JobTracker:
         Raises:
             ValueError: If job is already in terminal state
         """
-        job = self.get_job(job_id)
-
-        # Enforce terminal state finality
-        if job.status in _TERMINAL_STATES:
-            raise ValueError(
-                f"Job {job_id} is already in terminal state {job.status.value}"
-            )
-
-        # Create updated job
-        updated = JobRecord(
+        with self.transaction():
+            job = self.get_job(job_id)
+            if job.status in _TERMINAL_STATES:
+                raise ValueError(
+                    f"Job {job_id} is already in terminal state {job.status.value}"
+                )
+            updated = JobRecord(
             job_id=job.job_id,
             action_id=job.action_id,
             action_type=job.action_type,
             workspace_id=job.workspace_id,
             target_node_id=job.target_node_id,
             mission_id=job.mission_id,
+            task_id=job.task_id,
+            timeout_seconds=job.timeout_seconds,
             created_at=job.created_at,
             created_by=job.created_by,
             status=new_status,
+            assignment_id=job.assignment_id,
+            dispatch_offer_id=job.dispatch_offer_id,
+            idempotency_key=job.idempotency_key,
+            request_fingerprint=job.request_fingerprint,
+            execution_fingerprint=job.execution_fingerprint,
             started_at=started_at or job.started_at,
             finished_at=finished_at or job.finished_at,
             duration_ms=duration_ms if duration_ms is not None else job.duration_ms,
@@ -271,11 +324,12 @@ class JobTracker:
             stdout=stdout if stdout is not None else job.stdout,
             stderr=stderr if stderr is not None else job.stderr,
             truncated=truncated or job.truncated,
+            stdout_truncated=stdout_truncated or job.stdout_truncated,
+            stderr_truncated=stderr_truncated or job.stderr_truncated,
             failure_reason=failure_reason or job.failure_reason,
-        )
-
-        self._save(updated)
-        return updated
+            )
+            self._save_unlocked(updated)
+            return updated
 
     def list_jobs(self, *, limit: int = 100) -> list[JobRecord]:
         """
@@ -287,21 +341,13 @@ class JobTracker:
         Returns:
             List of JobRecords, most recent first
         """
-        job_files = sorted(
-            self._storage_path.glob("job-*.json"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-
-        jobs = []
-        for job_file in job_files[:limit]:
-            try:
-                jobs.append(self.get_job(job_file.stem))
-            except (ValueError, json.JSONDecodeError, KeyError):
-                # Skip corrupted job files
-                continue
-
-        return jobs
+        with self.transaction():
+            job_files = sorted(
+                self._storage_path.glob("job-*.json"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            return [self.get_job(job_file.stem) for job_file in job_files[:limit]]
 
     def find_by_idempotency_key(self, idempotency_key: str) -> JobRecord | None:
         """
@@ -316,44 +362,85 @@ class JobTracker:
         if not idempotency_key:
             return None
 
-        # Linear scan - acceptable for small job counts, could be indexed later
-        for job_file in self._storage_path.glob("job-*.json"):
-            try:
-                data = json.loads(job_file.read_text(encoding="utf-8"))
-                if data.get("idempotency_key") == idempotency_key:
-                    return JobRecord(
-                        job_id=data["job_id"],
-                        action_id=data["action_id"],
-                        action_type=data["action_type"],
-                        workspace_id=data["workspace_id"],
-                        target_node_id=data.get("target_node_id"),
-                        mission_id=data.get("mission_id"),
-                        created_at=data["created_at"],
-                        created_by=data["created_by"],
-                        status=JobStatus(data["status"]),
-                        assignment_id=data.get("assignment_id"),
-                        dispatch_offer_id=data.get("dispatch_offer_id"),
-                        idempotency_key=data.get("idempotency_key"),
-                        request_fingerprint=data.get("request_fingerprint"),
-                        started_at=data.get("started_at"),
-                        finished_at=data.get("finished_at"),
-                        duration_ms=data.get("duration_ms"),
-                        exit_code=data.get("exit_code"),
-                        stdout=data.get("stdout"),
-                        stderr=data.get("stderr"),
-                        truncated=data.get("truncated", False),
-                        failure_reason=data.get("failure_reason"),
-                    )
-            except (json.JSONDecodeError, KeyError, ValueError):
-                # Skip corrupted job files
-                continue
-
-        return None
+        with self.transaction():
+            for job_file in self._storage_path.glob("job-*.json"):
+                try:
+                    data = json.loads(job_file.read_text(encoding="utf-8"))
+                    record = self._record_from_data(data)
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                    raise JobCorruptionError(
+                        f"Authoritative job record is corrupt: {job_file.name}"
+                    ) from exc
+                if record.idempotency_key == idempotency_key:
+                    return record
+            return None
 
     def _save(self, job: JobRecord) -> None:
         """Save job to storage."""
+        with self.transaction():
+            self._save_unlocked(job)
+
+    def _save_unlocked(self, job: JobRecord) -> None:
+        """Atomically replace one authoritative record while the lock is held."""
         job_path = self._storage_path / f"{job.job_id}.json"
-        job_path.write_text(
-            json.dumps(job.to_dict(), indent=2) + "\n",
-            encoding="utf-8",
+        payload = (json.dumps(job.to_dict(), indent=2) + "\n").encode("utf-8")
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{job.job_id}.", suffix=".tmp", dir=self._storage_path
         )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_name, job_path)
+            self._fsync_directory()
+        except BaseException:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _fsync_directory(self) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(self._storage_path, flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    @contextmanager
+    def transaction(self):
+        """Serialize job lookup and mutation across threads and processes."""
+        with self._thread_lock:
+            depth = getattr(self._transaction_state, "depth", 0)
+            if depth:
+                self._transaction_state.depth = depth + 1
+                try:
+                    yield self
+                finally:
+                    self._transaction_state.depth -= 1
+                return
+            with self._lock_path.open("a+b") as lock_handle:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                self._transaction_state.depth = 1
+                try:
+                    yield self
+                finally:
+                    self._transaction_state.depth = 0
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
+    def execution_lock(self, job_id: str):
+        """Claim one execution across processes without waiting for a duplicate."""
+        lock_path = self._storage_path / f".{job_id}.execution.lock"
+        with lock_path.open("a+b") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

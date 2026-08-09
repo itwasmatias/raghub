@@ -21,8 +21,9 @@ from tools.ai_controller.operations_api.auth import Principal, authenticate
 from tools.ai_controller.operations_api.errors import APIError, invalid
 from tools.ai_controller.operations_api.serialization import public_value
 
-from .actions import ActionCatalog, ActionType
+from .actions import ActionCatalog, ActionType, execution_fingerprint
 from .jobs import JobStatus, JobTracker
+from .runtime import ConsoleActionExecutionRuntime
 from .workspaces import WorkspaceRegistry
 
 
@@ -53,6 +54,7 @@ class ConsoleServer:
         integrity_key: bytes,
         server_id: str = "console-server-v0.1",
         now: Callable[[], datetime] = _utc_now,
+        runner=None,
     ):
         """
         Initialize Console Server.
@@ -117,6 +119,16 @@ class ConsoleServer:
             heartbeat_registry=heartbeat_registry,
             assignment_store=self.assignment_store,
         )
+        runtime_args = {
+            "workspaces": self.workspaces,
+            "jobs": self.job_tracker,
+            "dispatch_coordinator": self.task_dispatch_coordinator,
+            "action_catalog": self.action_catalog,
+            "clock": self.now,
+        }
+        if runner is not None:
+            runtime_args["runner"] = runner
+        self.action_runtime = ConsoleActionExecutionRuntime(**runtime_args)
 
     def system_status(self) -> dict[str, Any]:
         """
@@ -195,6 +207,8 @@ def create_console_blueprint(console: ConsoleServer) -> Blueprint:
 
     @bp.errorhandler(Exception)
     def handle_unexpected_error(error: Exception):
+        import traceback
+        traceback.print_exc()  # DEBUG
         return APIError(
             "INTERNAL_ERROR",
             "An unexpected error occurred",
@@ -257,6 +271,17 @@ def create_console_blueprint(console: ConsoleServer) -> Blueprint:
         if not isinstance(body, dict):
             raise invalid("Request body must be a JSON object")
 
+        forbidden_execution_fields = {
+            "executable", "argv", "command", "shell", "env", "environment",
+            "cwd", "path", "relative_path",
+        }
+        supplied_forbidden = sorted(forbidden_execution_fields.intersection(body))
+        if supplied_forbidden:
+            raise invalid(
+                "Execution-shaping fields are not accepted: "
+                + ", ".join(supplied_forbidden)
+            )
+
         # Extract required fields
         action_type_str = body.get("action_type")
         workspace_id = body.get("workspace_id")
@@ -279,7 +304,10 @@ def create_console_blueprint(console: ConsoleServer) -> Blueprint:
             raise invalid(str(exc))
 
         # Get action spec
-        spec = console.action_catalog.get_spec(action_type)
+        try:
+            spec = console.action_catalog.get_spec(action_type)
+        except ValueError as exc:
+            raise invalid(str(exc))
 
         # Validate timeout if provided
         requested_timeout = body.get("timeout_seconds")
@@ -303,6 +331,14 @@ def create_console_blueprint(console: ConsoleServer) -> Blueprint:
                 test_target = console.action_catalog.validate_test_target(test_target)
             except (TypeError, ValueError) as exc:
                 raise invalid(str(exc))
+
+        immutable_parameters = {"test_target": test_target} if test_target else {}
+        action_execution_fingerprint = execution_fingerprint(
+            action_type=action_type,
+            workspace_id=workspace_id,
+            timeout_seconds=timeout,
+            immutable_parameters=immutable_parameters,
+        )
 
         # Validate and process idempotency key
         idempotency_key = body.get("idempotency_key")
@@ -354,54 +390,87 @@ def create_console_blueprint(console: ConsoleServer) -> Blueprint:
         else:
             request_fingerprint = None
 
-        # Create TaskRequest for routing through existing federation contracts
-        task_request = TaskRequest(
-            task_id=f"console-action-{uuid.uuid4().hex}",
-            mission_id=body.get("mission_id") or f"console-{uuid.uuid4().hex}",
-            required_capabilities={spec.required_capability},
-            authorization_level=spec.authorization_level,
-            approval_required=spec.approval_required,
-            input_data={
-                "action_type": action_type.value,
-                "workspace_id": workspace_id,
-                "timeout_seconds": timeout,
-                "test_target": test_target if test_target else None,
-            },
-            expected_result=f"Execute {action_type.value} in workspace {workspace_id}",
-        )
+        # Hold one durable cross-process transaction from the final duplicate
+        # check through job creation. Routing/offer side effects therefore also
+        # occur at most once for one idempotency key.
+        with console.job_tracker.transaction():
+            if idempotency_key is not None:
+                existing_job = console.job_tracker.find_by_idempotency_key(
+                    idempotency_key
+                )
+                if existing_job:
+                    if existing_job.request_fingerprint != request_fingerprint:
+                        raise APIError(
+                            "IDEMPOTENCY_CONFLICT",
+                            f"Idempotency key '{idempotency_key}' already used with different request parameters",
+                            409,
+                        )
+                    return {
+                        "job_id": existing_job.job_id,
+                        "action_id": existing_job.action_id,
+                        "action_type": existing_job.action_type,
+                        "workspace_id": existing_job.workspace_id,
+                        "created_at": existing_job.created_at,
+                        "created_by": existing_job.created_by,
+                        "status": existing_job.status.value,
+                        "approval_required": spec.approval_required,
+                        "authorization_level": spec.authorization_level.value,
+                        "target_node_id": existing_job.target_node_id,
+                        "routing_outcome": "success" if existing_job.assignment_id else "no_eligible_nodes",
+                    }, 200
 
-        # Route through existing TaskRouter
-        routing_decision = console.task_router.route(task_request)
-
-        # Create dispatch offer for successful routing
-        dispatch_offer_id = None
-        if routing_decision.assignment_id is not None:
-            # Calculate expiration (default: 5 minutes from now)
-            expires_at = console.now() + timedelta(minutes=5)
-
-            dispatch_offer = console.task_dispatch_coordinator.create_offer(
-                assignment_id=routing_decision.assignment_id,
-                actor_node_id=console.coordinator_node_id,
-                expires_at=expires_at,
+            task_request = TaskRequest(
+                task_id=f"console-action-{uuid.uuid4().hex}",
+                mission_id=body.get("mission_id") or f"console-{uuid.uuid4().hex}",
+                required_capabilities={spec.required_capability},
+                authorization_level=spec.authorization_level,
+                approval_required=spec.approval_required,
+                input_data={
+                    "action_type": action_type.value,
+                    "workspace_id": workspace_id,
+                    "timeout_seconds": timeout,
+                    "test_target": test_target if test_target else None,
+                    "execution_fingerprint": action_execution_fingerprint,
+                },
+                expected_result=f"Execute {action_type.value} in workspace {workspace_id}",
             )
-            dispatch_offer_id = dispatch_offer.offer_id
+            routing_decision = console.task_router.route(task_request)
 
-        # Create job with routing and dispatch information
-        job = console.job_tracker.create_job(
-            action_type=action_type.value,
-            workspace_id=workspace_id,
-            created_by=principal.identity,
-            mission_id=task_request.mission_id,
-            target_node_id=(
-                routing_decision.assignment.assigned_node.node_id
-                if routing_decision.assignment
-                else None
-            ),
-            assignment_id=routing_decision.assignment_id,
-            dispatch_offer_id=dispatch_offer_id,
-            idempotency_key=idempotency_key,
-            request_fingerprint=request_fingerprint,
-        )
+            dispatch_offer_id = None
+            if routing_decision.assignment_id is not None:
+                expires_at = console.now() + timedelta(minutes=5)
+                dispatch_offer = console.task_dispatch_coordinator.create_offer(
+                    assignment_id=routing_decision.assignment_id,
+                    actor_node_id=console.coordinator_node_id,
+                    expires_at=expires_at,
+                )
+                dispatch_offer_id = dispatch_offer.offer_id
+
+            job = console.job_tracker.create_job(
+                action_type=action_type.value,
+                workspace_id=workspace_id,
+                created_by=principal.identity,
+                mission_id=task_request.mission_id,
+                task_id=task_request.task_id,
+                timeout_seconds=timeout,
+                target_node_id=(
+                    routing_decision.assignment.assigned_node.node_id
+                    if routing_decision.assignment
+                    else None
+                ),
+                assignment_id=routing_decision.assignment_id,
+                dispatch_offer_id=dispatch_offer_id,
+                idempotency_key=idempotency_key,
+                request_fingerprint=request_fingerprint,
+                execution_fingerprint=action_execution_fingerprint,
+            )
+
+        if (
+            dispatch_offer_id is not None
+            and action_type is ActionType.INSPECT_GIT_STATUS
+            and "console.execute" in principal.capabilities
+        ):
+            job = console.action_runtime.execute(job.job_id)
 
         return {
             "job_id": job.job_id,
@@ -415,6 +484,11 @@ def create_console_blueprint(console: ConsoleServer) -> Blueprint:
             "authorization_level": spec.authorization_level.value,
             "target_node_id": job.target_node_id,
             "routing_outcome": routing_decision.outcome.value,
+            "exit_code": job.exit_code,
+            "stdout": job.stdout,
+            "stderr": job.stderr,
+            "stdout_truncated": job.stdout_truncated,
+            "stderr_truncated": job.stderr_truncated,
         }, 201
 
     @bp.route("/jobs/<job_id>", methods=["GET"])

@@ -139,7 +139,9 @@ _PUBLIC_KEYS = {
     "state",
     "status",
     "stderr",
+    "stderr_truncated",
     "stdout",
+    "stdout_truncated",
     "supersedes_action_ids",
     "target_node_id",
     "task_id",
@@ -177,6 +179,32 @@ _SENSITIVE_VALUE_PATTERNS = (
     re.compile(r"(?i)(?:^|[\s\"'])/(?:home|root|Users|private|srv|opt)/\S*"),
     re.compile(r"(?i)(?:^|[\s\"'])[A-Za-z]:\\(?:Users|Documents|repos?)\\"),
 )
+
+
+def scrub_sensitive_text(value: str) -> str:
+    """Redact credential-shaped values while retaining useful command output."""
+    if not isinstance(value, str):
+        raise TypeError("value must be a string")
+    result = value
+    for pattern in (
+        _SENSITIVE_VALUE_PATTERNS[0],
+        _SENSITIVE_VALUE_PATTERNS[1],
+        _SENSITIVE_VALUE_PATTERNS[2],
+        _SENSITIVE_VALUE_PATTERNS[5],
+        re.compile(r"\b(?:sk-(?:proj-)?|gh[pousr]_|xox[baprs]-)[A-Za-z0-9_-]+"),
+    ):
+        result = pattern.sub(lambda match: _redacted_match(match.group(0)), result)
+    return result
+
+
+def _redacted_match(value: str) -> str:
+    if "=" in value:
+        return f"{value.split('=', 1)[0]}=[REDACTED]"
+    if ":" in value:
+        return f"{value.split(':', 1)[0]}: [REDACTED]"
+    if value.lower().startswith("bearer "):
+        return "Bearer [REDACTED]"
+    return "[REDACTED]"
 _TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _PUBLIC_TASK_STATE_KEYS = {
     "task_id",

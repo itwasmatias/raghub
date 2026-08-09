@@ -81,6 +81,20 @@ def _routing_payload(
     coordinator_node_id: str,
     routing_revision: int,
 ) -> dict:
+    authorization_metadata = {
+        "level": assignment.task_request.authorization_level.value,
+    }
+    execution_fingerprint = assignment.task_request.input_data.get(
+        "execution_fingerprint"
+    )
+    if execution_fingerprint is not None:
+        if (
+            not isinstance(execution_fingerprint, str)
+            or len(execution_fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in execution_fingerprint)
+        ):
+            raise ValueError("execution_fingerprint must be a lowercase SHA-256 digest")
+        authorization_metadata["execution_fingerprint"] = execution_fingerprint
     return {
         "routing_revision": routing_revision,
         "mission_id": assignment.mission_id,
@@ -90,9 +104,7 @@ def _routing_payload(
         "required_capabilities": sorted(
             str(item) for item in assignment.task_request.required_capabilities
         ),
-        "authorization_metadata": {
-            "level": assignment.task_request.authorization_level.value,
-        },
+        "authorization_metadata": authorization_metadata,
         "approval_metadata": {
             "required": assignment.task_request.approval_required,
         },
@@ -269,9 +281,30 @@ class DurableAssignmentRegistry:
                 != sorted(set(record["required_capabilities"]))
             ):
                 raise AssignmentCorruptionError("assignment capabilities are invalid")
-            if set(record["authorization_metadata"]) != {"level"} or not isinstance(
-                record["authorization_metadata"]["level"],
+            authorization_metadata = record["authorization_metadata"]
+            if not isinstance(authorization_metadata, dict):
+                raise AssignmentCorruptionError("authorization metadata is invalid")
+
+            authorization_keys = set(authorization_metadata)
+            if authorization_keys not in (
+                {"level"},
+                {"level", "execution_fingerprint"},
+            ) or not isinstance(
+                authorization_metadata["level"],
                 str,
+            ):
+                raise AssignmentCorruptionError("authorization metadata is invalid")
+
+            execution_fingerprint = authorization_metadata.get(
+                "execution_fingerprint"
+            )
+            if execution_fingerprint is not None and (
+                not isinstance(execution_fingerprint, str)
+                or len(execution_fingerprint) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in execution_fingerprint
+                )
             ):
                 raise AssignmentCorruptionError("authorization metadata is invalid")
             if set(record["approval_metadata"]) != {"required"} or not isinstance(
