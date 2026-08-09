@@ -25,14 +25,37 @@ from research_mission.results import (
     ResearchTaskResultStatus,
 )
 from research_mission.runtime import InvalidMissionTransition, ResearchMissionRuntime
+from research_mission.evaluation import (
+    JudgeEligibilityDecision,
+    ResearchChallenge,
+    ResearchClaim,
+    ResearchContradiction,
+    ResearchEvaluation,
+    ResearchEvaluationContractError,
+    ResearchEvaluationError,
+    ResearchEvaluationIncompleteError,
+    ResearchEvaluationRuntime,
+    ResearchEvaluationStatus,
+    SynthesisResult,
+)
 
 __all__ = [
     "ChallengerAssessment",
     "InvalidMissionTransition",
     "JudgeDecision",
+    "JudgeEligibilityDecision",
     "JudgeOutcome",
     "ResearchEvidence",
     "ResearchEvidenceConflictError",
+    "ResearchChallenge",
+    "ResearchClaim",
+    "ResearchContradiction",
+    "ResearchEvaluation",
+    "ResearchEvaluationContractError",
+    "ResearchEvaluationError",
+    "ResearchEvaluationIncompleteError",
+    "ResearchEvaluationRuntime",
+    "ResearchEvaluationStatus",
     "ResearchMission",
     "ResearchMissionContractError",
     "ResearchMissionPlan",
@@ -47,4 +70,5 @@ __all__ = [
     "ResearchTaskResult",
     "ResearchTaskResultStatus",
     "ResearchTaskSpec",
+    "SynthesisResult",
 ]
