@@ -104,7 +104,9 @@ def result(req, output="LOCAL_OK", **changes):
         structured_output=None, started_at="2026-08-09T15:00:00Z",
         completed_at="2026-08-09T15:00:02Z", elapsed_seconds=2.0,
         usage=LocalInferenceUsage(8, 2),
-        resource_measurements={"prompt_ms": 1000.0, "predicted_ms": 500.0},
+        resource_measurements={"prompt_evaluated_tokens": 4,
+            "generated_evaluated_tokens": 2,
+            "prompt_ms": 1000.0, "predicted_ms": 500.0},
         termination_reason="stop", error_code=None, error_message=None,
         cloud_escalation_count=0, cloud_cost_usd=0.0)
     response_values.update(changes)
@@ -175,13 +177,40 @@ def test_execution_success_is_separate_from_objective_correctness_and_metrics_ar
     assert report.metrics.tasks_attempted == 1
     assert report.metrics.tasks_successfully_executed == 1
     assert report.metrics.objectively_incorrect == 1
-    assert report.metrics.mean_prompt_throughput == 8.0
+    assert record.prompt_tokens == 8
+    assert record.prompt_evaluated_tokens == 4
+    assert report.metrics.mean_prompt_throughput == 4.0
     assert report.metrics.mean_generation_throughput == 4.0
     assert report.metrics.total_cloud_cost_usd == 0.0
     assert report.to_dict() == PilotReport.create(
         "pilot-run-1", build_default_pilot_definition(), model(), (record,)).to_dict()
     assert "proof" not in str(report.to_dict()).lower()
     assert "winner" not in str(report.to_dict()).lower()
+
+
+def test_report_fingerprint_and_throughput_bind_evaluated_token_work():
+    task = build_default_pilot_definition().tasks[0]
+    req = request(task)
+    original = PilotTaskRecord.from_evidence(task, req, result(req))
+    changed = replace(original, prompt_evaluated_tokens=1)
+    first = PilotReport.create("pilot-run-1", build_default_pilot_definition(), model(), (original,))
+    second = PilotReport.create("pilot-run-1", build_default_pilot_definition(), model(), (changed,))
+    assert first.report_fingerprint != second.report_fingerprint
+    assert first.metrics.mean_prompt_throughput == 4.0
+    assert second.metrics.mean_prompt_throughput == 1.0
+
+
+def test_logical_counts_without_evaluated_work_do_not_fabricate_throughput():
+    task = build_default_pilot_definition().tasks[0]
+    req = request(task)
+    evidence = result(req, resource_measurements={"prompt_ms": 1000.0,
+        "predicted_ms": 500.0})
+    record = PilotTaskRecord.from_evidence(task, req, evidence)
+    report = PilotReport.create("pilot-run-1", build_default_pilot_definition(), model(), (record,))
+    assert record.prompt_tokens == 8
+    assert record.prompt_evaluated_tokens is None
+    assert report.metrics.mean_prompt_throughput is None
+    assert report.metrics.mean_generation_throughput is None
 
 
 def test_record_rejects_foreign_linkage_cloud_evidence_and_malformed_measurements():

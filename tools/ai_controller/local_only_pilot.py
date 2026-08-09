@@ -254,6 +254,7 @@ class PilotTaskRecord:
     model_descriptor_fingerprint: str; request_fingerprint: str; execution_fingerprint: str
     result_id: str; status: str; execution_succeeded: bool; evaluation: PilotEvaluation
     prompt_tokens: int | None; generated_tokens: int | None
+    prompt_evaluated_tokens: int | None; generated_evaluated_tokens: int | None
     prompt_ms: float | None; generation_ms: float | None; elapsed_seconds: float
     termination_reason: str; locality: LocalityType; remote_execution: bool
     cloud_escalation_count: int; cloud_cost_usd: float; error_code: str | None
@@ -275,7 +276,8 @@ class PilotTaskRecord:
             raise PilotContractError("record execution/evaluation state is malformed")
         if self.execution_succeeded != (self.status == LocalInferenceStatus.SUCCEEDED.value):
             raise PilotContractError("execution success contradicts status")
-        for name in ("prompt_tokens", "generated_tokens", "cloud_escalation_count"):
+        for name in ("prompt_tokens", "generated_tokens", "prompt_evaluated_tokens",
+                "generated_evaluated_tokens", "cloud_escalation_count"):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
                 raise PilotContractError(f"{name} must be non-negative integer or None")
@@ -308,6 +310,8 @@ class PilotTaskRecord:
         resources = response.resource_measurements
         prompt_ms = resources.get("prompt_ms")
         generation_ms = resources.get("predicted_ms", resources.get("generation_ms"))
+        prompt_evaluated_tokens = resources.get("prompt_evaluated_tokens")
+        generated_evaluated_tokens = resources.get("generated_evaluated_tokens")
         evaluation = (evaluate_output(task, response.output_text or "")
             if response.status is LocalInferenceStatus.SUCCEEDED
             else PilotEvaluation(PilotCorrectness.UNEVALUABLE, "execution_failed", ()))
@@ -316,6 +320,7 @@ class PilotTaskRecord:
             result.result_id, response.status.value,
             response.status is LocalInferenceStatus.SUCCEEDED, evaluation,
             response.usage.prompt_tokens, response.usage.generated_tokens,
+            prompt_evaluated_tokens, generated_evaluated_tokens,
             prompt_ms, generation_ms, response.elapsed_seconds, response.termination_reason,
             response.locality, response.remote_execution, response.cloud_escalation_count,
             float(response.cloud_cost_usd or 0), response.error_code)
@@ -405,10 +410,12 @@ class PilotReport:
                 for item in records):
             raise PilotContractError("foreign task or model evidence")
         elapsed = [item.elapsed_seconds for item in records]
-        prompt_rates = [item.prompt_tokens / (item.prompt_ms / 1000)
-            for item in records if item.prompt_tokens is not None and item.prompt_ms not in (None, 0)]
-        generation_rates = [item.generated_tokens / (item.generation_ms / 1000)
-            for item in records if item.generated_tokens is not None and item.generation_ms not in (None, 0)]
+        prompt_rates = [item.prompt_evaluated_tokens / (item.prompt_ms / 1000)
+            for item in records if item.prompt_evaluated_tokens is not None
+            and item.prompt_ms not in (None, 0)]
+        generation_rates = [item.generated_evaluated_tokens / (item.generation_ms / 1000)
+            for item in records if item.generated_evaluated_tokens is not None
+            and item.generation_ms not in (None, 0)]
         metrics = PilotAggregateMetrics(len(records), sum(r.execution_succeeded for r in records),
             sum(r.evaluation.correctness is PilotCorrectness.CORRECT for r in records),
             sum(r.evaluation.correctness is PilotCorrectness.INCORRECT for r in records),

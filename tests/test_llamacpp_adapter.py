@@ -30,6 +30,7 @@ from tools.ai_controller.local_model_runtime import (
     GovernedLocalModelRuntime,
     LocalInferenceRequest,
     LocalInferenceStatus,
+    LocalInferenceUsage,
     LocalModelCapability,
     LocalModelDescriptor,
     LocalModelLoadStatus,
@@ -1375,21 +1376,94 @@ def test_chat_timings_token_counts_are_preserved_when_usage_is_absent():
     try:
         result = adapter.infer(descriptor(), request(),
             LocalModelRuntimeConfig(True, 512, frozenset(), True))
-        assert result.usage.prompt_tokens == 9
+        assert result.usage.prompt_tokens is None
         assert result.usage.generated_tokens == 24
         assert result.resource_measurements == {
+            "prompt_evaluated_tokens": 9,
+            "generated_evaluated_tokens": 24,
             "prompt_ms": 100.0, "predicted_ms": 7000.0}
     finally:
         server.shutdown()
 
 
-def test_chat_conflicting_usage_and_timings_fail_closed():
+def test_chat_cached_prompt_logical_and_evaluated_counts_are_distinct():
     server = start_fake_server()
     server.response_override = {"model": "llama-3.2-1b-q4", "choices": [
         {"index": 0, "message": {"role": "assistant", "content": "LOCAL_OK"},
          "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 9, "completion_tokens": 4},
-        "timings": {"prompt_n": 10, "predicted_n": 4}}
+        "usage": {"prompt_tokens": 38, "completion_tokens": 3, "total_tokens": 41},
+        "timings": {"prompt_n": 20, "predicted_n": 3,
+                    "prompt_ms": 500.0, "predicted_ms": 250.0}}
+    adapter = LlamaCppLocalAdapter(config=adapter_config(
+        endpoint=f"http://127.0.0.1:{server.server_address[1]}",
+        mode=LlamaCppAdapterMode.CHAT), clock=fixed_clock)
+    try:
+        result = adapter.infer(descriptor(), request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True))
+        assert result.status is LocalInferenceStatus.SUCCEEDED
+        assert result.usage.prompt_tokens == 38
+        assert result.usage.generated_tokens == 3
+        assert result.resource_measurements == {
+            "prompt_evaluated_tokens": 20,
+            "generated_evaluated_tokens": 3,
+            "prompt_ms": 500.0,
+            "predicted_ms": 250.0,
+        }
+        assert result.locality is LocalityType.LOCAL
+        assert result.remote_execution is False
+        assert result.cloud_escalation_count == 0
+        assert result.cloud_cost_usd == 0.0
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize("prompt_n", [20, 1])
+def test_chat_prompt_cache_reuse_accepts_smaller_evaluated_count(prompt_n):
+    server = start_fake_server()
+    server.response_override = {"model": "llama-3.2-1b-q4", "choices": [
+        {"index": 0, "message": {"role": "assistant", "content": "LOCAL_OK"},
+         "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 38, "completion_tokens": 3, "total_tokens": 41},
+        "timings": {"prompt_n": prompt_n, "predicted_n": 3}}
+    adapter = LlamaCppLocalAdapter(config=adapter_config(
+        endpoint=f"http://127.0.0.1:{server.server_address[1]}",
+        mode=LlamaCppAdapterMode.CHAT), clock=fixed_clock)
+    try:
+        result = adapter.infer(descriptor(), request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True))
+        assert result.status is LocalInferenceStatus.SUCCEEDED
+        assert result.usage.prompt_tokens == 38
+        assert result.resource_measurements["prompt_evaluated_tokens"] == prompt_n
+    finally:
+        server.shutdown()
+
+
+def test_chat_no_cache_logical_and_evaluated_counts_may_match():
+    server = start_fake_server()
+    server.response_override = {"model": "llama-3.2-1b-q4", "choices": [
+        {"index": 0, "message": {"role": "assistant", "content": "OK"},
+         "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 2, "total_tokens": 14},
+        "timings": {"prompt_n": 12, "predicted_n": 2}}
+    adapter = LlamaCppLocalAdapter(config=adapter_config(
+        endpoint=f"http://127.0.0.1:{server.server_address[1]}",
+        mode=LlamaCppAdapterMode.CHAT), clock=fixed_clock)
+    try:
+        result = adapter.infer(descriptor(), request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True))
+        assert result.status is LocalInferenceStatus.SUCCEEDED
+        assert result.resource_measurements["prompt_evaluated_tokens"] == 12
+    finally:
+        server.shutdown()
+
+
+def test_chat_completion_usage_and_evaluated_count_conflict_fails_closed():
+    server = start_fake_server()
+    server.response_override = {"model": "llama-3.2-1b-q4", "choices": [
+        {"index": 0, "message": {"role": "assistant", "content": "OK"},
+         "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 2, "total_tokens": 14},
+        "timings": {"prompt_n": 4, "predicted_n": 3}}
     adapter = LlamaCppLocalAdapter(config=adapter_config(
         endpoint=f"http://127.0.0.1:{server.server_address[1]}",
         mode=LlamaCppAdapterMode.CHAT), clock=fixed_clock)
@@ -1398,6 +1472,94 @@ def test_chat_conflicting_usage_and_timings_fail_closed():
             LocalModelRuntimeConfig(True, 512, frozenset(), True))
         assert result.status is LocalInferenceStatus.FAILED
         assert result.error_code == "malformed_token_count"
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize("usage", [
+    {"prompt_tokens": "38", "completion_tokens": 3, "total_tokens": 41},
+    {"prompt_tokens": -1, "completion_tokens": 3, "total_tokens": 2},
+    {"prompt_tokens": 38, "completion_tokens": 3, "total_tokens": "41"},
+    {"prompt_tokens": 38, "completion_tokens": 3, "total_tokens": -1},
+    {"prompt_tokens": 38, "completion_tokens": 3, "total_tokens": 40},
+])
+def test_chat_malformed_logical_usage_fails_closed(usage):
+    server = start_fake_server()
+    server.response_override = {"model": "llama-3.2-1b-q4", "choices": [
+        {"index": 0, "message": {"role": "assistant", "content": "OK"},
+         "finish_reason": "stop"}], "usage": usage}
+    adapter = LlamaCppLocalAdapter(config=adapter_config(
+        endpoint=f"http://127.0.0.1:{server.server_address[1]}",
+        mode=LlamaCppAdapterMode.CHAT), clock=fixed_clock)
+    try:
+        result = adapter.infer(descriptor(), request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True))
+        assert result.status is LocalInferenceStatus.FAILED
+        assert result.error_code == "malformed_token_count"
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize("timings", [
+    {"prompt_n": "20", "predicted_n": 3},
+    {"prompt_n": -1, "predicted_n": 3},
+    {"prompt_n": 20, "predicted_n": 1.5},
+    {"prompt_n": 20, "predicted_n": -1},
+    {"prompt_n": 20, "predicted_n": 3, "prompt_ms": "500"},
+    {"prompt_n": 20, "predicted_n": 3, "prompt_ms": float("nan")},
+    {"prompt_n": 20, "predicted_n": 3, "predicted_ms": -1},
+    {"prompt_n": 20, "predicted_n": 3, "predicted_ms": float("inf")},
+])
+def test_chat_malformed_evaluated_work_or_timings_fail_closed(timings):
+    server = start_fake_server()
+    server.response_override = {"model": "llama-3.2-1b-q4", "choices": [
+        {"index": 0, "message": {"role": "assistant", "content": "OK"},
+         "finish_reason": "stop"}], "timings": timings}
+    adapter = LlamaCppLocalAdapter(config=adapter_config(
+        endpoint=f"http://127.0.0.1:{server.server_address[1]}",
+        mode=LlamaCppAdapterMode.CHAT), clock=fixed_clock)
+    try:
+        result = adapter.infer(descriptor(), request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True))
+        assert result.status is LocalInferenceStatus.FAILED
+        assert result.error_code in {"malformed_token_count", "malformed_timing_metadata"}
+    finally:
+        server.shutdown()
+
+
+def test_chat_usage_without_timings_preserves_only_logical_counts():
+    server = start_fake_server()
+    server.response_override = {"model": "llama-3.2-1b-q4", "choices": [
+        {"index": 0, "message": {"role": "assistant", "content": "OK"},
+         "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 38, "completion_tokens": 3, "total_tokens": 41}}
+    adapter = LlamaCppLocalAdapter(config=adapter_config(
+        endpoint=f"http://127.0.0.1:{server.server_address[1]}",
+        mode=LlamaCppAdapterMode.CHAT), clock=fixed_clock)
+    try:
+        result = adapter.infer(descriptor(), request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True))
+        assert result.status is LocalInferenceStatus.SUCCEEDED
+        assert result.usage == LocalInferenceUsage(38, 3)
+        assert result.resource_measurements == {}
+    finally:
+        server.shutdown()
+
+
+def test_chat_without_usage_or_timings_does_not_fabricate_token_evidence():
+    server = start_fake_server()
+    server.response_override = {"model": "llama-3.2-1b-q4", "choices": [
+        {"index": 0, "message": {"role": "assistant", "content": "OK"},
+         "finish_reason": "stop"}]}
+    adapter = LlamaCppLocalAdapter(config=adapter_config(
+        endpoint=f"http://127.0.0.1:{server.server_address[1]}",
+        mode=LlamaCppAdapterMode.CHAT), clock=fixed_clock)
+    try:
+        result = adapter.infer(descriptor(), request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True))
+        assert result.status is LocalInferenceStatus.SUCCEEDED
+        assert result.usage == LocalInferenceUsage(None, None)
+        assert result.resource_measurements == {}
     finally:
         server.shutdown()
 

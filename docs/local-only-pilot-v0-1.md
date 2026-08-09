@@ -52,3 +52,20 @@ model SHA-256 is bound into configuration and report provenance; current
 llama-server metadata attests the loaded alias but does not independently expose a
 cryptographic digest of the loaded model bytes. Operational setup must therefore
 verify the model file digest before starting the separately managed server.
+
+## Pinned llama.cpp token accounting
+
+At pinned llama.cpp commit `876a4321163249c43ca4e986818fab5ab081f282`, the
+OpenAI-compatible response is built from two deliberately different sources:
+
+- `usage.prompt_tokens` is the full logical request prompt (`task->n_tokens()`).
+- `timings.prompt_n` is the prompt work actually processed
+  (`n_prompt_tokens_processed`) after cached-prefix reuse.
+- `usage.completion_tokens` and `timings.predicted_n` are both `n_decoded`.
+- `usage.total_tokens` is `prompt_tokens + completion_tokens`.
+
+The adapter therefore keeps logical usage in `LocalInferenceUsage` and records
+timing-side work as `prompt_evaluated_tokens` and
+`generated_evaluated_tokens`. Prompt and generation throughput use evaluated
+work divided by the corresponding timing. Logical prompt usage is never used as
+a substitute for evaluated work when cache reuse may have reduced processing.

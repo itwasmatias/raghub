@@ -763,20 +763,27 @@ class LlamaCppLocalAdapter:
         if timings is not None:
             if not isinstance(timings, dict):
                 return failed("malformed_timing_metadata", "timings is not an object")
-            for source, current, label in (
-                    ("prompt_n", prompt_tokens, "prompt_tokens"),
-                    ("predicted_n", generated_tokens, "completion_tokens")):
+            timing_counts = {}
+            for source, target in (("prompt_n", "prompt_evaluated_tokens"),
+                                   ("predicted_n", "generated_evaluated_tokens")):
                 value = timings.get(source)
                 if value is not None and (not isinstance(value, int)
                                           or isinstance(value, bool) or value < 0):
                     return failed("malformed_token_count", f"timings {source} is malformed")
-                if current is not None and value is not None and current != value:
-                    return failed("malformed_token_count",
-                        f"usage {label} conflicts with timings {source}")
-                if source == "prompt_n" and prompt_tokens is None:
-                    prompt_tokens = value
-                if source == "predicted_n" and generated_tokens is None:
-                    generated_tokens = value
+                if value is not None:
+                    timing_counts[source] = value
+                    resources[target] = value
+            # At pinned llama.cpp commit 876a432, usage.completion_tokens and
+            # timings.predicted_n are both built from n_decoded.
+            predicted_n = timing_counts.get("predicted_n")
+            if generated_tokens is not None and predicted_n is not None \
+                    and generated_tokens != predicted_n:
+                return failed("malformed_token_count",
+                    "usage completion_tokens conflicts with timings predicted_n")
+            if generated_tokens is None:
+                generated_tokens = predicted_n
+            # prompt_n is only work actually evaluated after prompt-cache reuse;
+            # it is not a fallback for the full logical usage.prompt_tokens.
             for source, target in (("prompt_ms", "prompt_ms"),
                                    ("predicted_ms", "predicted_ms")):
                 value = timings.get(source)
