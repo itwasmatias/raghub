@@ -85,6 +85,19 @@ from federation.task_dispatcher import (
 )
 from federation.task_request import AuthorizationLevel, TaskRequest
 from federation.task_router import TaskRouter
+from federation.worker_execution import (
+    TERMINAL_WORKER_EXECUTION_STATUSES,
+    WorkerExecutionAttempt,
+    WorkerExecutionConflictError,
+    WorkerExecutionCoordinator,
+    WorkerExecutionCorruptionError,
+    WorkerExecutionError,
+    WorkerExecutionIdentityError,
+    WorkerExecutionRequest,
+    WorkerExecutionResultEnvelope,
+    WorkerExecutionStateError,
+    WorkerExecutionStatus,
+)
 
 __all__ = [
     # Node Registry and Capabilities
@@ -159,4 +172,16 @@ __all__ = [
     "DispatchTerminalStateError",
     "DispatchWorkerUnavailableError",
     "TaskDispatchCoordinator",
+    # Worker execution protocol (transport-neutral; performs no execution)
+    "TERMINAL_WORKER_EXECUTION_STATUSES",
+    "WorkerExecutionAttempt",
+    "WorkerExecutionConflictError",
+    "WorkerExecutionCoordinator",
+    "WorkerExecutionCorruptionError",
+    "WorkerExecutionError",
+    "WorkerExecutionIdentityError",
+    "WorkerExecutionRequest",
+    "WorkerExecutionResultEnvelope",
+    "WorkerExecutionStateError",
+    "WorkerExecutionStatus",
 ]
