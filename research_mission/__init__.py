@@ -61,6 +61,16 @@ from research_mission.replication import (
     ResearchReplicationResult,
     ResearchReplicationRuntime,
 )
+from research_mission.recovery import (
+    MissionRecoveryCorruptionError,
+    MissionRecoveryError,
+    MissionRecoveryEvidence,
+    MissionRecoveryEvidenceRuntime,
+    MissionRecoveryEvidenceStore,
+    MissionRecoveryNotFoundError,
+    RecoveryOutcome,
+    TaskRecoveryEvidence,
+)
 
 __all__ = [
     "ChallengerAssessment",
@@ -113,4 +123,12 @@ __all__ = [
     "ResearchReplicationError",
     "ResearchReplicationResult",
     "ResearchReplicationRuntime",
+    "MissionRecoveryCorruptionError",
+    "MissionRecoveryError",
+    "MissionRecoveryEvidence",
+    "MissionRecoveryEvidenceRuntime",
+    "MissionRecoveryEvidenceStore",
+    "MissionRecoveryNotFoundError",
+    "RecoveryOutcome",
+    "TaskRecoveryEvidence",
 ]
