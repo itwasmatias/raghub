@@ -288,11 +288,114 @@ class LlamaCppLocalAdapter:
             )
 
     def _attest_server_model(self, model: LocalModelDescriptor) -> None:
-        """Verify server and model identity before inference."""
-        # For v0.1, we rely on the model descriptor being already validated
-        # Future: query llama-server /health or /v1/models endpoints
-        # and verify runtime/model metadata
-        pass
+        """Verify server and model identity before inference.
+
+        Queries GET /v1/models to attest that the loaded model matches
+        the expected model identity before allowing inference.
+
+        Fails closed on:
+        - Malformed metadata response
+        - No model loaded/available
+        - Model identity conflict
+        - Ambiguous model authority
+        - Metadata from foreign authority
+        """
+        # Query /v1/models endpoint to get loaded model metadata
+        url = self._config.endpoint.rstrip("/") + "/v1/models"
+
+        try:
+            resp = self._http.request(
+                "GET",
+                url,
+                preload_content=False,
+            )
+        except urllib3.exceptions.HTTPError as exc:
+            raise LlamaCppServerIdentityError(
+                f"failed to query model metadata: {exc}"
+            ) from exc
+
+        # Read bounded response
+        try:
+            raw_data = resp.read(self._config.maximum_response_bytes + 1)
+        except Exception as exc:
+            raise LlamaCppServerIdentityError(
+                f"failed to read metadata response: {exc}"
+            ) from exc
+        finally:
+            resp.release_conn()
+
+        if len(raw_data) > self._config.maximum_response_bytes:
+            raise LlamaCppServerIdentityError(
+                f"metadata response exceeds maximum size {self._config.maximum_response_bytes}"
+            )
+
+        # Check status
+        if resp.status != 200:
+            raise LlamaCppServerIdentityError(
+                f"llama-server metadata endpoint returned HTTP {resp.status}"
+            )
+
+        # Parse JSON
+        try:
+            metadata = json.loads(raw_data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise LlamaCppServerIdentityError(
+                f"failed to parse metadata JSON: {exc}"
+            ) from exc
+
+        # Validate metadata structure
+        if not isinstance(metadata, dict):
+            raise LlamaCppServerIdentityError(
+                "metadata response is not a JSON object"
+            )
+
+        # Extract models list (OpenAI-compatible format)
+        models_data = metadata.get("data")
+        if models_data is None:
+            raise LlamaCppServerIdentityError(
+                "metadata response missing 'data' field"
+            )
+
+        if not isinstance(models_data, list):
+            raise LlamaCppServerIdentityError(
+                "metadata 'data' field is not a list"
+            )
+
+        if len(models_data) == 0:
+            raise LlamaCppServerIdentityError(
+                "no models available on server"
+            )
+
+        if len(models_data) > 1:
+            raise LlamaCppServerIdentityError(
+                f"ambiguous model authority: server reports {len(models_data)} models"
+            )
+
+        # Extract single model
+        model_info = models_data[0]
+        if not isinstance(model_info, dict):
+            raise LlamaCppServerIdentityError(
+                "model info is not a JSON object"
+            )
+
+        # Extract model ID
+        loaded_model_id = model_info.get("id")
+        if loaded_model_id is None:
+            raise LlamaCppServerIdentityError(
+                "model info missing 'id' field"
+            )
+
+        if not isinstance(loaded_model_id, str):
+            raise LlamaCppServerIdentityError(
+                f"model 'id' is not string: {type(loaded_model_id).__name__}"
+            )
+
+        # Verify loaded model matches expected model
+        if loaded_model_id != self._config.expected_model_id:
+            raise LlamaCppServerIdentityError(
+                f"loaded model '{loaded_model_id}' does not match "
+                f"expected '{self._config.expected_model_id}'"
+            )
 
     def _map_request(
         self, inference_request: LocalInferenceRequest
@@ -423,41 +526,76 @@ class LlamaCppLocalAdapter:
         else:
             termination_reason = "unknown"
 
-        # Extract token counts - be lenient with invalid counts, treat as None
+        # Extract token counts - fail closed on malformed
         timings = response_data.get("timings", {})
         prompt_tokens = timings.get("prompt_n")
         generated_tokens = timings.get("predicted_n")
 
-        # Validate token counts - reject only negative values, ignore non-integers
+        # Validate prompt_tokens - fail closed on malformed
         if prompt_tokens is not None:
-            if isinstance(prompt_tokens, int) and not isinstance(prompt_tokens, bool):
-                if prompt_tokens < 0:
-                    return self._error_response(
-                        model,
-                        started_at,
-                        completed_at,
-                        elapsed_seconds,
-                        "invalid_token_count",
-                        f"invalid prompt_n: {prompt_tokens}",
-                    )
-            else:
-                # Non-integer, treat as None
-                prompt_tokens = None
+            # Reject booleans (must check before int since bool is subclass of int)
+            if isinstance(prompt_tokens, bool):
+                return self._error_response(
+                    model,
+                    started_at,
+                    completed_at,
+                    elapsed_seconds,
+                    "malformed_token_count",
+                    f"prompt_n is boolean: {prompt_tokens}",
+                )
+            # Reject non-integers (strings, floats, lists, dicts, etc.)
+            if not isinstance(prompt_tokens, int):
+                return self._error_response(
+                    model,
+                    started_at,
+                    completed_at,
+                    elapsed_seconds,
+                    "malformed_token_count",
+                    f"prompt_n is not integer: {type(prompt_tokens).__name__}",
+                )
+            # Reject negative
+            if prompt_tokens < 0:
+                return self._error_response(
+                    model,
+                    started_at,
+                    completed_at,
+                    elapsed_seconds,
+                    "malformed_token_count",
+                    f"prompt_n is negative: {prompt_tokens}",
+                )
 
+        # Validate generated_tokens - fail closed on malformed
         if generated_tokens is not None:
-            if isinstance(generated_tokens, int) and not isinstance(generated_tokens, bool):
-                if generated_tokens < 0:
-                    return self._error_response(
-                        model,
-                        started_at,
-                        completed_at,
-                        elapsed_seconds,
-                        "invalid_token_count",
-                        f"invalid predicted_n: {generated_tokens}",
-                    )
-            else:
-                # Non-integer, treat as None
-                generated_tokens = None
+            # Reject booleans (must check before int since bool is subclass of int)
+            if isinstance(generated_tokens, bool):
+                return self._error_response(
+                    model,
+                    started_at,
+                    completed_at,
+                    elapsed_seconds,
+                    "malformed_token_count",
+                    f"predicted_n is boolean: {generated_tokens}",
+                )
+            # Reject non-integers (strings, floats, lists, dicts, etc.)
+            if not isinstance(generated_tokens, int):
+                return self._error_response(
+                    model,
+                    started_at,
+                    completed_at,
+                    elapsed_seconds,
+                    "malformed_token_count",
+                    f"predicted_n is not integer: {type(generated_tokens).__name__}",
+                )
+            # Reject negative
+            if generated_tokens < 0:
+                return self._error_response(
+                    model,
+                    started_at,
+                    completed_at,
+                    elapsed_seconds,
+                    "malformed_token_count",
+                    f"predicted_n is negative: {generated_tokens}",
+                )
 
         # Extract timing measurements if available
         resource_measurements: dict[str, Any] = {}

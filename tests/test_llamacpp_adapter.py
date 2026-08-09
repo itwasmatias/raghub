@@ -119,6 +119,39 @@ def adapter_config(**changes):
 class FakeLlamaServer(BaseHTTPRequestHandler):
     """Deterministic fake llama-server for testing."""
 
+    def do_GET(self):
+        if self.path != "/v1/models":
+            self.send_error(404, "Not Found")
+            return
+
+        # Default models response
+        response = {
+            "object": "list",
+            "data": [
+                {
+                    "id": "llama-3.2-1b-q4",
+                    "object": "model",
+                    "created": 1234567890,
+                    "owned_by": "organization",
+                }
+            ],
+        }
+
+        # Check for custom test behaviors
+        if hasattr(self.server, "models_response_override"):
+            response = self.server.models_response_override
+
+        if hasattr(self.server, "models_status_override"):
+            self.send_response(self.server.models_status_override)
+        else:
+            self.send_response(200)
+
+        self.send_header("Content-Type", "application/json")
+        response_bytes = json.dumps(response).encode("utf-8")
+        self.send_header("Content-Length", str(len(response_bytes)))
+        self.end_headers()
+        self.wfile.write(response_bytes)
+
     def do_POST(self):
         if self.path != "/completion":
             self.send_error(404, "Not Found")
@@ -517,11 +550,12 @@ def test_negative_token_counts_rejected():
     )
 
     assert response.status is LocalInferenceStatus.FAILED
-    assert "invalid" in response.error_message.lower()
+    assert "negative" in response.error_message.lower()
     server.shutdown()
 
 
-def test_invalid_token_count_types_rejected():
+def test_string_token_count_rejected():
+    """String token counts must be rejected (fail closed)."""
     server = start_fake_server()
     port = server.server_address[1]
     server.response_override = {
@@ -539,9 +573,479 @@ def test_invalid_token_count_types_rejected():
         LocalModelRuntimeConfig(True, 512, frozenset(), True),
     )
 
-    # Non-integer token counts should be ignored (treated as None)
+    # String token counts must be rejected (fail closed)
+    assert response.status is LocalInferenceStatus.FAILED
+    assert "malformed" in response.error_code
+    server.shutdown()
+
+
+def test_boolean_true_token_count_rejected():
+    """Boolean True token count must be rejected (fail closed)."""
+    server = start_fake_server()
+    port = server.server_address[1]
+    server.response_override = {
+        "content": "output",
+        "stopped_eos": True,
+        "timings": {"prompt_n": True, "predicted_n": 5},
+    }
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    response = adapter.infer(
+        descriptor(),
+        request(),
+        LocalModelRuntimeConfig(True, 512, frozenset(), True),
+    )
+
+    assert response.status is LocalInferenceStatus.FAILED
+    assert "malformed" in response.error_code
+    assert "boolean" in response.error_message.lower()
+    server.shutdown()
+
+
+def test_boolean_false_token_count_rejected():
+    """Boolean False token count must be rejected (fail closed)."""
+    server = start_fake_server()
+    port = server.server_address[1]
+    server.response_override = {
+        "content": "output",
+        "stopped_eos": True,
+        "timings": {"prompt_n": 10, "predicted_n": False},
+    }
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    response = adapter.infer(
+        descriptor(),
+        request(),
+        LocalModelRuntimeConfig(True, 512, frozenset(), True),
+    )
+
+    assert response.status is LocalInferenceStatus.FAILED
+    assert "malformed" in response.error_code
+    assert "boolean" in response.error_message.lower()
+    server.shutdown()
+
+
+def test_float_token_count_rejected():
+    """Float token counts must be rejected (fail closed)."""
+    server = start_fake_server()
+    port = server.server_address[1]
+    server.response_override = {
+        "content": "output",
+        "stopped_eos": True,
+        "timings": {"prompt_n": 10.5, "predicted_n": 5},
+    }
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    response = adapter.infer(
+        descriptor(),
+        request(),
+        LocalModelRuntimeConfig(True, 512, frozenset(), True),
+    )
+
+    assert response.status is LocalInferenceStatus.FAILED
+    assert "malformed" in response.error_code
+    assert "not integer" in response.error_message.lower()
+    server.shutdown()
+
+
+def test_list_token_count_rejected():
+    """List token counts must be rejected (fail closed)."""
+    server = start_fake_server()
+    port = server.server_address[1]
+    server.response_override = {
+        "content": "output",
+        "stopped_eos": True,
+        "timings": {"prompt_n": [10], "predicted_n": 5},
+    }
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    response = adapter.infer(
+        descriptor(),
+        request(),
+        LocalModelRuntimeConfig(True, 512, frozenset(), True),
+    )
+
+    assert response.status is LocalInferenceStatus.FAILED
+    assert "malformed" in response.error_code
+    server.shutdown()
+
+
+def test_dict_token_count_rejected():
+    """Dict token counts must be rejected (fail closed)."""
+    server = start_fake_server()
+    port = server.server_address[1]
+    server.response_override = {
+        "content": "output",
+        "stopped_eos": True,
+        "timings": {"prompt_n": {"value": 10}, "predicted_n": 5},
+    }
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    response = adapter.infer(
+        descriptor(),
+        request(),
+        LocalModelRuntimeConfig(True, 512, frozenset(), True),
+    )
+
+    assert response.status is LocalInferenceStatus.FAILED
+    assert "malformed" in response.error_code
+    server.shutdown()
+
+
+def test_zero_token_count_accepted():
+    """Zero token count is valid and must be accepted."""
+    server = start_fake_server()
+    port = server.server_address[1]
+    server.response_override = {
+        "content": "output",
+        "stopped_eos": True,
+        "timings": {"prompt_n": 0, "predicted_n": 5},
+    }
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    response = adapter.infer(
+        descriptor(),
+        request(),
+        LocalModelRuntimeConfig(True, 512, frozenset(), True),
+    )
+
+    assert response.status is LocalInferenceStatus.SUCCEEDED
+    assert response.usage.prompt_tokens == 0
+    assert response.usage.generated_tokens == 5
+    server.shutdown()
+
+
+def test_absent_token_count_accepted():
+    """Absent token count field is valid (unknown) and accepted as None."""
+    server = start_fake_server()
+    port = server.server_address[1]
+    server.response_override = {
+        "content": "output",
+        "stopped_eos": True,
+        "timings": {},  # No token counts present
+    }
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    response = adapter.infer(
+        descriptor(),
+        request(),
+        LocalModelRuntimeConfig(True, 512, frozenset(), True),
+    )
+
+    assert response.status is LocalInferenceStatus.SUCCEEDED
+    assert response.usage.prompt_tokens is None
+    assert response.usage.generated_tokens is None
+    server.shutdown()
+
+
+# ==================================================
+# Model Attestation Tests
+# ==================================================
+
+
+def test_expected_model_accepted():
+    """Expected loaded model identity is accepted."""
+    server = start_fake_server()
+    port = server.server_address[1]
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    response = adapter.infer(
+        descriptor(),
+        request(),
+        LocalModelRuntimeConfig(True, 512, frozenset(), True),
+    )
+
     assert response.status is LocalInferenceStatus.SUCCEEDED
     server.shutdown()
+
+
+def test_wrong_model_rejected():
+    """Wrong loaded model is rejected before inference."""
+    server = start_fake_server()
+    port = server.server_address[1]
+    server.models_response_override = {
+        "object": "list",
+        "data": [{"id": "different-model", "object": "model"}],
+    }
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    with pytest.raises(LlamaCppServerIdentityError, match="does not match"):
+        adapter.infer(
+            descriptor(),
+            request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True),
+        )
+
+    server.shutdown()
+
+
+def test_no_model_loaded_rejected():
+    """Empty models list is rejected."""
+    server = start_fake_server()
+    port = server.server_address[1]
+    server.models_response_override = {
+        "object": "list",
+        "data": [],
+    }
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    with pytest.raises(LlamaCppServerIdentityError, match="no models available"):
+        adapter.infer(
+            descriptor(),
+            request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True),
+        )
+
+    server.shutdown()
+
+
+def test_ambiguous_multiple_models_rejected():
+    """Multiple models in response is rejected (ambiguous authority)."""
+    server = start_fake_server()
+    port = server.server_address[1]
+    server.models_response_override = {
+        "object": "list",
+        "data": [
+            {"id": "model-1", "object": "model"},
+            {"id": "model-2", "object": "model"},
+        ],
+    }
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    with pytest.raises(LlamaCppServerIdentityError, match="ambiguous model authority"):
+        adapter.infer(
+            descriptor(),
+            request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True),
+        )
+
+    server.shutdown()
+
+
+def test_malformed_models_metadata_rejected():
+    """Malformed metadata response is rejected."""
+    server = start_fake_server()
+    port = server.server_address[1]
+    server.models_response_override = "not a dict"
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    with pytest.raises(LlamaCppServerIdentityError, match="not a JSON object"):
+        adapter.infer(
+            descriptor(),
+            request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True),
+        )
+
+    server.shutdown()
+
+
+def test_missing_data_field_rejected():
+    """Missing 'data' field in metadata is rejected."""
+    server = start_fake_server()
+    port = server.server_address[1]
+    server.models_response_override = {"object": "list"}
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    with pytest.raises(LlamaCppServerIdentityError, match="missing 'data' field"):
+        adapter.infer(
+            descriptor(),
+            request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True),
+        )
+
+    server.shutdown()
+
+
+def test_data_not_list_rejected():
+    """'data' field that is not a list is rejected."""
+    server = start_fake_server()
+    port = server.server_address[1]
+    server.models_response_override = {
+        "object": "list",
+        "data": "not a list",
+    }
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    with pytest.raises(LlamaCppServerIdentityError, match="not a list"):
+        adapter.infer(
+            descriptor(),
+            request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True),
+        )
+
+    server.shutdown()
+
+
+def test_model_info_not_dict_rejected():
+    """Model info that is not a dict is rejected."""
+    server = start_fake_server()
+    port = server.server_address[1]
+    server.models_response_override = {
+        "object": "list",
+        "data": ["not a dict"],
+    }
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    with pytest.raises(LlamaCppServerIdentityError, match="not a JSON object"):
+        adapter.infer(
+            descriptor(),
+            request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True),
+        )
+
+    server.shutdown()
+
+
+def test_missing_model_id_rejected():
+    """Missing model 'id' field is rejected."""
+    server = start_fake_server()
+    port = server.server_address[1]
+    server.models_response_override = {
+        "object": "list",
+        "data": [{"object": "model"}],
+    }
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    with pytest.raises(LlamaCppServerIdentityError, match="missing 'id' field"):
+        adapter.infer(
+            descriptor(),
+            request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True),
+        )
+
+    server.shutdown()
+
+
+def test_non_string_model_id_rejected():
+    """Non-string model ID is rejected."""
+    server = start_fake_server()
+    port = server.server_address[1]
+    server.models_response_override = {
+        "object": "list",
+        "data": [{"id": 12345, "object": "model"}],
+    }
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    with pytest.raises(LlamaCppServerIdentityError, match="not string"):
+        adapter.infer(
+            descriptor(),
+            request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True),
+        )
+
+    server.shutdown()
+
+
+def test_oversized_metadata_rejected():
+    """Oversized metadata response is rejected."""
+    server = start_fake_server()
+    port = server.server_address[1]
+    # Create large response
+    server.models_response_override = {
+        "object": "list",
+        "data": [{"id": "x" * 10000, "object": "model"}],
+    }
+
+    config = adapter_config(
+        endpoint=f"http://127.0.0.1:{port}",
+        maximum_response_bytes=100,
+    )
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    with pytest.raises(LlamaCppServerIdentityError, match="maximum size"):
+        adapter.infer(
+            descriptor(),
+            request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True),
+        )
+
+    server.shutdown()
+
+
+def test_metadata_http_error_rejected():
+    """HTTP error from metadata endpoint is rejected."""
+    server = start_fake_server()
+    port = server.server_address[1]
+    server.models_status_override = 500
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    with pytest.raises(LlamaCppServerIdentityError, match="HTTP 500"):
+        adapter.infer(
+            descriptor(),
+            request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True),
+        )
+
+    server.shutdown()
+
+
+def test_metadata_uses_loopback_only():
+    """Metadata request respects loopback-only restriction."""
+    # This is enforced at config validation time
+    with pytest.raises(LlamaCppNetworkPolicyError):
+        adapter_config(endpoint="http://192.168.1.1:8080")
+
+
+def test_metadata_does_not_use_proxies():
+    """Metadata request does not use environmental proxies."""
+    # urllib3.PoolManager by default does not use proxies
+    with mock.patch.dict(os.environ, {"HTTP_PROXY": "http://evil.com:8080"}):
+        server = start_fake_server()
+        port = server.server_address[1]
+
+        config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+        adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+        # If proxy were used, this would fail to reach the test server
+        response = adapter.infer(
+            descriptor(),
+            request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True),
+        )
+
+        assert response.status is LocalInferenceStatus.SUCCEEDED
+        server.shutdown()
+
+
+# ==================================================
+# Response Measurements and Termination Tests
+# ==================================================
 
 
 def test_resource_measurements_extracted():
@@ -663,20 +1167,18 @@ def test_http_500_returns_error_response():
 
 
 def test_connection_refused_returns_error_response():
+    """Connection refused during attestation raises error before inference."""
     # Use a port that's not listening
     config = adapter_config(endpoint="http://127.0.0.1:1")
     adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
 
-    response = adapter.infer(
-        descriptor(),
-        request(),
-        LocalModelRuntimeConfig(True, 512, frozenset(), True),
-    )
-
-    assert response.status is LocalInferenceStatus.FAILED
-    assert response.error_code == "http_request_failed"
-    assert response.locality is LocalityType.LOCAL
-    assert response.cloud_escalation_count == 0
+    # Connection refused during attestation raises LlamaCppServerIdentityError
+    with pytest.raises(LlamaCppServerIdentityError, match="failed to query model metadata"):
+        adapter.infer(
+            descriptor(),
+            request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True),
+        )
 
 
 def test_timeout_returns_error_response():
@@ -707,6 +1209,47 @@ def test_timeout_returns_error_response():
     )
 
     assert response.status is LocalInferenceStatus.FAILED
+    FakeLlamaServer.do_POST = original_do_POST
+    server.shutdown()
+
+
+def test_connection_loss_after_transmission_requires_reconciliation():
+    """Connection loss after request transmission returns FAILED status.
+
+    This documents that ambiguous completion (where we cannot know if the
+    server processed the request) is represented as FAILED, which triggers
+    reconciliation-required semantics in the runtime, not as a safely
+    retryable ordinary failure.
+    """
+    server = start_fake_server()
+    port = server.server_address[1]
+
+    # Mock server to close connection during response
+    original_do_POST = FakeLlamaServer.do_POST
+
+    def connection_loss_POST(self):
+        # Read request (simulating server received it)
+        content_length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(content_length)
+        # Close connection without response (ambiguous completion)
+        self.wfile.close()
+
+    FakeLlamaServer.do_POST = connection_loss_POST
+
+    config = adapter_config(endpoint=f"http://127.0.0.1:{port}")
+    adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    response = adapter.infer(
+        descriptor(),
+        request(),
+        LocalModelRuntimeConfig(True, 512, frozenset(), True),
+    )
+
+    # Ambiguous completion is represented as FAILED (reconciliation required)
+    assert response.status is LocalInferenceStatus.FAILED
+    assert response.error_code == "http_request_failed"
+    # Not marked as safely retryable - runtime must use reconciliation
+
     FakeLlamaServer.do_POST = original_do_POST
     server.shutdown()
 
@@ -745,14 +1288,21 @@ def test_malformed_json_response_returns_error():
 
 
 def test_oversized_response_rejected():
+    """Oversized inference response is rejected."""
     server = start_fake_server()
     port = server.server_address[1]
 
-    # Configure very small maximum
+    # Configure moderate maximum (enough for attestation, too small for large inference)
     config = adapter_config(
-        endpoint=f"http://127.0.0.1:{port}", maximum_response_bytes=10
+        endpoint=f"http://127.0.0.1:{port}", maximum_response_bytes=200
     )
     adapter = LlamaCppLocalAdapter(config=config, clock=fixed_clock)
+
+    # Override to return very large inference response
+    server.response_override = {
+        "content": "x" * 10000,
+        "stopped_eos": True,
+    }
 
     response = adapter.infer(
         descriptor(),
