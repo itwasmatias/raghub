@@ -98,6 +98,18 @@ from federation.worker_execution import (
     WorkerExecutionStateError,
     WorkerExecutionStatus,
 )
+from federation.worker_governance import (
+    BudgetDecision,
+    BudgetPolicy,
+    ExecutionLocality,
+    ExecutionPreference,
+    GovernedWorker,
+    WorkerAvailability,
+    WorkerBudgetGovernor,
+    WorkerCapacity,
+    WorkerCostClass,
+    WorkerProviderMetadata,
+)
 
 __all__ = [
     # Node Registry and Capabilities
@@ -184,4 +196,14 @@ __all__ = [
     "WorkerExecutionResultEnvelope",
     "WorkerExecutionStateError",
     "WorkerExecutionStatus",
+    "BudgetDecision",
+    "BudgetPolicy",
+    "ExecutionLocality",
+    "ExecutionPreference",
+    "GovernedWorker",
+    "WorkerAvailability",
+    "WorkerBudgetGovernor",
+    "WorkerCapacity",
+    "WorkerCostClass",
+    "WorkerProviderMetadata",
 ]
