@@ -14,6 +14,10 @@ from federation import (
     WorkerExecutionResultEnvelope,
     WorkerExecutionStatus,
 )
+from federation.dispatch_offer import DispatchOfferSnapshot
+from federation.node_record import NodeRecord
+from federation.routing_decision import RoutingDecision, RoutingOutcome
+from federation.task_assignment import TaskAssignment
 from research_mission import (
     MissionCheckpointConflictError, MissionCheckpointCorruptionError,
     MissionCheckpointStore, MissionResumeCoordinator, ResearchMission,
@@ -35,7 +39,7 @@ def mission():
     ) for index, role in enumerate(ResearchRole, 1))
     item = ResearchMission("mission-1", "objective")
     item.plan = ResearchMissionPlan("mission-1", tasks)
-    item.status = ResearchMissionStatus.DISPATCHED
+    item.status = ResearchMissionStatus.PLANNED
     return item
 
 
@@ -66,6 +70,37 @@ def attempt(task_id, status, *, approval=False):
 def coordinator(tmp_path):
     return MissionResumeCoordinator(MissionCheckpointStore(tmp_path / "checkpoints.jsonl",
         integrity_key=KEY), clock=lambda: NOW)
+
+
+def add_authoritative_links(item, *, fingerprint="a" * 64):
+    decisions = []
+    offers = []
+    for task in item.plan.tasks:
+        request_value = task.to_task_request()
+        assignment = TaskAssignment(request_value, NodeRecord(
+            "worker-1", "worker.local", "Fedora", capabilities=set(task.required_capabilities)))
+        assignment_id = f"assignment-{task.task_id}"
+        decisions.append(RoutingDecision(request_value, RoutingOutcome.SUCCESS,
+            assignment=assignment, assignment_id=assignment_id))
+        offer = object.__new__(DispatchOfferSnapshot)
+        values = {
+            "offer_id": f"offer-{task.task_id}", "assignment_id": assignment_id,
+            "assignment_fingerprint": "b" * 64, "task_id": task.task_id,
+            "mission_id": item.mission_id, "coordinator_node_id": "coordinator-1",
+            "worker_node_id": "worker-1", "required_capabilities": (),
+            "authorization_level": task.authorization_level,
+            "approval_required": task.approval_required,
+            "authorization_metadata": (("execution_fingerprint", fingerprint),),
+            "approval_metadata": (), "created_at": NOW, "expires_at": NOW,
+            "audit_history": (), "status": "accepted", "terminal_at": NOW,
+            "resolution_reason": None,
+        }
+        for name, value in values.items(): object.__setattr__(offer, name, value)
+        offers.append(offer)
+    item.routing_decisions = tuple(decisions)
+    item.dispatch_offers = tuple(offers)
+    item.status = ResearchMissionStatus.DISPATCHED
+    return item
 
 
 def test_checkpoint_active_mission_and_deterministic_pending_resume(tmp_path):
@@ -213,3 +248,58 @@ def test_resume_decision_is_immutable_and_deterministically_ordered(tmp_path):
     decision = authority.resume(item)
     assert tuple(task.task_id for task in decision.tasks) == ("task-1", "task-2", "task-3")
     with pytest.raises(Exception): decision.tasks += ()
+
+
+def test_authenticated_but_internally_inconsistent_store_payload_is_rejected(tmp_path):
+    item = mission(); item.status = ResearchMissionStatus.PLANNED
+    state = ResearchMissionResultCoordinator(item).inspect(); authority = coordinator(tmp_path)
+    saved = authority.checkpoint(item, result_state=state, attempts=())
+    record = json.loads((tmp_path / "checkpoints.jsonl").read_text())
+    payload = record["payload"]
+    (tmp_path / "checkpoints.jsonl").unlink()
+    payload["state_fingerprint"] = "0" * 64
+    payload["checkpoint_id"] = "pending"
+    with pytest.raises((MissionCheckpointCorruptionError, ValueError)):
+        authority.store.save(payload)
+
+
+def test_dispatched_mission_requires_complete_routing_and_offer_linkage(tmp_path):
+    item = mission(); item.status = ResearchMissionStatus.DISPATCHED
+    state = ResearchMissionResultCoordinator(item).inspect()
+    with pytest.raises(ValueError, match="linkage"):
+        coordinator(tmp_path).checkpoint(item, result_state=state, attempts=())
+
+
+def test_dispatch_authority_and_fingerprint_are_composed_and_preserved(tmp_path):
+    item = add_authoritative_links(mission()); state = ResearchMissionResultCoordinator(item).inspect()
+    saved = coordinator(tmp_path).checkpoint(item, result_state=state, attempts=())
+    assert saved.tasks[0].execution_fingerprint == "a" * 64
+    assert saved.tasks[0].assignment_id == "assignment-task-1"
+    assert saved.tasks[0].dispatch_offer_id == "offer-task-1"
+    object.__setattr__(item.dispatch_offers[0], "approval_required", True)
+    with pytest.raises(ValueError, match="authority"):
+        coordinator(tmp_path / "foreign").checkpoint(item, result_state=state, attempts=())
+
+
+def test_execution_fingerprint_must_match_dispatch_evidence(tmp_path):
+    item = add_authoritative_links(mission()); state = ResearchMissionResultCoordinator(item).inspect()
+    forged = replace(request("task-1"), execution_fingerprint="c" * 64)
+    with pytest.raises(ValueError, match="fingerprint"):
+        coordinator(tmp_path).checkpoint(item, result_state=state,
+            attempts=(WorkerExecutionAttempt(forged, WorkerExecutionStatus.ACCEPTED),))
+
+
+def test_execution_worker_must_match_dispatch_target(tmp_path):
+    item = add_authoritative_links(mission()); state = ResearchMissionResultCoordinator(item).inspect()
+    forged = replace(request("task-1"), execution_fingerprint="a" * 64,
+        worker_node_id="foreign-worker")
+    with pytest.raises(ValueError, match="actor identity"):
+        coordinator(tmp_path).checkpoint(item, result_state=state,
+            attempts=(WorkerExecutionAttempt(forged, WorkerExecutionStatus.ACCEPTED),))
+
+
+def test_completed_mission_with_unresolved_tasks_cannot_be_resumed(tmp_path):
+    item = add_authoritative_links(mission()); item.status = ResearchMissionStatus.COMPLETED
+    state = ResearchMissionResultCoordinator(item).inspect()
+    with pytest.raises(ValueError, match="completed mission"):
+        coordinator(tmp_path).checkpoint(item, result_state=state, attempts=())

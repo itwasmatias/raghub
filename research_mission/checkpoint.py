@@ -18,7 +18,12 @@ from federation.integrity import authentication_tag, authenticates, require_inte
 from federation.dispatch_offer import DispatchOfferSnapshot
 from federation.routing_decision import RoutingDecision, RoutingOutcome
 from federation.worker_execution import WorkerExecutionAttempt, WorkerExecutionStatus
-from research_mission.models import ResearchMission, ResearchMissionPlan, ResearchTaskSpec
+from research_mission.models import (
+    ResearchMission,
+    ResearchMissionPlan,
+    ResearchMissionStatus,
+    ResearchTaskSpec,
+)
 from research_mission.result_runtime import ResearchMissionResultState
 from research_mission.results import ResearchTaskResultStatus
 
@@ -87,6 +92,12 @@ class ResumeDecision:
 
     @property
     def automatic_resume_safe(self) -> bool:
+        if self.checkpoint.mission_status in {
+            ResearchMissionStatus.COMPLETED.value,
+            ResearchMissionStatus.FAILED.value,
+            ResearchMissionStatus.CANCELLED.value,
+        }:
+            return False
         return any(item.classification is ResumeClassification.SAFE_TO_RESUME for item in self.tasks) and not any(
             item.classification is ResumeClassification.RECONCILIATION_REQUIRED
             for item in self.tasks
@@ -164,6 +175,36 @@ def plan_fingerprint(plan: ResearchMissionPlan) -> str:
     return hashlib.sha256(_canonical({"mission_id": plan.mission_id, "tasks": tasks})).hexdigest()
 
 
+def _payload_state_fingerprint(payload):
+    return hashlib.sha256(_canonical({
+        "plan_fingerprint": payload["plan_fingerprint"],
+        "mission_status": payload["mission_status"],
+        "tasks": payload["tasks"],
+    })).hexdigest()
+
+
+def _payload_checkpoint_id(payload):
+    return "checkpoint-" + hashlib.sha256(_canonical({
+        "mission_id": payload["mission_id"],
+        "plan_fingerprint": payload["plan_fingerprint"],
+        "revision": payload["revision"],
+        "state_fingerprint": payload["state_fingerprint"],
+    })).hexdigest()
+
+
+def _dispatch_execution_fingerprint(offer):
+    values = []
+    for metadata in (offer.authorization_metadata, offer.approval_metadata):
+        for key, value in metadata:
+            if key == "execution_fingerprint":
+                values.append(_digest(value, "dispatch execution_fingerprint"))
+    if not values:
+        return None
+    if len(set(values)) != 1:
+        raise ValueError("dispatch execution fingerprint evidence conflicts")
+    return values[0]
+
+
 class MissionCheckpointStore:
     """Authenticated append-only checkpoint revisions protected across processes."""
 
@@ -190,10 +231,11 @@ class MissionCheckpointStore:
                     return latest
                 payload = dict(payload)
                 payload["revision"] = 1 if latest is None else latest.revision + 1
-                checkpoint_id = "checkpoint-" + hashlib.sha256(_canonical({
-                    "mission_id": payload["mission_id"], "plan_fingerprint": payload["plan_fingerprint"],
-                    "revision": payload["revision"], "state_fingerprint": payload["state_fingerprint"],
-                })).hexdigest()
+                if payload["state_fingerprint"] != _payload_state_fingerprint(payload):
+                    raise MissionCheckpointCorruptionError(
+                        "checkpoint state fingerprint does not match payload"
+                    )
+                checkpoint_id = _payload_checkpoint_id(payload)
                 payload["checkpoint_id"] = checkpoint_id
                 unsigned = {"schema": _SCHEMA, "sequence": len(records) + 1,
                     "predecessor": records[-1]["authentication_tag"] if records else _GENESIS,
@@ -286,6 +328,10 @@ class MissionCheckpointStore:
             created = _time(datetime.fromisoformat(payload["created_at"]), "created_at")
             tasks = tuple(MissionCheckpointStore._task(item) for item in payload["tasks"])
             if tuple(task.sequence for task in tasks) != tuple(range(1, len(tasks) + 1)): raise ValueError("task order")
+            if payload["state_fingerprint"] != _payload_state_fingerprint(payload):
+                raise ValueError("state fingerprint mismatch")
+            if payload["checkpoint_id"] != _payload_checkpoint_id(payload):
+                raise ValueError("checkpoint identity mismatch")
             return MissionCheckpoint(payload["checkpoint_id"], payload["mission_id"], payload["plan_fingerprint"],
                 payload["revision"], _identifier(payload["mission_status"], "mission_status"), tasks, created,
                 payload["state_fingerprint"])
@@ -341,6 +387,14 @@ class MissionResumeCoordinator:
             request = decision.task_request
             if request.mission_id != mission.mission_id or request.task_id not in planned:
                 raise ValueError("routing decision belongs to foreign mission/task")
+            task = planned[request.task_id]
+            if (
+                request.authorization_level != task.authorization_level
+                or request.approval_required != task.approval_required
+                or request.expected_result != task.expected_result
+                or request.required_capabilities != set(task.required_capabilities)
+            ):
+                raise ValueError("routing decision authority does not match planned task")
             if request.task_id in routing: raise ValueError("duplicate routing decision")
             if decision.outcome is RoutingOutcome.SUCCESS:
                 _identifier(decision.assignment_id, "assignment_id")
@@ -355,7 +409,38 @@ class MissionResumeCoordinator:
             decision = routing.get(offer.task_id)
             if decision is not None and decision.assignment_id != offer.assignment_id:
                 raise ValueError("routing and dispatch linkage conflict")
+            if decision is not None and decision.assigned_node_id != offer.worker_node_id:
+                raise ValueError("routing and dispatch worker identity conflict")
+            task = planned[offer.task_id]
+            if (
+                offer.authorization_level != task.authorization_level
+                or offer.approval_required != task.approval_required
+                or set(offer.required_capabilities)
+                != {capability.name for capability in task.required_capabilities}
+            ):
+                raise ValueError("dispatch authority does not match planned task")
+            _dispatch_execution_fingerprint(offer)
             offers[offer.task_id] = offer
+        if mission.status in {
+            ResearchMissionStatus.ROUTED,
+            ResearchMissionStatus.DISPATCHED,
+            ResearchMissionStatus.COMPLETED,
+        } and set(routing) != set(planned):
+            raise ValueError("mission routing linkage is incomplete")
+        if mission.status in {
+            ResearchMissionStatus.ROUTED,
+            ResearchMissionStatus.DISPATCHED,
+            ResearchMissionStatus.COMPLETED,
+        } and any(
+            decision.outcome is not RoutingOutcome.SUCCESS
+            for decision in routing.values()
+        ):
+            raise ValueError("routed mission contains unsuccessful routing evidence")
+        if mission.status in {
+            ResearchMissionStatus.DISPATCHED,
+            ResearchMissionStatus.COMPLETED,
+        } and set(offers) != set(planned):
+            raise ValueError("mission dispatch linkage is incomplete")
         result_items = tuple(result_state.results)
         if len({item.task_id for item in result_items}) != len(result_items):
             raise ValueError("result state contains duplicate task results")
@@ -415,6 +500,8 @@ class MissionResumeCoordinator:
         results = {item.task_id: item for item in result_items}
         if any(item.mission_id != mission.mission_id or item.task_id not in planned for item in result_state.results):
             raise ValueError("result state contains foreign result")
+        if any(item.role is not planned[item.task_id].role for item in result_items):
+            raise ValueError("result role does not match planned task")
         evidence = {}
         evidence_ids = set()
         for item in result_state.evidence:
@@ -427,7 +514,9 @@ class MissionResumeCoordinator:
         task_payloads = []
         for task in mission.plan.tasks:
             execution = by_task.get(task.task_id); result = results.get(task.task_id)
-            classification = self._classify(task, execution, result, completed)
+            classification = self._classify(
+                task, execution, result, completed, mission.status
+            )
             refs = set(evidence.get(task.task_id, ()))
             if execution and execution.result: refs.update(execution.result.evidence_references)
             req = execution.request if execution else None
@@ -439,6 +528,16 @@ class MissionResumeCoordinator:
             dispatch_offer_id = req.dispatch_offer_id if req else (offer.offer_id if offer else None)
             if req and offer and (req.assignment_id != offer.assignment_id or req.dispatch_offer_id != offer.offer_id):
                 raise ValueError("execution and dispatch linkage conflict")
+            if req and offer and (
+                req.worker_node_id != offer.worker_node_id
+                or req.coordinator_node_id != offer.coordinator_node_id
+            ):
+                raise ValueError("execution and dispatch actor identity conflict")
+            if req and routed and req.assignment_id != routed.assignment_id:
+                raise ValueError("execution and routing assignment conflict")
+            offer_fingerprint = _dispatch_execution_fingerprint(offer) if offer else None
+            if req and offer and req.execution_fingerprint != offer_fingerprint:
+                raise ValueError("execution fingerprint does not match dispatch evidence")
             task_payloads.append({"task_id": task.task_id, "sequence": task.sequence,
                 "classification": classification.value,
                 "assignment_id": assignment_id,
@@ -446,9 +545,16 @@ class MissionResumeCoordinator:
                 "execution_attempt_id": req.execution_attempt_id if req else None,
                 "execution_status": execution.status.value if execution else None,
                 "approval_required": task.approval_required,
-                "execution_fingerprint": req.execution_fingerprint if req else None,
+                "execution_fingerprint": (
+                    req.execution_fingerprint if req else offer_fingerprint
+                ),
                 "result_reference": f"result:{task.task_id}" if result else None,
                 "evidence_references": sorted(refs)})
+        if mission.status is ResearchMissionStatus.COMPLETED and any(
+            item["classification"] != ResumeClassification.ALREADY_COMPLETED.value
+            for item in task_payloads
+        ):
+            raise ValueError("completed mission contains unresolved tasks")
         fingerprint = plan_fingerprint(mission.plan)
         state = {"plan_fingerprint": fingerprint, "mission_status": mission.status.value,
                  "tasks": task_payloads}
@@ -470,7 +576,7 @@ class MissionResumeCoordinator:
         return ResumeDecision(latest, latest.tasks)
 
     @staticmethod
-    def _classify(task, execution, result, completed):
+    def _classify(task, execution, result, completed, mission_status):
         if result is not None:
             return (ResumeClassification.ALREADY_COMPLETED if result.status is ResearchTaskResultStatus.COMPLETED
                     else ResumeClassification.FAILED_TERMINAL)
@@ -481,6 +587,11 @@ class MissionResumeCoordinator:
                                     WorkerExecutionStatus.RECONCILIATION_REQUIRED}:
                 return ResumeClassification.RECONCILIATION_REQUIRED
             if execution.status is not WorkerExecutionStatus.ACCEPTED: raise ValueError("unknown execution state")
+        if mission_status in {
+            ResearchMissionStatus.FAILED,
+            ResearchMissionStatus.CANCELLED,
+        }:
+            return ResumeClassification.FAILED_TERMINAL
         if not set(task.depends_on).issubset(completed): return ResumeClassification.PENDING
         if task.approval_required: return ResumeClassification.BLOCKED_ON_APPROVAL
         return ResumeClassification.SAFE_TO_RESUME
