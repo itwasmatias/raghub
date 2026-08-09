@@ -11,6 +11,9 @@ Comprehensive tests for provider-neutral measurement foundation, covering:
 - Serialization
 """
 
+from dataclasses import replace
+import math
+
 import pytest
 
 from tools.ai_controller.local_capability_baseline import (
@@ -634,6 +637,126 @@ class TestSerialization:
         import json
         json_str = json.dumps(data)
         assert json_str is not None
+
+
+class TestIntegrityHardening:
+    @staticmethod
+    def profile(**changes):
+        values = dict(worker_id="worker-001", profile_id="profile-001",
+            created_at="2026-08-09T12:00:00Z", locality=LocalityType.LOCAL,
+            provider_identifier=None, model_identifier="model",
+            cost_class=CostClass.ZERO, capabilities=frozenset({"analysis"}),
+            typical_availability_hours=12.0, max_concurrent_tasks=2,
+            hardware_facts={"nested": {"ram_gb": 16}}, runtime_facts={})
+        values.update(changes)
+        return WorkerCapabilityProfile(**values)
+
+    @staticmethod
+    def measurement(**changes):
+        values = dict(measurement_id="measurement-001", task_id="task-001",
+            worker_id="worker-001", profile_fingerprint="a" * 64,
+            started_at="2026-08-09T12:00:00Z",
+            completed_at="2026-08-09T12:01:00Z", elapsed_seconds=60.0,
+            outcome=TaskOutcome.SUCCESS, success=True,
+            verification_result="passed", attempt_number=1,
+            human_intervention_count=0, retry_count=0, zero_cloud_cost=True,
+            cloud_escalation_count=0, estimated_cloud_cost_usd=None,
+            execution_strategy="local", locality=LocalityType.LOCAL,
+            provider_identifier=None, model_identifier="model",
+            evidence_metadata={"nested": {"verified": True}})
+        values.update(changes)
+        return TaskMeasurement(**values)
+
+    @staticmethod
+    def baseline(**changes):
+        values = dict(baseline_id="baseline-001",
+            created_at="2026-08-09T12:00:00Z", execution_strategy="local",
+            task_count=1, success_count=1, failure_count=0,
+            total_elapsed_seconds=60.0, mean_elapsed_seconds=60.0,
+            median_elapsed_seconds=60.0, total_human_interventions=0,
+            total_retries=0, total_cloud_cost_usd=None,
+            zero_cost_task_count=1, measurements=("measurement-001",))
+        values.update(changes)
+        return ComparisonBaseline(**values)
+
+    def test_caller_owned_nested_metadata_cannot_mutate_records(self):
+        hardware = {"nested": {"ram_gb": 16}}
+        metadata = {"nested": {"verified": True}}
+        profile = self.profile(hardware_facts=hardware)
+        measurement = self.measurement(evidence_metadata=metadata)
+        profile_fingerprint = profile.profile_fingerprint()
+        measurement_fingerprint = measurement.measurement_fingerprint()
+        hardware["nested"]["ram_gb"] = 1
+        metadata["nested"]["verified"] = False
+        assert profile.to_dict()["hardware_facts"]["nested"]["ram_gb"] == 16
+        assert measurement.to_dict()["evidence_metadata"]["nested"]["verified"] is True
+        assert profile.profile_fingerprint() == profile_fingerprint
+        assert measurement.measurement_fingerprint() == measurement_fingerprint
+
+    @pytest.mark.parametrize("field,value", [
+        ("typical_availability_hours", 6.0), ("max_concurrent_tasks", 3),
+        ("created_at", "2026-08-09T13:00:00Z"),
+    ])
+    def test_profile_fingerprint_binds_all_profile_facts(self, field, value):
+        original = self.profile()
+        assert replace(original, **{field: value}).profile_fingerprint() != original.profile_fingerprint()
+
+    @pytest.mark.parametrize("field,value", [
+        ("completed_at", "2026-08-09T12:02:00Z"), ("elapsed_seconds", 120.0),
+        ("human_intervention_count", 1),
+        ("evidence_metadata", {"different": True}),
+    ])
+    def test_measurement_fingerprint_binds_all_measurement_facts(self, field, value):
+        original = self.measurement()
+        assert replace(original, **{field: value}).measurement_fingerprint() != original.measurement_fingerprint()
+
+    def test_measurement_fingerprint_binds_consistent_failure_outcome(self):
+        original = self.measurement()
+        failure = replace(original, outcome=TaskOutcome.FAILURE, success=False)
+        assert failure.measurement_fingerprint() != original.measurement_fingerprint()
+
+    def test_baseline_fingerprint_binds_aggregate_facts(self):
+        original = self.baseline()
+        assert replace(original, total_elapsed_seconds=61.0).baseline_fingerprint() != original.baseline_fingerprint()
+
+    @pytest.mark.parametrize("factory,timestamp_field", [
+        (profile.__func__, "created_at"),
+        (measurement.__func__, "started_at"),
+        (baseline.__func__, "created_at"),
+    ])
+    def test_naive_timestamps_fail_closed(self, factory, timestamp_field):
+        with pytest.raises(ValueError, match="timezone-aware"):
+            factory(**{timestamp_field: "2026-08-09T12:00:00"})
+
+    @pytest.mark.parametrize("factory,field", [
+        (profile.__func__, "typical_availability_hours"),
+        (measurement.__func__, "elapsed_seconds"),
+        (measurement.__func__, "estimated_cloud_cost_usd"),
+        (baseline.__func__, "total_elapsed_seconds"),
+    ])
+    def test_non_finite_numbers_fail_closed(self, factory, field):
+        with pytest.raises(ValueError, match="finite"):
+            factory(**{field: math.nan})
+
+    def test_success_flag_cannot_contradict_outcome(self):
+        with pytest.raises(ValueError, match="success must match outcome"):
+            self.measurement(outcome=TaskOutcome.FAILURE, success=True)
+
+    def test_baseline_counts_cannot_exceed_task_count(self):
+        with pytest.raises(ValueError, match="counts cannot exceed task_count"):
+            self.baseline(success_count=1, failure_count=1)
+
+    @pytest.mark.parametrize("factory,field", [
+        (profile.__func__, "provider_identifier"),
+        (profile.__func__, "model_identifier"),
+        (measurement.__func__, "provider_identifier"),
+        (measurement.__func__, "model_identifier"),
+        (measurement.__func__, "verification_result"),
+        (measurement.__func__, "profile_fingerprint"),
+    ])
+    def test_optional_text_fields_fail_at_construction(self, factory, field):
+        with pytest.raises(TypeError, match=field):
+            factory(**{field: object()})
 
     def test_measurement_to_dict_serializable(self):
         """Measurement to_dict should produce JSON-serializable data."""
