@@ -123,6 +123,14 @@ class FakeLlamaServer(BaseHTTPRequestHandler):
         if self.path != "/v1/models":
             self.send_error(404, "Not Found")
             return
+        self.server.models_request_count += 1
+
+        if hasattr(self.server, "models_redirect_location"):
+            self.send_response(self.server.models_redirect_status)
+            self.send_header("Location", self.server.models_redirect_location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
 
         # Default models response
         response = {
@@ -156,9 +164,17 @@ class FakeLlamaServer(BaseHTTPRequestHandler):
         if self.path != "/completion":
             self.send_error(404, "Not Found")
             return
+        self.server.inference_request_count += 1
 
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
+
+        if hasattr(self.server, "inference_redirect_location"):
+            self.send_response(self.server.inference_redirect_status)
+            self.send_header("Location", self.server.inference_redirect_location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
 
         try:
             req = json.loads(body.decode("utf-8"))
@@ -207,8 +223,36 @@ def start_fake_server(port=0):
     """Start a fake llama-server on loopback."""
     server = HTTPServer(("127.0.0.1", port), FakeLlamaServer)
     server.last_request = None
+    server.models_request_count = 0
+    server.inference_request_count = 0
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
+    return server
+
+
+class RedirectTargetServer(BaseHTTPRequestHandler):
+    """Records any redirect follow without serving useful content."""
+
+    def _record(self):
+        self.server.contact_count += 1
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length:
+            self.rfile.read(content_length)
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    do_GET = _record
+    do_POST = _record
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_redirect_target():
+    server = HTTPServer(("127.0.0.1", 0), RedirectTargetServer)
+    server.contact_count = 0
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
 
@@ -1126,6 +1170,67 @@ def test_termination_reason_mapped_correctly():
 # ==================================================
 # HTTP Error Handling Tests
 # ==================================================
+
+
+def test_metadata_redirect_is_not_followed_retried_or_allowed_to_infer():
+    source = start_fake_server()
+    target = start_redirect_target()
+    source.models_redirect_status = 302
+    source.models_redirect_location = (
+        f"http://127.0.0.1:{target.server_address[1]}/redirected-models"
+    )
+    adapter = LlamaCppLocalAdapter(
+        config=adapter_config(
+            endpoint=f"http://127.0.0.1:{source.server_address[1]}"
+        ),
+        clock=fixed_clock,
+    )
+
+    try:
+        with pytest.raises(LlamaCppServerIdentityError, match="HTTP 302"):
+            adapter.infer(
+                descriptor(),
+                request(),
+                LocalModelRuntimeConfig(True, 512, frozenset(), True),
+            )
+        assert source.models_request_count == 1
+        assert source.inference_request_count == 0
+        assert source.last_request is None
+        assert target.contact_count == 0
+    finally:
+        source.shutdown()
+        target.shutdown()
+
+
+def test_inference_307_redirect_is_not_followed_replayed_or_retried():
+    source = start_fake_server()
+    target = start_redirect_target()
+    source.inference_redirect_status = 307
+    source.inference_redirect_location = (
+        f"http://127.0.0.1:{target.server_address[1]}/redirected-inference"
+    )
+    adapter = LlamaCppLocalAdapter(
+        config=adapter_config(
+            endpoint=f"http://127.0.0.1:{source.server_address[1]}"
+        ),
+        clock=fixed_clock,
+    )
+
+    try:
+        result = adapter.infer(
+            descriptor(),
+            request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True),
+        )
+        assert result.status is LocalInferenceStatus.FAILED
+        assert result.error_code == "http_request_failed"
+        assert "307" in result.error_message
+        assert source.models_request_count == 1
+        assert source.inference_request_count == 1
+        assert target.contact_count == 0
+    finally:
+        source.shutdown()
+        target.shutdown()
 
 
 def test_http_404_returns_error_response():
