@@ -287,6 +287,9 @@ class AIWorkBridge:
     - Does NOT allow bypassing approval requirements
     - Does NOT allow lowering authorization levels
     - Fails closed on invalid, unauthorized, or conflicting proposals
+
+    NOTE: This is the foundation validator. For durable lifecycle coordination,
+    use ProposalCoordinator with ProposalStore.
     """
 
     def __init__(
@@ -541,3 +544,146 @@ class AIWorkBridge:
             raise ProposalValidationError(f"unknown action type: {action_type}")
 
         return params
+
+
+class ProposalCoordinator:
+    """
+    Durable proposal coordinator with exact idempotency.
+
+    Coordinates:
+    - AIWorkBridge validation
+    - ProposalStore durable submission
+    - Restart-safe exact idempotency
+    - Conflict detection
+
+    This coordinator provides the durable entry point for AI worker proposals.
+    Actual routing, dispatch, approval, and execution are handled by existing
+    federation systems (TaskRouter, TaskDispatchCoordinator, ApprovalCenter,
+    ConsoleActionExecutionRuntime).
+    """
+
+    def __init__(
+        self,
+        *,
+        ai_work_bridge: AIWorkBridge,
+        proposal_store: "ProposalStore",  # type: ignore
+    ):
+        """
+        Initialize proposal coordinator.
+
+        Args:
+            ai_work_bridge: Validator for AI worker proposals
+            proposal_store: Durable proposal storage
+        """
+        if not isinstance(ai_work_bridge, AIWorkBridge):
+            raise TypeError("ai_work_bridge must be an AIWorkBridge")
+
+        # Avoid circular import
+        from tools.ai_controller.operations_api.proposal_store import ProposalStore
+        if not isinstance(proposal_store, ProposalStore):
+            raise TypeError("proposal_store must be a ProposalStore")
+
+        self.bridge = ai_work_bridge
+        self.store = proposal_store
+
+    def submit_proposal(self, proposal: AIWorkerProposal) -> "ProposalRecord":  # type: ignore
+        """
+        Submit AI worker proposal with exact idempotency.
+
+        This method:
+        1. Validates proposal via AIWorkBridge (authoritative policy)
+        2. Submits to ProposalStore with exact idempotency
+        3. Returns durable ProposalRecord
+
+        If exact duplicate exists (same proposal_id + same fingerprint):
+        - Returns existing record (no mutation)
+
+        If conflicting duplicate exists (same proposal_id + different fingerprint):
+        - Raises ProposalConflict
+
+        Args:
+            proposal: AI worker proposal to submit
+
+        Returns:
+            ProposalRecord (new or existing)
+
+        Raises:
+            ProposalValidationError: If proposal is invalid
+            ProposalUnauthorizedError: If action is not allowed
+            ProposalConflict: If conflicting proposal exists
+        """
+        # Validate via AIWorkBridge (authoritative policy derivation)
+        evidence = self.bridge.validate_proposal(proposal)
+
+        # Submit to durable store with exact idempotency
+        from tools.ai_controller.operations_api.proposal_store import (
+            ProposalLifecycleState,
+        )
+
+        record = self.store.submit_proposal(
+            proposal_id=proposal.proposal_id,
+            worker_identity=proposal.worker_identity,
+            mission_id=proposal.mission_id,
+            task_id=proposal.task_id,
+            action_type=proposal.action_type,
+            workspace_id=proposal.workspace_id,
+            immutable_parameters=proposal.immutable_parameters,
+            expected_result=proposal.expected_result,
+            authorization_level=evidence.authorization_level,
+            approval_required=evidence.approval_required,
+            required_capabilities=frozenset(str(cap) for cap in evidence.required_capabilities),
+            proposal_fingerprint=evidence.proposal_fingerprint,
+            execution_fingerprint=evidence.execution_fingerprint,
+            approval_execution_fingerprint=evidence.approval_execution_fingerprint,
+            clock=self.bridge.clock,
+        )
+
+        return record
+
+    def get_proposal(self, proposal_id: str) -> "ProposalRecord | None":  # type: ignore
+        """
+        Get proposal by identity.
+
+        Args:
+            proposal_id: Proposal identifier
+
+        Returns:
+            ProposalRecord if found, None otherwise
+        """
+        return self.store.get_proposal(proposal_id)
+
+    def update_lifecycle(
+        self,
+        proposal_id: str,
+        **updates,
+    ) -> "ProposalRecord":  # type: ignore
+        """
+        Update proposal lifecycle state.
+
+        Allowed updates:
+        - lifecycle_state: ProposalLifecycleState
+        - task_request_fingerprint: str
+        - assignment_id: str
+        - dispatch_offer_id: str
+        - target_node_id: str
+        - approval_request_id: str
+        - job_id: str
+        - result_reference: str
+        - completed_at: str (ISO-8601)
+        - failure_reason: str
+
+        Args:
+            proposal_id: Proposal identifier
+            **updates: Lifecycle updates
+
+        Returns:
+            Updated ProposalRecord
+
+        Raises:
+            ProposalNotFound: If proposal does not exist
+        """
+        return self.store.update_lifecycle(
+            proposal_id,
+            clock=self.bridge.clock,
+            **updates,
+        )
