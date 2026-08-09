@@ -11,6 +11,7 @@ from enum import Enum
 from federation.capability import NodeCapability
 from federation.task_assignment import TaskAssignment
 from federation.task_request import TaskRequest
+from federation.worker_governance import BudgetRoutingEvidence
 
 
 class RoutingOutcome(str, Enum):
@@ -57,6 +58,7 @@ class RoutingDecision:
     excluded_nodes: list[ExcludedNode] = field(default_factory=list)
     explanation: str = ""
     assignment_id: str | None = None
+    budget_evidence: BudgetRoutingEvidence | None = None
 
     def __post_init__(self) -> None:
         """Validate routing decision fields."""
@@ -98,6 +100,10 @@ class RoutingDecision:
             not isinstance(self.assignment_id, str) or not self.assignment_id.strip()
         ):
             raise ValueError("assignment_id must be a non-empty string or None")
+        if self.budget_evidence is not None and type(
+            self.budget_evidence
+        ) is not BudgetRoutingEvidence:
+            raise TypeError("budget_evidence must be BudgetRoutingEvidence or None")
 
         # Validate required_capabilities_matched
         try:
