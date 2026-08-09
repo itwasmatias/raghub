@@ -141,6 +141,8 @@ def test_worker_success_and_failure_are_terminal(tmp_path):
     assert saved.tasks[0].evidence_references == ("evidence-worker",)
     assert saved.tasks[0].assignment_id == "assignment-task-1"
     assert saved.tasks[0].dispatch_offer_id == "offer-task-1"
+    assert saved.tasks[0].worker_node_id == "worker-1"
+    assert saved.tasks[0].coordinator_node_id == "coordinator-1"
 
 
 def test_duplicate_checkpoint_is_idempotent_and_restart_persists(tmp_path):

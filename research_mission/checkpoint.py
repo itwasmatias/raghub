@@ -67,6 +67,8 @@ class TaskCheckpoint:
     dispatch_offer_id: str | None
     execution_attempt_id: str | None
     execution_status: WorkerExecutionStatus | None
+    worker_node_id: str | None
+    coordinator_node_id: str | None
     approval_required: bool
     execution_fingerprint: str | None
     result_reference: str | None
@@ -341,24 +343,37 @@ class MissionCheckpointStore:
     @staticmethod
     def _task(value):
         fields = {"task_id","sequence","classification","assignment_id","dispatch_offer_id",
-                  "execution_attempt_id","execution_status","approval_required","execution_fingerprint",
+                  "execution_attempt_id","execution_status","worker_node_id","coordinator_node_id",
+                  "approval_required","execution_fingerprint",
                   "result_reference","evidence_references"}
         if not isinstance(value, dict) or set(value) != fields: raise ValueError("task schema")
         if not isinstance(value["sequence"], int) or isinstance(value["sequence"], bool) or value["sequence"] < 1:
             raise ValueError("task sequence")
-        for name in ("assignment_id","dispatch_offer_id","execution_attempt_id","result_reference"):
+        for name in ("assignment_id","dispatch_offer_id","execution_attempt_id",
+                     "worker_node_id","coordinator_node_id","result_reference"):
             if value[name] is not None: _identifier(value[name], name)
         fingerprint = value["execution_fingerprint"]
         if fingerprint is not None: _digest(fingerprint, "execution_fingerprint")
         if not isinstance(value["approval_required"], bool): raise ValueError("approval_required")
-        linked = (value["assignment_id"], value["dispatch_offer_id"],
-                  value["execution_attempt_id"], value["execution_status"])
-        if any(item is not None for item in linked[2:]) and any(item is None for item in linked):
+        execution_linked = (
+            value["assignment_id"], value["dispatch_offer_id"],
+            value["execution_attempt_id"], value["execution_status"],
+            value["worker_node_id"], value["coordinator_node_id"],
+        )
+        if any(item is not None for item in execution_linked[2:4]) and any(
+            item is None for item in execution_linked
+        ):
             raise ValueError("execution linkage is incomplete")
+        if value["dispatch_offer_id"] is not None and any(
+            value[name] is None
+            for name in ("assignment_id", "worker_node_id", "coordinator_node_id")
+        ):
+            raise ValueError("dispatch linkage is incomplete")
         refs = tuple(_identifier(item, "evidence_reference") for item in value["evidence_references"])
         return TaskCheckpoint(_identifier(value["task_id"], "task_id"), value["sequence"],
             ResumeClassification(value["classification"]), value["assignment_id"], value["dispatch_offer_id"],
             value["execution_attempt_id"], None if value["execution_status"] is None else WorkerExecutionStatus(value["execution_status"]),
+            value["worker_node_id"], value["coordinator_node_id"],
             value["approval_required"], fingerprint, value["result_reference"], refs)
 
 
@@ -544,6 +559,18 @@ class MissionResumeCoordinator:
                 "dispatch_offer_id": dispatch_offer_id,
                 "execution_attempt_id": req.execution_attempt_id if req else None,
                 "execution_status": execution.status.value if execution else None,
+                "worker_node_id": (
+                    req.worker_node_id if req else (
+                        offer.worker_node_id if offer else (
+                            routed.assigned_node_id if routed else None
+                        )
+                    )
+                ),
+                "coordinator_node_id": (
+                    req.coordinator_node_id if req else (
+                        offer.coordinator_node_id if offer else None
+                    )
+                ),
                 "approval_required": task.approval_required,
                 "execution_fingerprint": (
                     req.execution_fingerprint if req else offer_fingerprint
