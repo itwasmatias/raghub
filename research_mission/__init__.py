@@ -38,6 +38,19 @@ from research_mission.evaluation import (
     ResearchEvaluationStatus,
     SynthesisResult,
 )
+from research_mission.checkpoint import (
+    MissionCheckpoint,
+    MissionCheckpointConflictError,
+    MissionCheckpointCorruptionError,
+    MissionCheckpointError,
+    MissionCheckpointNotFoundError,
+    MissionCheckpointStore,
+    MissionResumeCoordinator,
+    ResumeClassification,
+    ResumeDecision,
+    TaskCheckpoint,
+    plan_fingerprint,
+)
 
 __all__ = [
     "ChallengerAssessment",
@@ -71,4 +84,15 @@ __all__ = [
     "ResearchTaskResultStatus",
     "ResearchTaskSpec",
     "SynthesisResult",
+    "MissionCheckpoint",
+    "MissionCheckpointConflictError",
+    "MissionCheckpointCorruptionError",
+    "MissionCheckpointError",
+    "MissionCheckpointNotFoundError",
+    "MissionCheckpointStore",
+    "MissionResumeCoordinator",
+    "ResumeClassification",
+    "ResumeDecision",
+    "TaskCheckpoint",
+    "plan_fingerprint",
 ]
