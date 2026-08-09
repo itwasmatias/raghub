@@ -51,6 +51,16 @@ from research_mission.checkpoint import (
     TaskCheckpoint,
     plan_fingerprint,
 )
+from research_mission.replication import (
+    ReplicationAttempt,
+    ReplicationAttemptOutcome,
+    ReplicationClaimEvaluation,
+    ReplicationClaimStatus,
+    ResearchReplicationContractError,
+    ResearchReplicationError,
+    ResearchReplicationResult,
+    ResearchReplicationRuntime,
+)
 
 __all__ = [
     "ChallengerAssessment",
@@ -95,4 +105,12 @@ __all__ = [
     "ResumeDecision",
     "TaskCheckpoint",
     "plan_fingerprint",
+    "ReplicationAttempt",
+    "ReplicationAttemptOutcome",
+    "ReplicationClaimEvaluation",
+    "ReplicationClaimStatus",
+    "ResearchReplicationContractError",
+    "ResearchReplicationError",
+    "ResearchReplicationResult",
+    "ResearchReplicationRuntime",
 ]
