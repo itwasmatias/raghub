@@ -41,14 +41,20 @@ _PUBLIC_KEYS = {
     "active_tasks",
     "action_id",
     "action_type",
+    "actor_identity",
     "application",
     "applied_at",
     "applied_by",
+    "approval_metadata",
+    "approval_policy",
     "approval_required",
+    "approval_request_id",
+    "assignment_fingerprint",
     "assignment_id",
     "attempt_count",
     "authority",
     "authorization_level",
+    "authorization_metadata",
     "base_ref",
     "blockers",
     "budget_usage",
@@ -57,6 +63,7 @@ _PUBLIC_KEYS = {
     "classification",
     "created_at",
     "created_by",
+    "decided_at",
     "decision",
     "decision_time",
     "definition",
@@ -70,6 +77,8 @@ _PUBLIC_KEYS = {
     "event_type",
     "evidence",
     "evidence_fingerprint",
+    "evidence_revision",
+    "execution_fingerprint",
     "exit_code",
     "expected_event_revision",
     "expected_budget_fingerprint",
@@ -91,6 +100,8 @@ _PUBLIC_KEYS = {
     "healthy_nodes",
     "id",
     "idempotency_key",
+    "immutable_parameters_fingerprint",
+    "is_actionable",
     "job_id",
     "jobs",
     "last_heartbeat",
@@ -111,7 +122,9 @@ _PUBLIC_KEYS = {
     "mission_task_id",
     "node_id",
     "nodes",
+    "non_actionable_reason",
     "note",
+    "offer_id",
     "operating_mode",
     "principal",
     "proposal_revision",
@@ -123,11 +136,14 @@ _PUBLIC_KEYS = {
     "queue_id",
     "queue_identities",
     "required_capability",
+    "routing_assignment_id",
     "sha256",
     "queue_task_id",
     "reason",
     "record",
     "request_fingerprint",
+    "request",
+    "requester_identity",
     "revision",
     "root_cause_task_ids",
     "routing_outcome",
@@ -145,6 +161,7 @@ _PUBLIC_KEYS = {
     "supersedes_action_ids",
     "target_node_id",
     "task_id",
+    "target_node_id",
     "tasks",
     "task_states",
     "test_results",
@@ -157,6 +174,7 @@ _PUBLIC_KEYS = {
     "truncated",
     "unhealthy_nodes",
     "updated_at",
+    "valid",
     "version",
     "workspace_id",
 }
@@ -382,3 +400,18 @@ def public_definition(definition: MissionDefinition) -> dict[str, Any]:
 
 def public_state(state: MissionState) -> dict[str, Any]:
     return public_value(state.to_dict())
+
+
+def public_approval_item(item: Any) -> dict[str, Any]:
+    """
+    Serialize an ApprovalItem for public consumption.
+
+    Args:
+        item: ApprovalItem instance
+
+    Returns:
+        Safe public dict representation
+    """
+    if hasattr(item, "to_dict") and callable(item.to_dict):
+        return public_value(item.to_dict())
+    return public_value(item)
