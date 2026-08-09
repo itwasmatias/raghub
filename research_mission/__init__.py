@@ -71,6 +71,14 @@ from research_mission.recovery import (
     RecoveryOutcome,
     TaskRecoveryEvidence,
 )
+from research_mission.confidence import (
+    ClaimConfidence,
+    ConfidenceClassification,
+    ResearchConfidenceContractError,
+    ResearchConfidenceError,
+    ResearchConfidenceSynthesis,
+    ResearchConfidenceSynthesisRuntime,
+)
 
 __all__ = [
     "ChallengerAssessment",
@@ -131,4 +139,10 @@ __all__ = [
     "MissionRecoveryNotFoundError",
     "RecoveryOutcome",
     "TaskRecoveryEvidence",
+    "ClaimConfidence",
+    "ConfidenceClassification",
+    "ResearchConfidenceContractError",
+    "ResearchConfidenceError",
+    "ResearchConfidenceSynthesis",
+    "ResearchConfidenceSynthesisRuntime",
 ]
