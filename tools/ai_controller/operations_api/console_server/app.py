@@ -26,6 +26,17 @@ from .jobs import JobStatus, JobTracker
 from .runtime import ConsoleActionExecutionRuntime
 from .workspaces import WorkspaceRegistry
 
+# Import approval center components for approval-required actions
+try:
+    from tools.ai_controller.operations_api.approval_center import (
+        ApprovalRequestDraft,
+        make_execution_fingerprint as make_approval_execution_fingerprint,
+    )
+except ImportError:
+    # Approval Center not available - approval-required actions will fail at runtime
+    ApprovalRequestDraft = None
+    make_approval_execution_fingerprint = None
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -53,6 +64,7 @@ class ConsoleServer:
         coordinator_node_id: str = "console-server-v0.1",
         integrity_key: bytes,
         server_id: str = "console-server-v0.1",
+        approval_coordinator=None,
         now: Callable[[], datetime] = _utc_now,
         runner=None,
     ):
@@ -91,6 +103,7 @@ class ConsoleServer:
         self.server_id = server_id
         self.coordinator_node_id = coordinator_node_id
         self.integrity_key = integrity_key
+        self.approval_coordinator = approval_coordinator
         self.now = now
         self.action_catalog = ActionCatalog()
 
@@ -124,6 +137,7 @@ class ConsoleServer:
             "jobs": self.job_tracker,
             "dispatch_coordinator": self.task_dispatch_coordinator,
             "action_catalog": self.action_catalog,
+            "approval_coordinator": self.approval_coordinator,
             "clock": self.now,
         }
         if runner is not None:
@@ -446,6 +460,57 @@ def create_console_blueprint(console: ConsoleServer) -> Blueprint:
                 )
                 dispatch_offer_id = dispatch_offer.offer_id
 
+            # Create approval request for approval-required actions
+            approval_request_id = None
+            approval_execution_fingerprint_value = None
+            if spec.approval_required and console.approval_coordinator is not None:
+                # Generate deterministic approval_request_id using action_id
+                # (action_id hasn't been generated yet, so use a deterministic ID based on task)
+                approval_request_id = f"approval-{task_request.task_id}"
+
+                # Generate Approval Center execution fingerprint
+                approval_execution_fingerprint_value = make_approval_execution_fingerprint(
+                    action_type=action_type.value,
+                    workspace_id=workspace_id,
+                    authorization_level=spec.authorization_level,
+                    approval_required=True,
+                    immutable_parameters=immutable_parameters,
+                )
+
+                # Create approval request draft
+                draft = ApprovalRequestDraft(
+                    approval_request_id=approval_request_id,
+                    mission_id=task_request.mission_id,
+                    task_id=task_request.task_id,
+                    assignment_id=routing_decision.assignment_id,
+                    dispatch_offer_id=dispatch_offer_id,
+                    requester_identity=principal.identity,
+                    target_node_id=(
+                        routing_decision.assignment.assigned_node.node_id
+                        if routing_decision.assignment
+                        else None
+                    ),
+                    action_type=action_type.value,
+                    authorization_level=spec.authorization_level,
+                    approval_required=True,
+                    workspace_id=workspace_id,
+                    execution_fingerprint=approval_execution_fingerprint_value,
+                    immutable_parameters=immutable_parameters,
+                    expected_result=f"Execute {action_type.value} in workspace {workspace_id}",
+                    expires_in_seconds=3600,  # 1 hour
+                )
+
+                # Create approval request (idempotent)
+                try:
+                    console.approval_coordinator.create_request(
+                        draft,
+                        actor_identity=principal.identity,
+                    )
+                except Exception as exc:
+                    # Fail gracefully - approval request creation is best-effort for now
+                    # The runtime will fail closed later if approval is missing
+                    pass
+
             job = console.job_tracker.create_job(
                 action_type=action_type.value,
                 workspace_id=workspace_id,
@@ -460,15 +525,19 @@ def create_console_blueprint(console: ConsoleServer) -> Blueprint:
                 ),
                 assignment_id=routing_decision.assignment_id,
                 dispatch_offer_id=dispatch_offer_id,
+                approval_request_id=approval_request_id,
+                approval_execution_fingerprint=approval_execution_fingerprint_value,
                 idempotency_key=idempotency_key,
                 request_fingerprint=request_fingerprint,
                 execution_fingerprint=action_execution_fingerprint,
             )
 
+        # Only auto-execute if not approval-required
         if (
             dispatch_offer_id is not None
             and action_type is ActionType.INSPECT_GIT_STATUS
             and "console.execute" in principal.capabilities
+            and not spec.approval_required
         ):
             job = console.action_runtime.execute(job.job_id)
 

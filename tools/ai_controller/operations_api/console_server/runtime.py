@@ -144,6 +144,7 @@ class ConsoleActionExecutionRuntime:
         jobs: JobTracker,
         dispatch_coordinator,
         action_catalog: ActionCatalog,
+        approval_coordinator=None,
         runner=subprocess.run,
         clock=lambda: datetime.now(timezone.utc),
     ):
@@ -151,6 +152,7 @@ class ConsoleActionExecutionRuntime:
         self.jobs = jobs
         self.dispatch_coordinator = dispatch_coordinator
         self.action_catalog = action_catalog
+        self.approval_coordinator = approval_coordinator
         self.runner = runner
         self.clock = clock
 
@@ -204,8 +206,47 @@ class ConsoleActionExecutionRuntime:
                 or offer.worker_node_id != job.target_node_id
             ):
                 raise ValueError("dispatch offer identity does not match job")
+
+            # Approval authority verification for approval-required actions
             if offer.approval_required:
-                raise ValueError("approval-required action has no valid approval evidence")
+                # Fail closed: approval_request_id must be present for approval-required actions
+                if not job.approval_request_id:
+                    raise ValueError(
+                        "approval-required action missing approval_request_id"
+                    )
+
+                # Fail closed: approval_coordinator must be available to verify approval
+                if self.approval_coordinator is None:
+                    raise ValueError(
+                        "approval-required action has no approval coordinator configured"
+                    )
+
+                # Fail closed: approval_execution_fingerprint must be present
+                if not job.approval_execution_fingerprint:
+                    raise ValueError(
+                        "approval-required action missing approval_execution_fingerprint"
+                    )
+
+                # Verify approval evidence through authoritative Approval Center
+                # This validates: execution fingerprint, mission/task/assignment/offer/node identity,
+                # APPROVED status, unexpired evidence, and authenticated durable state
+                # Note: uses approval_execution_fingerprint (Approval Center contract),
+                # not execution_fingerprint (Console Runtime contract)
+                try:
+                    approval_evidence = self.approval_coordinator.verify_approval(
+                        job.approval_request_id,
+                        execution_fingerprint=job.approval_execution_fingerprint,
+                        mission_id=job.mission_id,
+                        task_id=job.task_id,
+                        assignment_id=job.assignment_id,
+                        dispatch_offer_id=job.dispatch_offer_id,
+                        target_node_id=job.target_node_id,
+                    )
+                except Exception as exc:
+                    # Fail closed on any approval verification error
+                    raise ValueError(
+                        f"approval verification failed: {exc}"
+                    ) from exc
 
             # H3: Verify execution fingerprint - FAIL CLOSED
             # Missing fingerprint → reject (no execution without authority)

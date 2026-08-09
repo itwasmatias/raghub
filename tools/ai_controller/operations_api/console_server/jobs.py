@@ -70,6 +70,8 @@ class JobRecord:
     timeout_seconds: int | None = None
     assignment_id: str | None = None
     dispatch_offer_id: str | None = None
+    approval_request_id: str | None = None
+    approval_execution_fingerprint: str | None = None
     idempotency_key: str | None = None
     request_fingerprint: str | None = None
     execution_fingerprint: str | None = None
@@ -100,6 +102,8 @@ class JobRecord:
             "status": self.status.value,
             "assignment_id": self.assignment_id,
             "dispatch_offer_id": self.dispatch_offer_id,
+            "approval_request_id": self.approval_request_id,
+            "approval_execution_fingerprint": self.approval_execution_fingerprint,
             "idempotency_key": self.idempotency_key,
             "request_fingerprint": self.request_fingerprint,
             "execution_fingerprint": self.execution_fingerprint,
@@ -151,6 +155,8 @@ class JobTracker:
         timeout_seconds: int | None = None,
         assignment_id: str | None = None,
         dispatch_offer_id: str | None = None,
+        approval_request_id: str | None = None,
+        approval_execution_fingerprint: str | None = None,
         idempotency_key: str | None = None,
         request_fingerprint: str | None = None,
         execution_fingerprint: str | None = None,
@@ -166,6 +172,8 @@ class JobTracker:
             mission_id: Optional mission identifier
             assignment_id: Optional routing assignment ID
             dispatch_offer_id: Optional dispatch offer ID
+            approval_request_id: Optional approval request ID
+            approval_execution_fingerprint: Optional Approval Center fingerprint
             idempotency_key: Optional idempotency key for deduplication
             request_fingerprint: Optional fingerprint of request parameters
 
@@ -190,6 +198,8 @@ class JobTracker:
                 status=JobStatus.PENDING,
                 assignment_id=assignment_id,
                 dispatch_offer_id=dispatch_offer_id,
+                approval_request_id=approval_request_id,
+                approval_execution_fingerprint=approval_execution_fingerprint,
                 idempotency_key=idempotency_key,
                 request_fingerprint=request_fingerprint,
                 execution_fingerprint=execution_fingerprint,
@@ -238,6 +248,8 @@ class JobTracker:
             status=JobStatus(data["status"]),
             assignment_id=data.get("assignment_id"),
             dispatch_offer_id=data.get("dispatch_offer_id"),
+            approval_request_id=data.get("approval_request_id"),
+            approval_execution_fingerprint=data.get("approval_execution_fingerprint"),
             idempotency_key=data.get("idempotency_key"),
             request_fingerprint=data.get("request_fingerprint"),
             execution_fingerprint=data.get("execution_fingerprint"),
@@ -314,6 +326,8 @@ class JobTracker:
             status=new_status,
             assignment_id=job.assignment_id,
             dispatch_offer_id=job.dispatch_offer_id,
+            approval_request_id=job.approval_request_id,
+            approval_execution_fingerprint=job.approval_execution_fingerprint,
             idempotency_key=job.idempotency_key,
             request_fingerprint=job.request_fingerprint,
             execution_fingerprint=job.execution_fingerprint,
