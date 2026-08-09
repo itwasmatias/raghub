@@ -7,6 +7,7 @@ Tests cover the governed approval-to-execution authority path.
 from __future__ import annotations
 
 import tempfile
+import subprocess
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,7 +42,7 @@ def approval_coordinator(tmp_path):
     coordinator = ApprovalCoordinator(
         store,
         authorized_approvers={"human-approver"},
-        authorized_requesters={"full-principal"},
+        authorized_requesters={"full-user"},  # Match principal from full-token
         clock=now,
     )
     return coordinator
@@ -49,9 +50,19 @@ def approval_coordinator(tmp_path):
 
 @pytest.fixture
 def console_with_approval(console, approval_coordinator):
-    """Add approval coordinator to console."""
+    """Add approval coordinator to console with deterministic execution."""
     console.approval_coordinator = approval_coordinator
     console.action_runtime.approval_coordinator = approval_coordinator
+
+    def successful_runner(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="",
+            stderr="",
+        )
+
+    console.action_runtime.runner = successful_runner
     return console
 
 
@@ -137,47 +148,45 @@ class TestApprovalFailClosed:
     """Test that approval verification fails closed."""
 
     def test_missing_approval_request_id_cannot_execute(
-        self, console_with_approval
+        self, client, console_with_approval
     ):
         """Missing approval_request_id should fail execution."""
-        original_spec = console_with_approval.action_catalog._SPECS[ActionType.INSPECT_GIT_STATUS]
+        original_spec = console_with_approval.action_catalog._SPECS[
+            ActionType.INSPECT_GIT_STATUS
+        ]
         test_spec = replace(original_spec, approval_required=True)
-        console_with_approval.action_catalog._SPECS[ActionType.INSPECT_GIT_STATUS] = test_spec
+        console_with_approval.action_catalog._SPECS[
+            ActionType.INSPECT_GIT_STATUS
+        ] = test_spec
 
         try:
-            # Create job manually without approval_request_id
-            job = console_with_approval.job_tracker.create_job(
-                action_type="inspect_git_status",
-                workspace_id="test-workspace",
-                created_by="user",
+            response = client.post(
+                "/api/console/v1/actions",
+                json={
+                    "action_type": "inspect_git_status",
+                    "workspace_id": "test-workspace",
+                },
+                headers={"Authorization": "Bearer full-token"},
             )
+            assert response.status_code == 201
 
-            # Create dispatch offer manually with approval_required
-            from datetime import timedelta
-            from federation.dispatch_offer import DispatchOffer
-            offer = console_with_approval.task_dispatch_coordinator.create_offer(
-                assignment_id="test-assignment",
-                actor_node_id="test-node",
-                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            job = console_with_approval.job_tracker.get_job(
+                response.json["job_id"]
             )
+            assert job.dispatch_offer_id is not None
+            assert job.approval_request_id is not None
 
-            # Update job with offer info
-            job = replace(
-                job,
-                dispatch_offer_id=offer.offer_id,
-                assignment_id="test-assignment",
-                target_node_id="test-node",
-                task_id="test-task",
-                mission_id="test-mission",
-            )
-            console_with_approval.job_tracker._save(job)
+            tampered = replace(job, approval_request_id=None)
+            with console_with_approval.job_tracker.transaction():
+                console_with_approval.job_tracker._save_unlocked(tampered)
 
-            # Should fail with missing approval_request_id
             with pytest.raises(ValueError, match="approval_request_id"):
                 console_with_approval.action_runtime.execute(job.job_id)
 
         finally:
-            console_with_approval.action_catalog._SPECS[ActionType.INSPECT_GIT_STATUS] = original_spec
+            console_with_approval.action_catalog._SPECS[
+                ActionType.INSPECT_GIT_STATUS
+            ] = original_spec
 
     def test_missing_approval_execution_fingerprint_cannot_execute(
         self, client, console_with_approval

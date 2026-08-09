@@ -31,11 +31,17 @@ try:
     from tools.ai_controller.operations_api.approval_center import (
         ApprovalRequestDraft,
         make_execution_fingerprint as make_approval_execution_fingerprint,
+        ApprovalConflict,
+        ApprovalUnauthorized,
+        ApprovalIntegrityError,
     )
 except ImportError:
     # Approval Center not available - approval-required actions will fail at runtime
     ApprovalRequestDraft = None
     make_approval_execution_fingerprint = None
+    ApprovalConflict = None
+    ApprovalUnauthorized = None
+    ApprovalIntegrityError = None
 
 
 def _utc_now() -> datetime:
@@ -501,15 +507,50 @@ def create_console_blueprint(console: ConsoleServer) -> Blueprint:
                 )
 
                 # Create approval request (idempotent)
+                # SECURITY: Fail closed if approval authority cannot be created.
+                # For approval-required actions, the request MUST NOT appear to
+                # succeed if authoritative approval evidence creation fails.
                 try:
                     console.approval_coordinator.create_request(
                         draft,
                         actor_identity=principal.identity,
                     )
+                except ApprovalConflict as exc:
+                    # Same approval_request_id with different parameters
+                    raise APIError(
+                        "APPROVAL_CONFLICT",
+                        f"Approval request identity conflicts with existing evidence: {exc}",
+                        409,
+                    ) from exc
+                except ApprovalUnauthorized as exc:
+                    # Requester identity not authorized
+                    raise APIError(
+                        "APPROVAL_UNAUTHORIZED",
+                        f"Not authorized to create approval request: {exc}",
+                        403,
+                    ) from exc
+                except ApprovalIntegrityError as exc:
+                    # Authenticated durable evidence is corrupt: fail closed.
+                    raise APIError(
+                        "APPROVAL_INTEGRITY_ERROR",
+                        f"Approval evidence integrity violation: {exc}",
+                        500,
+                    ) from exc
+                except (ValueError, TypeError) as exc:
+                    # Validation error in request parameters.
+                    raise APIError(
+                        "APPROVAL_VALIDATION_ERROR",
+                        f"Invalid approval request parameters: {exc}",
+                        400,
+                    ) from exc
                 except Exception as exc:
-                    # Fail gracefully - approval request creation is best-effort for now
-                    # The runtime will fail closed later if approval is missing
-                    pass
+                    # Fail closed: any unexpected error during approval authority
+                    # creation must prevent the request from appearing successful
+                    raise APIError(
+                        "APPROVAL_CREATION_FAILED",
+                        f"Failed to create approval authority (fail closed): {exc}",
+                        500,
+                    ) from exc
 
             job = console.job_tracker.create_job(
                 action_type=action_type.value,
