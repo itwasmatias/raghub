@@ -1406,3 +1406,557 @@ class TestNoShellExecution:
             # This should succeed without shell execution
             memory = collector.collect_memory()
             assert isinstance(memory, HostMemorySnapshot)
+
+
+class TestWarningThresholdPolicy:
+    """Test warning threshold policy fields and validation."""
+
+    def _create_snapshot_with_memory(self, available_memory_gb, free_swap_gb=3.5):
+        """Helper to create a snapshot with specific memory."""
+        from federation.host_resource_capacity import _fingerprint, _format_timestamp
+
+        collected_at = datetime.now(timezone.utc)
+        memory = HostMemorySnapshot(
+            total_bytes=16 * 1024**3,
+            available_bytes=int(available_memory_gb * 1024**3),
+            total_swap_bytes=4 * 1024**3,
+            free_swap_bytes=int(free_swap_gb * 1024**3),
+        )
+        cpu = HostCpuSnapshot(
+            logical_count=8,
+            load_average_1m=1.0,
+            load_average_5m=1.0,
+            load_average_15m=1.0,
+        )
+
+        payload = {
+            "node_id": "test-node",
+            "collected_at": _format_timestamp(collected_at),
+            "memory": {
+                "total_bytes": memory.total_bytes,
+                "available_bytes": memory.available_bytes,
+                "total_swap_bytes": memory.total_swap_bytes,
+                "free_swap_bytes": memory.free_swap_bytes,
+            },
+            "cpu": {
+                "logical_count": cpu.logical_count,
+                "load_average_1m": cpu.load_average_1m,
+                "load_average_5m": cpu.load_average_5m,
+                "load_average_15m": cpu.load_average_15m,
+            },
+            "storage": [],
+        }
+        fingerprint = _fingerprint(payload)
+
+        return HostResourceSnapshot(
+            node_id="test-node",
+            collected_at=collected_at,
+            memory=memory,
+            cpu=cpu,
+            storage=(),
+            fingerprint=fingerprint,
+        )
+
+    def _create_snapshot_with_load(self, normalized_load):
+        """Helper to create a snapshot with specific normalized load."""
+        from federation.host_resource_capacity import _fingerprint, _format_timestamp
+
+        collected_at = datetime.now(timezone.utc)
+        memory = HostMemorySnapshot(
+            total_bytes=16 * 1024**3,
+            available_bytes=8 * 1024**3,
+            total_swap_bytes=4 * 1024**3,
+            free_swap_bytes=3 * 1024**3,
+        )
+        cpu = HostCpuSnapshot(
+            logical_count=8,
+            load_average_1m=normalized_load * 8,
+            load_average_5m=1.0,
+            load_average_15m=1.0,
+        )
+
+        payload = {
+            "node_id": "test-node",
+            "collected_at": _format_timestamp(collected_at),
+            "memory": {
+                "total_bytes": memory.total_bytes,
+                "available_bytes": memory.available_bytes,
+                "total_swap_bytes": memory.total_swap_bytes,
+                "free_swap_bytes": memory.free_swap_bytes,
+            },
+            "cpu": {
+                "logical_count": cpu.logical_count,
+                "load_average_1m": cpu.load_average_1m,
+                "load_average_5m": cpu.load_average_5m,
+                "load_average_15m": cpu.load_average_15m,
+            },
+            "storage": [],
+        }
+        fingerprint = _fingerprint(payload)
+
+        return HostResourceSnapshot(
+            node_id="test-node",
+            collected_at=collected_at,
+            memory=memory,
+            cpu=cpu,
+            storage=(),
+            fingerprint=fingerprint,
+        )
+
+    def _create_snapshot_with_storage(self, available_storage_gb):
+        """Helper to create a snapshot with specific storage."""
+        from federation.host_resource_capacity import _fingerprint, _format_timestamp
+
+        collected_at = datetime.now(timezone.utc)
+        memory = HostMemorySnapshot(
+            total_bytes=16 * 1024**3,
+            available_bytes=8 * 1024**3,
+            total_swap_bytes=4 * 1024**3,
+            free_swap_bytes=3 * 1024**3,
+        )
+        cpu = HostCpuSnapshot(
+            logical_count=8,
+            load_average_1m=1.0,
+            load_average_5m=1.0,
+            load_average_15m=1.0,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = (
+                HostStorageSnapshot(
+                    root_path=tmpdir,
+                    total_bytes=1000 * 1024**3,
+                    free_bytes=int((available_storage_gb + 50) * 1024**3),
+                    available_bytes=int(available_storage_gb * 1024**3),
+                ),
+            )
+
+            payload = {
+                "node_id": "test-node",
+                "collected_at": _format_timestamp(collected_at),
+                "memory": {
+                    "total_bytes": memory.total_bytes,
+                    "available_bytes": memory.available_bytes,
+                    "total_swap_bytes": memory.total_swap_bytes,
+                    "free_swap_bytes": memory.free_swap_bytes,
+                },
+                "cpu": {
+                    "logical_count": cpu.logical_count,
+                    "load_average_1m": cpu.load_average_1m,
+                    "load_average_5m": cpu.load_average_5m,
+                    "load_average_15m": cpu.load_average_15m,
+                },
+                "storage": [
+                    {
+                        "root_path": storage[0].root_path,
+                        "total_bytes": storage[0].total_bytes,
+                        "free_bytes": storage[0].free_bytes,
+                        "available_bytes": storage[0].available_bytes,
+                    }
+                ],
+            }
+            fingerprint = _fingerprint(payload)
+
+            return (
+                HostResourceSnapshot(
+                    node_id="test-node",
+                    collected_at=collected_at,
+                    memory=memory,
+                    cpu=cpu,
+                    storage=storage,
+                    fingerprint=fingerprint,
+                ),
+                tmpdir,
+            )
+
+    def test_default_memory_warning_multiplier_preserves_existing_behavior(self):
+        """Default policy should preserve existing 1.5x memory warning behavior."""
+        # Scenario: memory_after = 2.9 GB, reserve = 2 GB
+        # 2.9 GB < 2 GB * 1.5 (3.0 GB) → CONSTRAINED_MEMORY
+        snapshot = self._create_snapshot_with_memory(available_memory_gb=5.9)
+        requirement = create_requirement(
+            minimum_available_memory_bytes=3 * 1024**3,
+            reserve_memory_bytes=1 * 1024**3,
+        )
+        policy = create_policy(
+            minimum_host_memory_reserve_bytes=1 * 1024**3,
+        )
+
+        # Verify default multiplier is 1.5
+        assert policy.memory_constrained_reserve_multiplier == 1.5
+
+        guard = HostCapacityGuard()
+        decision = guard.evaluate(snapshot, requirement, policy)
+
+        assert decision.status == HostCapacityStatus.CONSTRAINED
+        assert HostCapacityReason.CONSTRAINED_MEMORY in decision.reasons
+
+    def test_custom_memory_warning_multiplier_changes_boundary(self):
+        """Custom memory warning multiplier should change decision boundary."""
+        # Same scenario but with 2.0x multiplier
+        # 2.9 GB >= 2 GB * 2.0 (4.0 GB) is False, so still constrained
+        # Let's use a scenario where it matters: memory_after = 3.5 GB, reserve = 2 GB
+        snapshot = self._create_snapshot_with_memory(available_memory_gb=6.5)
+        requirement = create_requirement(
+            minimum_available_memory_bytes=3 * 1024**3,
+            reserve_memory_bytes=1 * 1024**3,
+        )
+
+        # With default 1.5x: 3.5 GB >= 3.0 GB → AVAILABLE
+        policy_default = create_policy(
+            minimum_host_memory_reserve_bytes=1 * 1024**3,
+        )
+        guard = HostCapacityGuard()
+        decision_default = guard.evaluate(snapshot, requirement, policy_default)
+        assert decision_default.status == HostCapacityStatus.AVAILABLE
+
+        # With 2.0x: 3.5 GB < 4.0 GB → CONSTRAINED
+        policy_custom = create_policy(
+            minimum_host_memory_reserve_bytes=1 * 1024**3,
+            memory_constrained_reserve_multiplier=2.0,
+        )
+        decision_custom = guard.evaluate(snapshot, requirement, policy_custom)
+        assert decision_custom.status == HostCapacityStatus.CONSTRAINED
+        assert HostCapacityReason.CONSTRAINED_MEMORY in decision_custom.reasons
+
+    def test_default_cpu_warning_ratio_preserves_existing_behavior(self):
+        """Default policy should preserve existing 0.8 CPU warning ratio."""
+        # Policy threshold = 2.0, ratio = 0.8
+        # 2.0 * 0.8 = 1.6
+        # Load = 1.7 should trigger CONSTRAINED_CPU
+        snapshot = self._create_snapshot_with_load(normalized_load=1.7)
+        requirement = create_requirement(
+            minimum_available_memory_bytes=1 * 1024**3,
+        )
+        policy = create_policy(
+            maximum_normalized_load_threshold=2.0,
+        )
+
+        # Verify default ratio is 0.8
+        assert policy.cpu_constrained_threshold_ratio == 0.8
+
+        guard = HostCapacityGuard()
+        decision = guard.evaluate(snapshot, requirement, policy)
+
+        assert decision.status == HostCapacityStatus.CONSTRAINED
+        assert HostCapacityReason.CONSTRAINED_CPU in decision.reasons
+
+    def test_custom_cpu_warning_ratio_changes_boundary(self):
+        """Custom CPU warning ratio should change decision boundary."""
+        # Load = 1.5, threshold = 2.0
+        # Default 0.8: 1.5 < 1.6 → AVAILABLE
+        # Custom 0.7: 1.5 >= 1.4 → CONSTRAINED
+        snapshot = self._create_snapshot_with_load(normalized_load=1.5)
+        requirement = create_requirement(
+            minimum_available_memory_bytes=1 * 1024**3,
+        )
+
+        policy_default = create_policy(
+            maximum_normalized_load_threshold=2.0,
+        )
+        guard = HostCapacityGuard()
+        decision_default = guard.evaluate(snapshot, requirement, policy_default)
+        assert decision_default.status == HostCapacityStatus.AVAILABLE
+
+        policy_custom = create_policy(
+            maximum_normalized_load_threshold=2.0,
+            cpu_constrained_threshold_ratio=0.7,
+        )
+        decision_custom = guard.evaluate(snapshot, requirement, policy_custom)
+        assert decision_custom.status == HostCapacityStatus.CONSTRAINED
+        assert HostCapacityReason.CONSTRAINED_CPU in decision_custom.reasons
+
+    def test_default_storage_warning_multiplier_preserves_existing_behavior(self):
+        """Default policy should preserve existing 1.5x storage warning behavior."""
+        # storage_after = 22 GB, reserve = 15 GB
+        # 22 GB < 15 GB * 1.5 (22.5 GB) → CONSTRAINED_STORAGE
+        snapshot, tmpdir = self._create_snapshot_with_storage(available_storage_gb=32)
+        requirement = create_requirement(
+            minimum_available_memory_bytes=1 * 1024**3,
+            minimum_available_storage_bytes=10 * 1024**3,
+            storage_root_path=tmpdir,
+            reserve_storage_bytes=5 * 1024**3,
+        )
+        policy = create_policy(
+            minimum_storage_reserve_bytes=10 * 1024**3,
+        )
+
+        # Verify default multiplier is 1.5
+        assert policy.storage_constrained_reserve_multiplier == 1.5
+
+        guard = HostCapacityGuard()
+        decision = guard.evaluate(snapshot, requirement, policy)
+
+        assert decision.status == HostCapacityStatus.CONSTRAINED
+        assert HostCapacityReason.CONSTRAINED_STORAGE in decision.reasons
+
+    def test_custom_storage_warning_multiplier_changes_boundary(self):
+        """Custom storage warning multiplier should change decision boundary."""
+        # storage_after = 23 GB, reserve = 15 GB
+        # Default 1.5x: 23 GB >= 22.5 GB → AVAILABLE
+        # Custom 2.0x: 23 GB < 30 GB → CONSTRAINED
+        snapshot, tmpdir = self._create_snapshot_with_storage(available_storage_gb=33)
+        requirement = create_requirement(
+            minimum_available_memory_bytes=1 * 1024**3,
+            minimum_available_storage_bytes=10 * 1024**3,
+            storage_root_path=tmpdir,
+            reserve_storage_bytes=5 * 1024**3,
+        )
+
+        policy_default = create_policy(
+            minimum_storage_reserve_bytes=10 * 1024**3,
+        )
+        guard = HostCapacityGuard()
+        decision_default = guard.evaluate(snapshot, requirement, policy_default)
+        assert decision_default.status == HostCapacityStatus.AVAILABLE
+
+        policy_custom = create_policy(
+            minimum_storage_reserve_bytes=10 * 1024**3,
+            storage_constrained_reserve_multiplier=2.0,
+        )
+        decision_custom = guard.evaluate(snapshot, requirement, policy_custom)
+        assert decision_custom.status == HostCapacityStatus.CONSTRAINED
+        assert HostCapacityReason.CONSTRAINED_STORAGE in decision_custom.reasons
+
+    def test_memory_warning_field_changes_policy_fingerprint(self):
+        """Changing memory warning multiplier must change policy fingerprint."""
+        policy1 = create_policy(memory_constrained_reserve_multiplier=1.5)
+        policy2 = create_policy(memory_constrained_reserve_multiplier=2.0)
+        assert policy1.fingerprint != policy2.fingerprint
+
+    def test_cpu_warning_field_changes_policy_fingerprint(self):
+        """Changing CPU warning ratio must change policy fingerprint."""
+        policy1 = create_policy(cpu_constrained_threshold_ratio=0.8)
+        policy2 = create_policy(cpu_constrained_threshold_ratio=0.7)
+        assert policy1.fingerprint != policy2.fingerprint
+
+    def test_storage_warning_field_changes_policy_fingerprint(self):
+        """Changing storage warning multiplier must change policy fingerprint."""
+        policy1 = create_policy(storage_constrained_reserve_multiplier=1.5)
+        policy2 = create_policy(storage_constrained_reserve_multiplier=2.0)
+        assert policy1.fingerprint != policy2.fingerprint
+
+    def test_memory_warning_field_changes_decision_fingerprint(self):
+        """Changing memory warning multiplier can change decision fingerprint."""
+        snapshot = self._create_snapshot_with_memory(available_memory_gb=6.5)
+        requirement = create_requirement(
+            minimum_available_memory_bytes=3 * 1024**3,
+            reserve_memory_bytes=1 * 1024**3,
+        )
+
+        policy1 = create_policy(
+            minimum_host_memory_reserve_bytes=1 * 1024**3,
+            memory_constrained_reserve_multiplier=1.5,
+        )
+        policy2 = create_policy(
+            minimum_host_memory_reserve_bytes=1 * 1024**3,
+            memory_constrained_reserve_multiplier=2.0,
+        )
+
+        guard = HostCapacityGuard()
+        decision1 = guard.evaluate(snapshot, requirement, policy1)
+        decision2 = guard.evaluate(snapshot, requirement, policy2)
+
+        # Fingerprints should differ because policies differ
+        assert decision1.fingerprint != decision2.fingerprint
+        # And decisions should be different
+        assert decision1.status != decision2.status
+
+    def test_cpu_warning_field_changes_decision_fingerprint(self):
+        """Changing CPU warning ratio can change decision fingerprint."""
+        snapshot = self._create_snapshot_with_load(normalized_load=1.5)
+        requirement = create_requirement(
+            minimum_available_memory_bytes=1 * 1024**3,
+        )
+
+        policy1 = create_policy(
+            maximum_normalized_load_threshold=2.0,
+            cpu_constrained_threshold_ratio=0.8,
+        )
+        policy2 = create_policy(
+            maximum_normalized_load_threshold=2.0,
+            cpu_constrained_threshold_ratio=0.7,
+        )
+
+        guard = HostCapacityGuard()
+        decision1 = guard.evaluate(snapshot, requirement, policy1)
+        decision2 = guard.evaluate(snapshot, requirement, policy2)
+
+        # Fingerprints should differ
+        assert decision1.fingerprint != decision2.fingerprint
+        # And decisions should be different
+        assert decision1.status != decision2.status
+
+    def test_storage_warning_field_changes_decision_fingerprint(self):
+        """Changing storage warning multiplier can change decision fingerprint."""
+        snapshot, tmpdir = self._create_snapshot_with_storage(available_storage_gb=33)
+        requirement = create_requirement(
+            minimum_available_memory_bytes=1 * 1024**3,
+            minimum_available_storage_bytes=10 * 1024**3,
+            storage_root_path=tmpdir,
+            reserve_storage_bytes=5 * 1024**3,
+        )
+
+        policy1 = create_policy(
+            minimum_storage_reserve_bytes=10 * 1024**3,
+            storage_constrained_reserve_multiplier=1.5,
+        )
+        policy2 = create_policy(
+            minimum_storage_reserve_bytes=10 * 1024**3,
+            storage_constrained_reserve_multiplier=2.0,
+        )
+
+        guard = HostCapacityGuard()
+        decision1 = guard.evaluate(snapshot, requirement, policy1)
+        decision2 = guard.evaluate(snapshot, requirement, policy2)
+
+        # Fingerprints should differ
+        assert decision1.fingerprint != decision2.fingerprint
+        # And decisions should be different
+        assert decision1.status != decision2.status
+
+    def test_memory_multiplier_nan_rejected(self):
+        """NaN must be rejected for memory warning multiplier."""
+        with pytest.raises(ValueError, match="must not be NaN"):
+            create_policy(memory_constrained_reserve_multiplier=float('nan'))
+
+    def test_memory_multiplier_infinity_rejected(self):
+        """Infinity must be rejected for memory warning multiplier."""
+        with pytest.raises(ValueError, match="must be finite"):
+            create_policy(memory_constrained_reserve_multiplier=float('inf'))
+
+    def test_memory_multiplier_bool_rejected(self):
+        """Bool must be rejected for memory warning multiplier."""
+        with pytest.raises(TypeError, match="must be a number"):
+            create_policy(memory_constrained_reserve_multiplier=True)
+
+    def test_memory_multiplier_below_one_rejected(self):
+        """Values < 1.0 must be rejected for memory warning multiplier."""
+        with pytest.raises(ValueError, match="must be >= 1.0"):
+            create_policy(memory_constrained_reserve_multiplier=0.5)
+
+    def test_cpu_ratio_nan_rejected(self):
+        """NaN must be rejected for CPU warning ratio."""
+        with pytest.raises(ValueError, match="must not be NaN"):
+            create_policy(cpu_constrained_threshold_ratio=float('nan'))
+
+    def test_cpu_ratio_infinity_rejected(self):
+        """Infinity must be rejected for CPU warning ratio."""
+        with pytest.raises(ValueError, match="must be finite"):
+            create_policy(cpu_constrained_threshold_ratio=float('inf'))
+
+    def test_cpu_ratio_bool_rejected(self):
+        """Bool must be rejected for CPU warning ratio."""
+        with pytest.raises(TypeError, match="must be a number"):
+            create_policy(cpu_constrained_threshold_ratio=False)
+
+    def test_cpu_ratio_zero_rejected(self):
+        """Zero must be rejected for CPU warning ratio."""
+        with pytest.raises(ValueError, match="must be in range"):
+            create_policy(cpu_constrained_threshold_ratio=0.0)
+
+    def test_cpu_ratio_above_one_rejected(self):
+        """Values > 1.0 must be rejected for CPU warning ratio."""
+        with pytest.raises(ValueError, match="must be in range"):
+            create_policy(cpu_constrained_threshold_ratio=1.1)
+
+    def test_cpu_ratio_negative_rejected(self):
+        """Negative values must be rejected for CPU warning ratio."""
+        with pytest.raises(ValueError, match="must be in range"):
+            create_policy(cpu_constrained_threshold_ratio=-0.5)
+
+    def test_storage_multiplier_nan_rejected(self):
+        """NaN must be rejected for storage warning multiplier."""
+        with pytest.raises(ValueError, match="must not be NaN"):
+            create_policy(storage_constrained_reserve_multiplier=float('nan'))
+
+    def test_storage_multiplier_infinity_rejected(self):
+        """Infinity must be rejected for storage warning multiplier."""
+        with pytest.raises(ValueError, match="must be finite"):
+            create_policy(storage_constrained_reserve_multiplier=float('inf'))
+
+    def test_storage_multiplier_bool_rejected(self):
+        """Bool must be rejected for storage warning multiplier."""
+        with pytest.raises(TypeError, match="must be a number"):
+            create_policy(storage_constrained_reserve_multiplier=True)
+
+    def test_storage_multiplier_below_one_rejected(self):
+        """Values < 1.0 must be rejected for storage warning multiplier."""
+        with pytest.raises(ValueError, match="must be >= 1.0"):
+            create_policy(storage_constrained_reserve_multiplier=0.9)
+
+    def test_exact_memory_boundary_at_multiplier(self):
+        """Memory exactly at multiplier × reserve should be AVAILABLE."""
+        # memory_after = exactly 3.0 GB, reserve = 2 GB, multiplier = 1.5
+        # 3.0 >= 3.0 → AVAILABLE
+        snapshot = self._create_snapshot_with_memory(available_memory_gb=6.0)
+        requirement = create_requirement(
+            minimum_available_memory_bytes=3 * 1024**3,
+            reserve_memory_bytes=1 * 1024**3,
+        )
+        policy = create_policy(
+            minimum_host_memory_reserve_bytes=1 * 1024**3,
+            memory_constrained_reserve_multiplier=1.5,
+        )
+
+        guard = HostCapacityGuard()
+        decision = guard.evaluate(snapshot, requirement, policy)
+
+        assert decision.status == HostCapacityStatus.AVAILABLE
+        assert HostCapacityReason.CONSTRAINED_MEMORY not in decision.reasons
+
+    def test_exact_cpu_boundary_at_ratio(self):
+        """CPU load exactly at ratio × threshold should be AVAILABLE."""
+        # load = exactly 1.6, threshold = 2.0, ratio = 0.8
+        # 1.6 == 1.6 → not > 1.6 → AVAILABLE
+        snapshot = self._create_snapshot_with_load(normalized_load=1.6)
+        requirement = create_requirement(
+            minimum_available_memory_bytes=1 * 1024**3,
+        )
+        policy = create_policy(
+            maximum_normalized_load_threshold=2.0,
+            cpu_constrained_threshold_ratio=0.8,
+        )
+
+        guard = HostCapacityGuard()
+        decision = guard.evaluate(snapshot, requirement, policy)
+
+        assert decision.status == HostCapacityStatus.AVAILABLE
+        assert HostCapacityReason.CONSTRAINED_CPU not in decision.reasons
+
+    def test_exact_storage_boundary_at_multiplier(self):
+        """Storage exactly at multiplier × reserve should be AVAILABLE."""
+        # storage_after = exactly 22.5 GB, reserve = 15 GB, multiplier = 1.5
+        # 22.5 >= 22.5 → AVAILABLE
+        snapshot, tmpdir = self._create_snapshot_with_storage(available_storage_gb=32.5)
+        requirement = create_requirement(
+            minimum_available_memory_bytes=1 * 1024**3,
+            minimum_available_storage_bytes=10 * 1024**3,
+            storage_root_path=tmpdir,
+            reserve_storage_bytes=5 * 1024**3,
+        )
+        policy = create_policy(
+            minimum_storage_reserve_bytes=10 * 1024**3,
+            storage_constrained_reserve_multiplier=1.5,
+        )
+
+        guard = HostCapacityGuard()
+        decision = guard.evaluate(snapshot, requirement, policy)
+
+        assert decision.status == HostCapacityStatus.AVAILABLE
+        assert HostCapacityReason.CONSTRAINED_STORAGE not in decision.reasons
+
+    def test_cpu_ratio_at_one_is_valid(self):
+        """CPU ratio of exactly 1.0 should be valid."""
+        policy = create_policy(cpu_constrained_threshold_ratio=1.0)
+        assert policy.cpu_constrained_threshold_ratio == 1.0
+
+    def test_memory_multiplier_at_one_is_valid(self):
+        """Memory multiplier of exactly 1.0 should be valid."""
+        policy = create_policy(memory_constrained_reserve_multiplier=1.0)
+        assert policy.memory_constrained_reserve_multiplier == 1.0
+
+    def test_storage_multiplier_at_one_is_valid(self):
+        """Storage multiplier of exactly 1.0 should be valid."""
+        policy = create_policy(storage_constrained_reserve_multiplier=1.0)
+        assert policy.storage_constrained_reserve_multiplier == 1.0

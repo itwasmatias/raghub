@@ -101,6 +101,34 @@ def _optional_nonnegative_float(value, field_name: str) -> float | None:
     return value
 
 
+def _reserve_multiplier(value, field_name: str) -> float:
+    """Validate reserve multiplier (must be >= 1.0, finite)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{field_name} must be a number")
+    value = float(value)
+    if value != value:  # NaN check
+        raise ValueError(f"{field_name} must not be NaN")
+    if value == float('inf') or value == float('-inf'):
+        raise ValueError(f"{field_name} must be finite")
+    if value < 1.0:
+        raise ValueError(f"{field_name} must be >= 1.0")
+    return value
+
+
+def _threshold_ratio(value, field_name: str) -> float:
+    """Validate threshold ratio (must be 0.0 < ratio <= 1.0, finite)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{field_name} must be a number")
+    value = float(value)
+    if value != value:  # NaN check
+        raise ValueError(f"{field_name} must not be NaN")
+    if value == float('inf') or value == float('-inf'):
+        raise ValueError(f"{field_name} must be finite")
+    if value <= 0.0 or value > 1.0:
+        raise ValueError(f"{field_name} must be in range (0.0, 1.0]")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class HostMemorySnapshot:
     """Immutable snapshot of host memory state.
@@ -369,6 +397,9 @@ class HostCapacityPolicy:
     maximum_normalized_load_threshold: float
     minimum_storage_reserve_bytes: int
     swap_pressure_threshold_bytes: int
+    memory_constrained_reserve_multiplier: float
+    cpu_constrained_threshold_ratio: float
+    storage_constrained_reserve_multiplier: float
     fingerprint: str
 
     def __post_init__(self):
@@ -398,6 +429,21 @@ class HostCapacityPolicy:
             "swap_pressure_threshold_bytes",
             _nonnegative_int(self.swap_pressure_threshold_bytes, "swap_pressure_threshold_bytes"),
         )
+        object.__setattr__(
+            self,
+            "memory_constrained_reserve_multiplier",
+            _reserve_multiplier(self.memory_constrained_reserve_multiplier, "memory_constrained_reserve_multiplier"),
+        )
+        object.__setattr__(
+            self,
+            "cpu_constrained_threshold_ratio",
+            _threshold_ratio(self.cpu_constrained_threshold_ratio, "cpu_constrained_threshold_ratio"),
+        )
+        object.__setattr__(
+            self,
+            "storage_constrained_reserve_multiplier",
+            _reserve_multiplier(self.storage_constrained_reserve_multiplier, "storage_constrained_reserve_multiplier"),
+        )
 
         # Compute fingerprint
         payload = {
@@ -406,6 +452,9 @@ class HostCapacityPolicy:
             "maximum_normalized_load_threshold": self.maximum_normalized_load_threshold,
             "minimum_storage_reserve_bytes": self.minimum_storage_reserve_bytes,
             "swap_pressure_threshold_bytes": self.swap_pressure_threshold_bytes,
+            "memory_constrained_reserve_multiplier": self.memory_constrained_reserve_multiplier,
+            "cpu_constrained_threshold_ratio": self.cpu_constrained_threshold_ratio,
+            "storage_constrained_reserve_multiplier": self.storage_constrained_reserve_multiplier,
         }
         computed = _fingerprint(payload)
         if self.fingerprint != computed:
@@ -764,8 +813,8 @@ class HostCapacityGuard:
             reasons.append(HostCapacityReason.INSUFFICIENT_MEMORY)
         elif memory_after_workload < total_memory_reserve:
             reasons.append(HostCapacityReason.MEMORY_RESERVE_VIOLATION)
-        elif memory_after_workload < total_memory_reserve * 1.5:
-            # Constrained: less than 1.5x reserve
+        elif memory_after_workload < total_memory_reserve * policy.memory_constrained_reserve_multiplier:
+            # Constrained: less than policy multiplier × reserve
             reasons.append(HostCapacityReason.CONSTRAINED_MEMORY)
 
         # Swap pressure check
@@ -790,8 +839,8 @@ class HostCapacityGuard:
 
             if normalized_load > policy.maximum_normalized_load_threshold:
                 reasons.append(HostCapacityReason.HIGH_CPU_LOAD)
-            elif normalized_load > policy.maximum_normalized_load_threshold * 0.8:
-                # Constrained: load > 80% of threshold
+            elif normalized_load > policy.maximum_normalized_load_threshold * policy.cpu_constrained_threshold_ratio:
+                # Constrained: load > policy ratio × threshold
                 reasons.append(HostCapacityReason.CONSTRAINED_CPU)
 
         # Storage checks
@@ -812,8 +861,8 @@ class HostCapacityGuard:
                     reasons.append(HostCapacityReason.INSUFFICIENT_STORAGE)
                 elif storage_after_workload < total_storage_reserve:
                     reasons.append(HostCapacityReason.STORAGE_RESERVE_VIOLATION)
-                elif storage_after_workload < total_storage_reserve * 1.5:
-                    # Constrained: less than 1.5x reserve
+                elif storage_after_workload < total_storage_reserve * policy.storage_constrained_reserve_multiplier:
+                    # Constrained: less than policy multiplier × reserve
                     reasons.append(HostCapacityReason.CONSTRAINED_STORAGE)
 
         # Determine status
@@ -909,6 +958,9 @@ def create_policy(
     maximum_normalized_load_threshold: float = 2.0,  # 2.0 default
     minimum_storage_reserve_bytes: int = 10 * 1024 * 1024 * 1024,  # 10 GB default
     swap_pressure_threshold_bytes: int = 1024 * 1024 * 1024,  # 1 GB swap used default
+    memory_constrained_reserve_multiplier: float = 1.5,  # 1.5x reserve default
+    cpu_constrained_threshold_ratio: float = 0.8,  # 80% of threshold default
+    storage_constrained_reserve_multiplier: float = 1.5,  # 1.5x reserve default
 ) -> HostCapacityPolicy:
     """Create a HostCapacityPolicy with computed fingerprint.
 
@@ -921,6 +973,9 @@ def create_policy(
         "maximum_normalized_load_threshold": maximum_normalized_load_threshold,
         "minimum_storage_reserve_bytes": minimum_storage_reserve_bytes,
         "swap_pressure_threshold_bytes": swap_pressure_threshold_bytes,
+        "memory_constrained_reserve_multiplier": memory_constrained_reserve_multiplier,
+        "cpu_constrained_threshold_ratio": cpu_constrained_threshold_ratio,
+        "storage_constrained_reserve_multiplier": storage_constrained_reserve_multiplier,
     }
     fingerprint = _fingerprint(payload)
 
@@ -930,5 +985,8 @@ def create_policy(
         maximum_normalized_load_threshold=maximum_normalized_load_threshold,
         minimum_storage_reserve_bytes=minimum_storage_reserve_bytes,
         swap_pressure_threshold_bytes=swap_pressure_threshold_bytes,
+        memory_constrained_reserve_multiplier=memory_constrained_reserve_multiplier,
+        cpu_constrained_threshold_ratio=cpu_constrained_threshold_ratio,
+        storage_constrained_reserve_multiplier=storage_constrained_reserve_multiplier,
         fingerprint=fingerprint,
     )
