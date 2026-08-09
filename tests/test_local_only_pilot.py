@@ -1,10 +1,21 @@
 from dataclasses import FrozenInstanceError, replace
+from datetime import datetime, timedelta, timezone
 import math
 import json
 
 import pytest
 
 from federation.task_request import AuthorizationLevel
+from federation.assignment_registry import DurableAssignmentRegistry
+from federation.capability import NodeCapability
+from federation.heartbeat import Heartbeat
+from federation.heartbeat_registry import HeartbeatRegistry
+from federation.node_record import NodeRecord
+from federation.registry import NodeRegistry
+from federation.task_assignment import TaskAssignment
+from federation.task_dispatcher import TaskDispatchCoordinator
+from federation.task_request import TaskRequest
+from federation.worker_execution import WorkerExecutionCoordinator
 from tools.ai_controller.local_capability_baseline import LocalityType
 from tools.ai_controller.local_model_runtime import (
     AdapterInferenceResponse, GenerationConfig, LocalInferenceRequest,
@@ -17,8 +28,53 @@ from tools.ai_controller.local_only_pilot import (
     PilotTaskRecord, build_default_pilot_definition, evaluate_output,
 )
 from tools.ai_controller.run_local_only_pilot import (
-    MODEL_ALIAS, MODEL_SHA256, _load_authority, parser,
+    MODEL_ALIAS, MODEL_SHA256, NODE_ID, PilotExecutionAuthority, _load_authority, parser,
 )
+
+AUTHORITY_KEY = b"local-pilot-authority-test-key-00001"
+AUTHORITY_NOW = datetime(2026, 8, 9, tzinfo=timezone.utc)
+
+
+def authoritative_environment(path, definition=None, *, worker=NODE_ID):
+    definition = definition or build_default_pilot_definition()
+    node = NodeRecord(worker, "worker.local", "Fedora",
+        capabilities={NodeCapability("local_model_inference")})
+    nodes = NodeRegistry(stale_threshold_seconds=10**9)
+    nodes.register(node)
+    assignments = DurableAssignmentRegistry(path / "assignments.jsonl",
+        coordinator_node_id="coordinator-1", integrity_key=AUTHORITY_KEY)
+    heartbeats = HeartbeatRegistry(path / "heartbeats.jsonl", registry_id="pilot-tests",
+        node_registry=nodes, integrity_key=AUTHORITY_KEY, clock=lambda: AUTHORITY_NOW)
+    heartbeats.record(Heartbeat.authenticated(worker_id=worker, registry_id="pilot-tests",
+        sequence=1, session_id="boot-1", worker_timestamp=AUTHORITY_NOW, health="healthy",
+        power_capabilities=(), requested_power_state="active", sleep_reason=None,
+        expected_wake_time=None, wake_method=None, active_work_checkpointed=False,
+        previous_authentication_tag="0" * 64, integrity_key=AUTHORITY_KEY))
+    dispatch = TaskDispatchCoordinator("coordinator-1", assignment_store=assignments,
+        dispatch_store_path=path / "dispatch.jsonl", integrity_key=AUTHORITY_KEY,
+        heartbeat_registry=heartbeats, clock=lambda: AUTHORITY_NOW)
+    protocol = WorkerExecutionCoordinator("coordinator-1", dispatch_coordinator=dispatch,
+        store_path=path / "execution.jsonl", integrity_key=AUTHORITY_KEY,
+        clock=lambda: AUTHORITY_NOW)
+    manifest = {}
+    for task in definition.tasks:
+        fingerprint = task.task_fingerprint()
+        request_value = TaskRequest(task.task_id, definition.pilot_id,
+            required_capabilities={NodeCapability("local_model_inference")},
+            authorization_level=AuthorizationLevel.INTERNAL, approval_required=False,
+            input_data={"execution_fingerprint": fingerprint}, expected_result="pilot evidence")
+        assignment = assignments.record(TaskAssignment(request_value, node))
+        offer = dispatch.create_offer(assignment_id=assignment.assignment_id,
+            actor_node_id="coordinator-1", expires_at=AUTHORITY_NOW + timedelta(hours=1))
+        offer = dispatch.accept_offer(offer_id=offer.offer_id, actor_node_id=worker)
+        attempt = protocol.register(dispatch_offer_id=offer.offer_id,
+            actor_node_id="coordinator-1", expected_result="pilot evidence")
+        attempt = protocol.claim(execution_attempt_id=attempt.request.execution_attempt_id,
+            actor_node_id=worker)
+        manifest[task.task_id] = {"execution_attempt_id": attempt.request.execution_attempt_id,
+            "assignment_id": assignment.assignment_id, "dispatch_offer_id": offer.offer_id,
+            "execution_fingerprint": fingerprint}
+    return PilotExecutionAuthority(protocol), manifest, protocol
 
 
 def model():
@@ -168,6 +224,9 @@ def test_evaluation_is_immutable_and_does_not_treat_agreement_as_correctness():
 def test_real_entrypoint_requires_exact_model_and_explicit_governed_inputs(tmp_path):
     parsed = parser().parse_args(["--endpoint", "http://127.0.0.1:8080",
         "--output", str(tmp_path / "report.json"), "--authority-manifest", "authority.json",
+        "--assignment-store", "assignments.jsonl", "--dispatch-store", "dispatch.jsonl",
+        "--execution-store", "execution.jsonl", "--heartbeat-store", "heartbeats.jsonl",
+        "--heartbeat-registry-id", "pilot-registry", "--coordinator-node-id", "coordinator-1",
         "--run-id", "run-1", "--profile-fingerprint", "a" * 64,
         "--model-alias", MODEL_ALIAS, "--model-sha256", MODEL_SHA256])
     assert parsed.endpoint == "http://127.0.0.1:8080"
@@ -187,3 +246,87 @@ def test_authority_manifest_requires_exact_task_set_and_schema(tmp_path):
     path.write_text(json.dumps(manifest))
     with pytest.raises(PilotContractError):
         _load_authority(path, set(manifest))
+
+
+def test_schema_valid_fabricated_manifest_and_missing_authority_fail(tmp_path):
+    definition = build_default_pilot_definition()
+    authority, manifest, _ = authoritative_environment(tmp_path, definition)
+    fabricated = {key: dict(value) for key, value in manifest.items()}
+    fabricated[definition.tasks[0].task_id]["execution_attempt_id"] = "execution-" + "f" * 64
+    with pytest.raises(PilotContractError, match="unavailable"):
+        authority.preflight(definition, fabricated, worker_node_id=NODE_ID)
+
+
+def test_authoritative_matching_evidence_passes_and_replay_is_deterministic(tmp_path):
+    definition = build_default_pilot_definition()
+    authority, manifest, _ = authoritative_environment(tmp_path, definition)
+    first = authority.preflight(definition, manifest, worker_node_id=NODE_ID)
+    second = authority.preflight(definition, manifest, worker_node_id=NODE_ID)
+    assert first == second
+    assert tuple(item.request.task_id for item in first) == tuple(task.task_id for task in definition.tasks)
+
+
+def test_only_claimed_attempt_can_begin_and_running_attempt_cannot_be_replayed(tmp_path):
+    definition = build_default_pilot_definition()
+    authority, manifest, protocol = authoritative_environment(tmp_path, definition)
+    authority.preflight(definition, manifest, worker_node_id=NODE_ID)
+    running = authority.begin(definition.tasks[0].task_id)
+    assert running.status.value == "running"
+    assert protocol.inspect(running.request.execution_attempt_id) == running
+    with pytest.raises(PilotContractError, match="not uniquely eligible"):
+        authority.preflight(definition, manifest, worker_node_id=NODE_ID)
+
+
+def test_runtime_verifier_rereads_current_authoritative_attempt(tmp_path):
+    definition = build_default_pilot_definition()
+    authority, manifest, protocol = authoritative_environment(tmp_path, definition)
+    authority.preflight(definition, manifest, worker_node_id=NODE_ID)
+    task = definition.tasks[0]
+    running = authority.begin(task.task_id)
+    evidence = running.request
+    inference = LocalInferenceRequest("pilot-request", task.task_id, NODE_ID,
+        model().descriptor_fingerprint(), task.prompt,
+        GenerationConfig(task.maximum_output_tokens, 0.0, 42, (), False),
+        evidence.authorization_level, evidence.approval_required, (), True,
+        evidence.execution_attempt_id, evidence.assignment_id, evidence.dispatch_offer_id,
+        evidence.execution_fingerprint)
+    assert authority.verifies(inference, model()) is True
+    protocol.fail(execution_attempt_id=evidence.execution_attempt_id,
+        actor_node_id=NODE_ID, reason="external terminal transition")
+    assert authority.verifies(inference, model()) is False
+
+
+@pytest.mark.parametrize(("field", "replacement"), [
+    ("assignment_id", "assignment-" + "1" * 64),
+    ("dispatch_offer_id", "dispatch-" + "2" * 64),
+    ("execution_attempt_id", "execution-" + "3" * 64),
+    ("execution_fingerprint", "4" * 64),
+])
+def test_swapped_authority_identifiers_fail_closed(tmp_path, field, replacement):
+    definition = build_default_pilot_definition()
+    authority, manifest, _ = authoritative_environment(tmp_path, definition)
+    changed = {key: dict(value) for key, value in manifest.items()}
+    changed[definition.tasks[0].task_id][field] = replacement
+    with pytest.raises(PilotContractError):
+        authority.preflight(definition, changed, worker_node_id=NODE_ID)
+
+
+def test_foreign_task_and_node_authority_fail_closed(tmp_path):
+    definition = build_default_pilot_definition()
+    authority, manifest, _ = authoritative_environment(tmp_path, definition)
+    swapped = {key: dict(value) for key, value in manifest.items()}
+    first, second = definition.tasks[:2]
+    swapped[first.task_id], swapped[second.task_id] = swapped[second.task_id], swapped[first.task_id]
+    with pytest.raises(PilotContractError, match="disagrees"):
+        authority.preflight(definition, swapped, worker_node_id=NODE_ID)
+    with pytest.raises(PilotContractError, match="disagrees"):
+        authority.preflight(definition, manifest, worker_node_id="foreign-node")
+
+
+def test_corrupt_authenticated_execution_evidence_fails_closed(tmp_path):
+    definition = build_default_pilot_definition()
+    authority, manifest, _ = authoritative_environment(tmp_path, definition)
+    execution_path = tmp_path / "execution.jsonl"
+    execution_path.write_bytes(execution_path.read_bytes()[:-1])
+    with pytest.raises(PilotContractError, match="unavailable"):
+        authority.preflight(definition, manifest, worker_node_id=NODE_ID)

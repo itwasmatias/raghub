@@ -18,6 +18,12 @@ python -m tools.ai_controller.run_local_only_pilot \
   --endpoint http://127.0.0.1:8080 \
   --output /explicit/path/report.json \
   --authority-manifest /explicit/path/authority.json \
+  --assignment-store /authoritative/path/assignments.jsonl \
+  --dispatch-store /authoritative/path/dispatch.jsonl \
+  --execution-store /authoritative/path/execution.jsonl \
+  --heartbeat-store /authoritative/path/heartbeats.jsonl \
+  --heartbeat-registry-id <registry-id> \
+  --coordinator-node-id <coordinator-id> \
   --run-id pilot-run-001 \
   --profile-fingerprint <lowercase-sha256> \
   --model-alias raghub-qwen2.5-0.5b-q4km \
@@ -26,8 +32,17 @@ python -m tools.ai_controller.run_local_only_pilot \
 
 The authority manifest must contain exactly one entry per pilot task and only
 `execution_attempt_id`, `assignment_id`, `dispatch_offer_id`, and
-`execution_fingerprint`. Those identities must come from the existing governed
-worker execution path. The entrypoint uses CHAT mode, no tools, a fixed seed and
+`execution_fingerprint`. The manifest is only an index: every claim is resolved
+against the existing HMAC-authenticated assignment, dispatch, and Worker Execution
+stores using the integrity key named by `--integrity-key-env` (default
+`RAGHUB_FEDERATION_INTEGRITY_KEY`). The exact mission, task, node, assignment,
+offer, attempt, and execution fingerprint must compose, and the attempt must be
+uniquely `CLAIMED`. Immediately before inference it is durably transitioned to
+`RUNNING`; an interrupted run therefore requires reconciliation and cannot reuse
+the manifest to execute again. Successful and failed inference results are recorded
+through the Worker Execution Protocol terminal transitions.
+
+The entrypoint uses CHAT mode, no tools, a fixed seed and
 temperature, at most 96 output tokens, and an empty cloud surface. The adapter
 continues to require loopback, exact loaded-model alias attestation, chat-template
 attestation, bounded responses, no redirects, and no retries.
