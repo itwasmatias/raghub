@@ -16,6 +16,7 @@ import urllib3
 from federation.llamacpp_adapter import (
     LlamaCppAdapterConfig,
     LlamaCppAdapterError,
+    LlamaCppAdapterMode,
     LlamaCppLocalAdapter,
     LlamaCppNetworkPolicyError,
     LlamaCppServerIdentityError,
@@ -110,7 +111,7 @@ def adapter_config(**changes):
         connection_timeout_seconds=5.0,
         request_timeout_seconds=30.0,
         maximum_response_bytes=1024 * 1024,
-        api_route="/completion",
+        mode=LlamaCppAdapterMode.COMPLETION,
     )
     values.update(changes)
     return LlamaCppAdapterConfig(**values)
@@ -120,6 +121,26 @@ class FakeLlamaServer(BaseHTTPRequestHandler):
     """Deterministic fake llama-server for testing."""
 
     def do_GET(self):
+        if self.path == "/props":
+            self.server.props_request_count += 1
+            if hasattr(self.server, "props_redirect_location"):
+                self.send_response(self.server.props_redirect_status)
+                self.send_header("Location", self.server.props_redirect_location)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            response = getattr(self.server, "props_response_override", {
+                "chat_template": "{{ messages }}",
+                "chat_template_caps": {},
+            })
+            status = getattr(self.server, "props_status_override", 200)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            response_bytes = json.dumps(response).encode("utf-8")
+            self.send_header("Content-Length", str(len(response_bytes)))
+            self.end_headers()
+            self.wfile.write(response_bytes)
+            return
         if self.path != "/v1/models":
             self.send_error(404, "Not Found")
             return
@@ -161,7 +182,7 @@ class FakeLlamaServer(BaseHTTPRequestHandler):
         self.wfile.write(response_bytes)
 
     def do_POST(self):
-        if self.path != "/completion":
+        if self.path not in ("/completion", "/v1/chat/completions"):
             self.send_error(404, "Not Found")
             return
         self.server.inference_request_count += 1
@@ -184,20 +205,33 @@ class FakeLlamaServer(BaseHTTPRequestHandler):
 
         # Store request for assertions
         self.server.last_request = req
+        self.server.last_request_path = self.path
 
         # Deterministic response
-        response = {
-            "content": f"response to: {req.get('prompt', '')}",
-            "stopped_eos": True,
-            "stopped_word": False,
-            "stopped_limit": False,
-            "timings": {
-                "prompt_n": 10,
-                "predicted_n": 5,
-                "prompt_ms": 100.0,
-                "predicted_ms": 50.0,
-            },
-        }
+        if self.path == "/v1/chat/completions":
+            response = {
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "model": "llama-3.2-1b-q4",
+                "choices": [{"index": 0, "message": {
+                    "role": "assistant", "content": "LOCAL_OK"},
+                    "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 9, "completion_tokens": 4,
+                    "total_tokens": 13},
+            }
+        else:
+            response = {
+                "content": f"response to: {req.get('prompt', '')}",
+                "stopped_eos": True,
+                "stopped_word": False,
+                "stopped_limit": False,
+                "timings": {
+                    "prompt_n": 10,
+                    "predicted_n": 5,
+                    "prompt_ms": 100.0,
+                    "predicted_ms": 50.0,
+                },
+            }
 
         # Check for custom test behaviors
         if hasattr(self.server, "response_override"):
@@ -223,7 +257,9 @@ def start_fake_server(port=0):
     """Start a fake llama-server on loopback."""
     server = HTTPServer(("127.0.0.1", port), FakeLlamaServer)
     server.last_request = None
+    server.last_request_path = None
     server.models_request_count = 0
+    server.props_request_count = 0
     server.inference_request_count = 0
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
@@ -1231,6 +1267,249 @@ def test_inference_307_redirect_is_not_followed_replayed_or_retried():
     finally:
         source.shutdown()
         target.shutdown()
+
+
+# ==================================================
+# Real llama-server chat compatibility regressions
+# ==================================================
+
+
+def test_chat_mode_uses_fixed_endpoint_and_single_governed_user_message():
+    server = start_fake_server()
+    adapter = LlamaCppLocalAdapter(config=adapter_config(
+        endpoint=f"http://127.0.0.1:{server.server_address[1]}",
+        mode=LlamaCppAdapterMode.CHAT), clock=fixed_clock)
+    instruction = "Reply with exactly LOCAL_OK and nothing else."
+
+    try:
+        result = adapter.infer(descriptor(), request(input_text=instruction),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True))
+        assert result.status is LocalInferenceStatus.SUCCEEDED
+        assert result.output_text == "LOCAL_OK"
+        assert server.last_request_path == "/v1/chat/completions"
+        assert server.last_request["model"] == "llama-3.2-1b-q4"
+        assert server.last_request["messages"] == [
+            {"role": "user", "content": instruction}]
+        assert server.last_request["stream"] is False
+        assert "prompt" not in server.last_request
+        assert "<|" not in json.dumps(server.last_request)
+        assert server.models_request_count == 1
+        assert server.props_request_count == 1
+        assert result.usage.prompt_tokens == 9
+        assert result.usage.generated_tokens == 4
+        assert result.termination_reason == "eos_or_stop"
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize("props", [
+    {}, {"chat_template": None}, {"chat_template": ""}, {"chat_template": "   "},
+    {"chat_template": 123}, {"chat_template": "valid", "chat_template_caps": []},
+])
+def test_chat_mode_fails_closed_without_valid_attested_template(props):
+    server = start_fake_server()
+    server.props_response_override = props
+    adapter = LlamaCppLocalAdapter(config=adapter_config(
+        endpoint=f"http://127.0.0.1:{server.server_address[1]}",
+        mode=LlamaCppAdapterMode.CHAT), clock=fixed_clock)
+    try:
+        with pytest.raises(LlamaCppServerIdentityError, match="chat template"):
+            adapter.infer(descriptor(), request(),
+                LocalModelRuntimeConfig(True, 512, frozenset(), True))
+        assert server.inference_request_count == 0
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize(("finish_reason", "expected"), [
+    ("length", "max_tokens"), ("stop", "eos_or_stop"),
+])
+def test_chat_finish_reason_is_preserved(finish_reason, expected):
+    server = start_fake_server()
+    server.response_override = {
+        "model": "llama-3.2-1b-q4",
+        "choices": [{"index": 0, "message": {
+            "role": "assistant", "content": "LOCAL_OK"},
+            "finish_reason": finish_reason}],
+    }
+    adapter = LlamaCppLocalAdapter(config=adapter_config(
+        endpoint=f"http://127.0.0.1:{server.server_address[1]}",
+        mode=LlamaCppAdapterMode.CHAT), clock=fixed_clock)
+    try:
+        result = adapter.infer(descriptor(), request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True))
+        assert result.status is LocalInferenceStatus.SUCCEEDED
+        assert result.termination_reason == expected
+        assert result.usage.prompt_tokens is None
+        assert result.usage.generated_tokens is None
+    finally:
+        server.shutdown()
+
+
+def test_chat_missing_finish_reason_remains_unknown():
+    server = start_fake_server()
+    server.response_override = {"model": "llama-3.2-1b-q4", "choices": [
+        {"index": 0, "message": {"role": "assistant", "content": "LOCAL_OK"}}]}
+    adapter = LlamaCppLocalAdapter(config=adapter_config(
+        endpoint=f"http://127.0.0.1:{server.server_address[1]}",
+        mode=LlamaCppAdapterMode.CHAT), clock=fixed_clock)
+    try:
+        result = adapter.infer(descriptor(), request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True))
+        assert result.status is LocalInferenceStatus.SUCCEEDED
+        assert result.termination_reason == "unknown"
+    finally:
+        server.shutdown()
+
+
+def test_chat_timings_token_counts_are_preserved_when_usage_is_absent():
+    server = start_fake_server()
+    server.response_override = {"model": "llama-3.2-1b-q4", "choices": [
+        {"index": 0, "message": {"role": "assistant", "content": "LOCAL_OK"},
+         "finish_reason": "length"}],
+        "timings": {"prompt_n": 9, "predicted_n": 24,
+                    "prompt_ms": 100.0, "predicted_ms": 7000.0}}
+    adapter = LlamaCppLocalAdapter(config=adapter_config(
+        endpoint=f"http://127.0.0.1:{server.server_address[1]}",
+        mode=LlamaCppAdapterMode.CHAT), clock=fixed_clock)
+    try:
+        result = adapter.infer(descriptor(), request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True))
+        assert result.usage.prompt_tokens == 9
+        assert result.usage.generated_tokens == 24
+        assert result.resource_measurements == {
+            "prompt_ms": 100.0, "predicted_ms": 7000.0}
+    finally:
+        server.shutdown()
+
+
+def test_chat_conflicting_usage_and_timings_fail_closed():
+    server = start_fake_server()
+    server.response_override = {"model": "llama-3.2-1b-q4", "choices": [
+        {"index": 0, "message": {"role": "assistant", "content": "LOCAL_OK"},
+         "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 9, "completion_tokens": 4},
+        "timings": {"prompt_n": 10, "predicted_n": 4}}
+    adapter = LlamaCppLocalAdapter(config=adapter_config(
+        endpoint=f"http://127.0.0.1:{server.server_address[1]}",
+        mode=LlamaCppAdapterMode.CHAT), clock=fixed_clock)
+    try:
+        result = adapter.infer(descriptor(), request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True))
+        assert result.status is LocalInferenceStatus.FAILED
+        assert result.error_code == "malformed_token_count"
+    finally:
+        server.shutdown()
+
+
+def test_chat_props_redirect_is_not_followed():
+    source = start_fake_server()
+    target = start_redirect_target()
+    source.props_redirect_status = 302
+    source.props_redirect_location = (
+        f"http://127.0.0.1:{target.server_address[1]}/redirected-props")
+    adapter = LlamaCppLocalAdapter(config=adapter_config(
+        endpoint=f"http://127.0.0.1:{source.server_address[1]}",
+        mode=LlamaCppAdapterMode.CHAT), clock=fixed_clock)
+    try:
+        with pytest.raises(LlamaCppServerIdentityError, match="HTTP 302"):
+            adapter.infer(descriptor(), request(),
+                LocalModelRuntimeConfig(True, 512, frozenset(), True))
+        assert source.models_request_count == 1
+        assert source.props_request_count == 1
+        assert source.inference_request_count == 0
+        assert target.contact_count == 0
+    finally:
+        source.shutdown()
+        target.shutdown()
+
+
+def test_adapter_mode_is_fixed_and_arbitrary_route_is_not_configurable():
+    with pytest.raises(ValueError, match="mode"):
+        adapter_config(mode="arbitrary")
+    with pytest.raises(TypeError):
+        adapter_config(api_route="/caller-controlled")
+
+
+@pytest.mark.parametrize("override", [
+    {"model": "llama-3.2-1b-q4", "choices": []},
+    {"model": "llama-3.2-1b-q4", "choices": [
+        {"index": 0, "message": {"role": "assistant", "content": "a"}},
+        {"index": 1, "message": {"role": "assistant", "content": "b"}}]},
+    {"model": "foreign", "choices": [{"index": 0, "message": {
+        "role": "assistant", "content": "a"}, "finish_reason": "stop"}]},
+    {"model": "llama-3.2-1b-q4", "choices": [{"index": 0, "message": {
+        "role": "user", "content": "a"}, "finish_reason": "stop"}]},
+    {"model": "llama-3.2-1b-q4", "choices": [{"index": 0, "message": {
+        "role": "assistant", "content": "a"}, "finish_reason": 3}]},
+    {"model": "llama-3.2-1b-q4", "choices": [{"index": 0, "message": {
+        "role": "assistant", "content": "a"}, "finish_reason": "tool_calls"}]},
+    {"model": "llama-3.2-1b-q4", "choices": [{"index": 0, "message": {
+        "role": "assistant", "content": "a"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": "9", "completion_tokens": 4}},
+])
+def test_malformed_chat_completion_fails_closed(override):
+    server = start_fake_server()
+    server.response_override = override
+    adapter = LlamaCppLocalAdapter(config=adapter_config(
+        endpoint=f"http://127.0.0.1:{server.server_address[1]}",
+        mode=LlamaCppAdapterMode.CHAT), clock=fixed_clock)
+    try:
+        result = adapter.infer(descriptor(), request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True))
+        assert result.status is LocalInferenceStatus.FAILED
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize(("stop_type", "expected"), [
+    ("limit", "max_tokens"), ("eos", "eos"), ("word", "stop_word"),
+    ("none", "unknown"),
+])
+def test_real_completion_stop_type_is_preserved(stop_type, expected):
+    server = start_fake_server()
+    server.response_override = {"content": "output", "stop_type": stop_type,
+        "timings": {"prompt_n": 9, "predicted_n": 24}}
+    adapter = LlamaCppLocalAdapter(config=adapter_config(
+        endpoint=f"http://127.0.0.1:{server.server_address[1]}"), clock=fixed_clock)
+    try:
+        result = adapter.infer(descriptor(), request(generation=generation(
+            maximum_output_tokens=24)), LocalModelRuntimeConfig(
+                True, 512, frozenset(), True))
+        assert result.status is LocalInferenceStatus.SUCCEEDED
+        assert result.termination_reason == expected
+        assert result.usage.generated_tokens == 24
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize("stop_type", [True, 1, "bogus", [], {}])
+def test_malformed_present_completion_stop_type_fails_closed(stop_type):
+    server = start_fake_server()
+    server.response_override = {"content": "output", "stop_type": stop_type}
+    adapter = LlamaCppLocalAdapter(config=adapter_config(
+        endpoint=f"http://127.0.0.1:{server.server_address[1]}"), clock=fixed_clock)
+    try:
+        result = adapter.infer(descriptor(), request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True))
+        assert result.status is LocalInferenceStatus.FAILED
+        assert result.error_code == "malformed_termination_metadata"
+    finally:
+        server.shutdown()
+
+
+def test_missing_completion_termination_metadata_remains_unknown():
+    server = start_fake_server()
+    server.response_override = {"content": "output"}
+    adapter = LlamaCppLocalAdapter(config=adapter_config(
+        endpoint=f"http://127.0.0.1:{server.server_address[1]}"), clock=fixed_clock)
+    try:
+        result = adapter.infer(descriptor(), request(),
+            LocalModelRuntimeConfig(True, 512, frozenset(), True))
+        assert result.status is LocalInferenceStatus.SUCCEEDED
+        assert result.termination_reason == "unknown"
+    finally:
+        server.shutdown()
 
 
 def test_http_404_returns_error_response():

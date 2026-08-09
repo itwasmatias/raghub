@@ -10,7 +10,7 @@ import socket
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Any, Mapping
 from urllib.parse import urlparse
 
@@ -27,6 +27,13 @@ from tools.ai_controller.local_model_runtime import (
     LocalInferenceRequest,
     LocalModelRuntimeConfig,
 )
+
+
+class LlamaCppAdapterMode(StrEnum):
+    """Immutable adapter mode for llama.cpp inference endpoint selection."""
+
+    COMPLETION = "completion"
+    CHAT = "chat"
 
 
 class LlamaCppAdapterError(LocalModelAdapterError):
@@ -58,7 +65,7 @@ class LlamaCppAdapterConfig:
     connection_timeout_seconds: float
     request_timeout_seconds: float
     maximum_response_bytes: int
-    api_route: str
+    mode: LlamaCppAdapterMode
 
     def __post_init__(self):
         from tools.ai_controller.local_model_runtime import (
@@ -97,8 +104,10 @@ class LlamaCppAdapterConfig:
         ):
             raise ValueError("maximum_response_bytes must be positive integer")
 
-        if not isinstance(self.api_route, str) or not self.api_route.startswith("/"):
-            raise ValueError("api_route must be a string starting with /")
+        try:
+            object.__setattr__(self, "mode", LlamaCppAdapterMode(self.mode))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("mode must be completion or chat") from exc
 
         # Validate loopback-only
         _validate_loopback_only(self.endpoint)
@@ -118,7 +127,7 @@ class LlamaCppAdapterConfig:
                 "connection_timeout_seconds": self.connection_timeout_seconds,
                 "request_timeout_seconds": self.request_timeout_seconds,
                 "maximum_response_bytes": self.maximum_response_bytes,
-                "api_route": self.api_route,
+                "mode": self.mode.value,
             }
         )
 
@@ -253,6 +262,8 @@ class LlamaCppLocalAdapter:
 
             # Attest server/model identity
             self._attest_server_model(model)
+            if self._config.mode is LlamaCppAdapterMode.CHAT:
+                self._attest_chat_capability()
 
             # Map generation config to llama.cpp request
             llama_request = self._map_request(inference_request)
@@ -397,21 +408,62 @@ class LlamaCppLocalAdapter:
                 f"expected '{self._config.expected_model_id}'"
             )
 
+    def _attest_chat_capability(self) -> None:
+        """Require authoritative server chat-template metadata in chat mode."""
+        url = self._config.endpoint.rstrip("/") + "/props"
+        try:
+            resp = self._http.request("GET", url, preload_content=False)
+        except urllib3.exceptions.HTTPError as exc:
+            raise LlamaCppServerIdentityError(
+                f"failed to query chat template metadata: {exc}") from exc
+        try:
+            raw_data = resp.read(self._config.maximum_response_bytes + 1)
+        except Exception as exc:
+            raise LlamaCppServerIdentityError(
+                f"failed to read chat template metadata: {exc}") from exc
+        finally:
+            resp.release_conn()
+        if len(raw_data) > self._config.maximum_response_bytes:
+            raise LlamaCppServerIdentityError(
+                "chat template metadata exceeds maximum response size")
+        if resp.status != 200:
+            raise LlamaCppServerIdentityError(
+                f"chat template metadata endpoint returned HTTP {resp.status}")
+        try:
+            props = json.loads(raw_data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise LlamaCppServerIdentityError(
+                f"failed to parse chat template metadata JSON: {exc}") from exc
+        if not isinstance(props, dict):
+            raise LlamaCppServerIdentityError("chat template metadata is not an object")
+        template = props.get("chat_template")
+        if not isinstance(template, str) or not template.strip():
+            raise LlamaCppServerIdentityError(
+                "chat template is missing or not authoritatively available")
+        capabilities = props.get("chat_template_caps")
+        if capabilities is not None and not isinstance(capabilities, dict):
+            raise LlamaCppServerIdentityError("chat template capabilities are malformed")
+
     def _map_request(
         self, inference_request: LocalInferenceRequest
     ) -> dict[str, Any]:
         """Map LocalInferenceRequest to llama.cpp completion request."""
         gen = inference_request.generation
 
-        # Build llama.cpp request
-        llama_req: dict[str, Any] = {
-            "prompt": inference_request.input_text,
-            "stream": False,
-        }
+        if self._config.mode is LlamaCppAdapterMode.CHAT:
+            llama_req: dict[str, Any] = {
+                "model": self._config.expected_model_id,
+                "messages": [{"role": "user", "content": inference_request.input_text}],
+                "stream": False,
+            }
+        else:
+            llama_req = {"prompt": inference_request.input_text, "stream": False}
 
         # Map generation parameters
         if gen.maximum_output_tokens is not None:
-            llama_req["n_predict"] = gen.maximum_output_tokens
+            llama_req[
+                "max_tokens" if self._config.mode is LlamaCppAdapterMode.CHAT else "n_predict"
+            ] = gen.maximum_output_tokens
 
         if gen.temperature is not None:
             llama_req["temperature"] = gen.temperature
@@ -432,7 +484,9 @@ class LlamaCppLocalAdapter:
 
     def _execute_http_request(self, llama_request: dict[str, Any]) -> dict[str, Any]:
         """Execute HTTP POST to llama-server with hardened bounds."""
-        url = self._config.endpoint.rstrip("/") + self._config.api_route
+        route = ("/v1/chat/completions"
+                 if self._config.mode is LlamaCppAdapterMode.CHAT else "/completion")
+        url = self._config.endpoint.rstrip("/") + route
 
         # Encode request
         try:
@@ -493,6 +547,10 @@ class LlamaCppLocalAdapter:
         elapsed_seconds: float,
     ) -> AdapterInferenceResponse:
         """Map llama.cpp response to AdapterInferenceResponse."""
+        if self._config.mode is LlamaCppAdapterMode.CHAT:
+            return self._map_chat_response(
+                model, response_data, started_at, completed_at, elapsed_seconds)
+
         # Extract generated text
         output_text = response_data.get("content")
         if output_text is None:
@@ -515,16 +573,10 @@ class LlamaCppLocalAdapter:
                 f"content field is not string: {type(output_text)}",
             )
 
-        # Extract termination reason
-        stopped = response_data.get("stopped_eos") or response_data.get("stopped_limit")
-        if response_data.get("stopped_word"):
-            termination_reason = "stop_word"
-        elif response_data.get("stopped_limit"):
-            termination_reason = "max_tokens"
-        elif response_data.get("stopped_eos"):
-            termination_reason = "eos"
-        else:
-            termination_reason = "unknown"
+        termination_reason, termination_error = self._completion_termination(response_data)
+        if termination_error is not None:
+            return self._error_response(model, started_at, completed_at, elapsed_seconds,
+                "malformed_termination_metadata", termination_error)
 
         # Extract token counts - fail closed on malformed
         timings = response_data.get("timings", {})
@@ -631,6 +683,120 @@ class LlamaCppLocalAdapter:
             cloud_escalation_count=0,
             cloud_cost_usd=0.0,
         )
+
+    @staticmethod
+    def _completion_termination(response_data):
+        if "stop_type" in response_data:
+            stop_type = response_data["stop_type"]
+            if not isinstance(stop_type, str) or stop_type not in {
+                    "limit", "eos", "word", "none"}:
+                return None, "stop_type is malformed or unsupported"
+            return {"limit": "max_tokens", "eos": "eos",
+                    "word": "stop_word", "none": "unknown"}[stop_type], None
+        present = {name: response_data[name] for name in (
+            "stopped_word", "stopped_limit", "stopped_eos") if name in response_data}
+        if any(not isinstance(value, bool) for value in present.values()):
+            return None, "legacy termination flags must be boolean"
+        active = [name for name, value in present.items() if value]
+        if len(active) > 1:
+            return None, "legacy termination flags conflict"
+        if not active:
+            return "unknown", None
+        return {"stopped_word": "stop_word", "stopped_limit": "max_tokens",
+                "stopped_eos": "eos"}[active[0]], None
+
+    def _map_chat_response(self, model, response_data, started_at, completed_at,
+                           elapsed_seconds):
+        def failed(code, message):
+            return self._error_response(model, started_at, completed_at,
+                elapsed_seconds, code, message)
+
+        if not isinstance(response_data, dict):
+            return failed("malformed_chat_response", "chat response is not an object")
+        if response_data.get("model") != self._config.expected_model_id:
+            return failed("model_identity_mismatch", "chat response model identity mismatch")
+        choices = response_data.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1:
+            return failed("malformed_chat_response", "chat response must contain one choice")
+        choice = choices[0]
+        if not isinstance(choice, dict) or choice.get("index") != 0:
+            return failed("malformed_chat_response", "chat choice identity is malformed")
+        message = choice.get("message")
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            return failed("malformed_chat_response", "chat choice is not an assistant message")
+        content = message.get("content")
+        if not isinstance(content, str):
+            return failed("malformed_chat_response", "assistant content is not text")
+        finish_reason = choice.get("finish_reason")
+        if finish_reason is None:
+            termination_reason = "unknown"
+        elif not isinstance(finish_reason, str) or finish_reason not in {"stop", "length"}:
+            return failed("malformed_termination_metadata",
+                "chat finish_reason is malformed or unsupported")
+        else:
+            termination_reason = {"stop": "eos_or_stop",
+                                  "length": "max_tokens"}[finish_reason]
+
+        prompt_tokens = generated_tokens = None
+        usage = response_data.get("usage")
+        if usage is not None:
+            if not isinstance(usage, dict):
+                return failed("malformed_token_count", "chat usage is not an object")
+            prompt_tokens = usage.get("prompt_tokens")
+            generated_tokens = usage.get("completion_tokens")
+            for name, value in (("prompt_tokens", prompt_tokens),
+                                ("completion_tokens", generated_tokens)):
+                if value is not None and (not isinstance(value, int)
+                                          or isinstance(value, bool) or value < 0):
+                    return failed("malformed_token_count", f"{name} is malformed")
+            total = usage.get("total_tokens")
+            if total is not None and (not isinstance(total, int) or isinstance(total, bool)
+                                      or total < 0):
+                return failed("malformed_token_count", "total_tokens is malformed")
+            if (total is not None and prompt_tokens is not None
+                    and generated_tokens is not None
+                    and total != prompt_tokens + generated_tokens):
+                return failed("malformed_token_count", "total_tokens is contradictory")
+
+        resources = {}
+        timings = response_data.get("timings")
+        if timings is not None:
+            if not isinstance(timings, dict):
+                return failed("malformed_timing_metadata", "timings is not an object")
+            for source, current, label in (
+                    ("prompt_n", prompt_tokens, "prompt_tokens"),
+                    ("predicted_n", generated_tokens, "completion_tokens")):
+                value = timings.get(source)
+                if value is not None and (not isinstance(value, int)
+                                          or isinstance(value, bool) or value < 0):
+                    return failed("malformed_token_count", f"timings {source} is malformed")
+                if current is not None and value is not None and current != value:
+                    return failed("malformed_token_count",
+                        f"usage {label} conflicts with timings {source}")
+                if source == "prompt_n" and prompt_tokens is None:
+                    prompt_tokens = value
+                if source == "predicted_n" and generated_tokens is None:
+                    generated_tokens = value
+            for source, target in (("prompt_ms", "prompt_ms"),
+                                   ("predicted_ms", "predicted_ms")):
+                value = timings.get(source)
+                if value is not None:
+                    if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                            or not math.isfinite(value) or value < 0):
+                        return failed("malformed_timing_metadata", f"{source} is malformed")
+                    resources[target] = float(value)
+
+        return AdapterInferenceResponse(
+            status=LocalInferenceStatus.SUCCEEDED, model_id=model.model_id,
+            runtime_id=model.runtime_id, node_id=model.node_id,
+            locality=LocalityType.LOCAL, remote_execution=False,
+            output_text=content, structured_output=None,
+            started_at=started_at.isoformat(), completed_at=completed_at.isoformat(),
+            elapsed_seconds=elapsed_seconds,
+            usage=LocalInferenceUsage(prompt_tokens, generated_tokens),
+            resource_measurements=resources, termination_reason=termination_reason,
+            error_code=None, error_message=None, cloud_escalation_count=0,
+            cloud_cost_usd=0.0)
 
     def _error_response(
         self,
