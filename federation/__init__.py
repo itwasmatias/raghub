@@ -112,6 +112,17 @@ from federation.worker_governance import (
     WorkerCostClass,
     WorkerProviderMetadata,
 )
+from federation.hybrid_routing import (
+    CloudRouteEligibility,
+    ExecutionRouteKind,
+    HybridRoutingCoordinator,
+    HybridRoutingDecision,
+    HybridRoutingPolicy,
+    HybridRoutingReason,
+    HybridRoutingRequest,
+    LocalRouteEligibility,
+    ProviderAvailabilitySnapshot,
+)
 
 __all__ = [
     # Node Registry and Capabilities
@@ -210,4 +221,14 @@ __all__ = [
     "WorkerCapacity",
     "WorkerCostClass",
     "WorkerProviderMetadata",
+    # Hybrid Routing + Credit Resilience
+    "CloudRouteEligibility",
+    "ExecutionRouteKind",
+    "HybridRoutingCoordinator",
+    "HybridRoutingDecision",
+    "HybridRoutingPolicy",
+    "HybridRoutingReason",
+    "HybridRoutingRequest",
+    "LocalRouteEligibility",
+    "ProviderAvailabilitySnapshot",
 ]
