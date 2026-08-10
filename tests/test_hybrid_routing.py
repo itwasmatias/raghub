@@ -157,25 +157,16 @@ def make_metadata_provider(metadata_by_node):
     return provider
 
 
-def make_governed_coordinator(node_registry, heartbeat_registry, metadata_by_node, hybrid_policy):
-    """
-    Create HybridRoutingCoordinator with governed TaskRouter.
-
-    Constructs BudgetRoutingGovernance using the same policy mapping as
-    HybridRoutingCoordinator._build_budget_policy() to ensure routing and
-    assessment use aligned governance.
-
-    Returns:
-        tuple: (coordinator, governed_router) for identity assertion in test_55
-    """
-    # Use same mapping as HybridRoutingCoordinator._build_budget_policy()
+def make_governed_coordinator(
+    node_registry,
+    heartbeat_registry,
+    metadata_by_node,
+    hybrid_policy,
+):
+    """Create a coordinator whose exact TaskRouter enforces hybrid governance."""
     budget_policy = BudgetPolicy(
-        local_only=not hybrid_policy.cloud_allowed,
-        cloud_budget_exhausted=False,  # Detected from metadata
         max_cost_class=hybrid_policy.max_cloud_cost_class,
         allow_cloud_escalation=hybrid_policy.cloud_allowed,
-        prefer_local=hybrid_policy.local_first,
-        require_local_fallback_eligibility=False,
     )
     governance = BudgetRoutingGovernance(metadata_by_node, budget_policy)
     governed_router = TaskRouter(
@@ -185,7 +176,7 @@ def make_governed_coordinator(node_registry, heartbeat_registry, metadata_by_nod
     )
     coordinator = HybridRoutingCoordinator(
         governed_router,
-        make_metadata_provider(metadata_by_node),
+        lambda: metadata_by_node,
     )
     return coordinator, governed_router
 
@@ -332,8 +323,9 @@ class TestLocalRouting:
         }
 
         policy = HybridRoutingPolicy(local_first=True, cloud_allowed=True)
-        coordinator, _ = make_governed_coordinator(
-            task_router._registry, heartbeat_registry, metadata, policy)
+        coordinator = HybridRoutingCoordinator(
+            task_router, make_metadata_provider(metadata)
+        )
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -370,8 +362,9 @@ class TestLocalRouting:
         }
 
         policy = HybridRoutingPolicy(local_first=True, cloud_allowed=False)
-        coordinator, _ = make_governed_coordinator(
-            task_router._registry, heartbeat_registry, metadata, policy)
+        coordinator = HybridRoutingCoordinator(
+            task_router, make_metadata_provider(metadata)
+        )
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -469,8 +462,9 @@ class TestLocalRouting:
         }
 
         policy = HybridRoutingPolicy(local_first=True, cloud_allowed=True)
-        coordinator, _ = make_governed_coordinator(
-            task_router._registry, heartbeat_registry, metadata, policy)
+        coordinator = HybridRoutingCoordinator(
+            task_router, make_metadata_provider(metadata)
+        )
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -506,8 +500,9 @@ class TestLocalRouting:
         }
 
         policy = HybridRoutingPolicy(local_first=True)
-        coordinator, _ = make_governed_coordinator(
-            task_router._registry, heartbeat_registry, metadata, policy)
+        coordinator = HybridRoutingCoordinator(
+            task_router, make_metadata_provider(metadata)
+        )
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -551,8 +546,9 @@ class TestLocalRouting:
         )
 
         policy = HybridRoutingPolicy(local_first=True, cloud_allowed=False)
-        coordinator, _ = make_governed_coordinator(
-            task_router._registry, heartbeat_registry, metadata, policy)
+        coordinator = HybridRoutingCoordinator(
+            task_router, make_metadata_provider(metadata)
+        )
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -598,8 +594,9 @@ class TestLocalRouting:
         )
 
         policy = HybridRoutingPolicy(local_first=True)
-        coordinator, _ = make_governed_coordinator(
-            task_router._registry, heartbeat_registry, metadata, policy)
+        coordinator = HybridRoutingCoordinator(
+            task_router, make_metadata_provider(metadata)
+        )
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -683,8 +680,9 @@ class TestLocalRouting:
         )
 
         policy = HybridRoutingPolicy(local_first=True, cloud_allowed=False)
-        coordinator, _ = make_governed_coordinator(
-            task_router._registry, heartbeat_registry, metadata, policy)
+        coordinator = HybridRoutingCoordinator(
+            task_router, make_metadata_provider(metadata)
+        )
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -725,8 +723,9 @@ class TestLocalRouting:
             cloud_allowed=False,
             allow_degraded_local=False,  # Explicitly disallow
         )
-        coordinator, _ = make_governed_coordinator(
-            task_router._registry, heartbeat_registry, metadata, policy)
+        coordinator = HybridRoutingCoordinator(
+            task_router, make_metadata_provider(metadata)
+        )
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -769,8 +768,9 @@ class TestLocalRouting:
             cloud_allowed=False,
             allow_degraded_local=True,  # Explicitly allow
         )
-        coordinator, _ = make_governed_coordinator(
-            task_router._registry, heartbeat_registry, metadata, policy)
+        coordinator = HybridRoutingCoordinator(
+            task_router, make_metadata_provider(metadata)
+        )
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1643,8 +1643,9 @@ class TestNoHiddenFallback:
         }
 
         policy = HybridRoutingPolicy(cloud_allowed=True, local_first=False)
-        coordinator, _ = make_governed_coordinator(
-            task_router._registry, heartbeat_registry, metadata, policy)
+        coordinator = HybridRoutingCoordinator(
+            task_router, make_metadata_provider(metadata)
+        )
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1682,8 +1683,9 @@ class TestNoHiddenFallback:
         }
 
         policy = HybridRoutingPolicy(local_first=True)
-        coordinator, _ = make_governed_coordinator(
-            task_router._registry, heartbeat_registry, metadata, policy)
+        coordinator = HybridRoutingCoordinator(
+            task_router, make_metadata_provider(metadata)
+        )
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1721,8 +1723,9 @@ class TestNoHiddenFallback:
         }
 
         policy = HybridRoutingPolicy(local_first=True)
-        coordinator, _ = make_governed_coordinator(
-            task_router._registry, heartbeat_registry, metadata, policy)
+        coordinator = HybridRoutingCoordinator(
+            task_router, make_metadata_provider(metadata)
+        )
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1848,8 +1851,9 @@ class TestDecision:
         }
 
         policy = HybridRoutingPolicy(local_first=True)
-        coordinator, _ = make_governed_coordinator(
-            task_router._registry, heartbeat_registry, metadata, policy)
+        coordinator = HybridRoutingCoordinator(
+            task_router, make_metadata_provider(metadata)
+        )
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -2025,8 +2029,9 @@ class TestDecision:
         }
 
         policy = HybridRoutingPolicy(local_first=True)
-        coordinator, _ = make_governed_coordinator(
-            task_router._registry, heartbeat_registry, metadata, policy)
+        coordinator = HybridRoutingCoordinator(
+            task_router, make_metadata_provider(metadata)
+        )
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -2063,8 +2068,9 @@ class TestDecision:
         }
 
         policy = HybridRoutingPolicy(local_first=True)
-        coordinator, _ = make_governed_coordinator(
-            task_router._registry, heartbeat_registry, metadata, policy)
+        coordinator = HybridRoutingCoordinator(
+            task_router, make_metadata_provider(metadata)
+        )
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -2198,11 +2204,10 @@ class TestIntegration:
             ),
         }
 
-        policy = HybridRoutingPolicy(local_first=True)
-        coordinator, governed_router = make_governed_coordinator(
-            task_router._registry, heartbeat_registry, metadata, policy)
-        # Coordinator uses the exact governed router provided by helper
-        assert coordinator._task_router is governed_router
+        coordinator = HybridRoutingCoordinator(
+            task_router, make_metadata_provider(metadata)
+        )
+        assert coordinator._task_router is task_router
 
     def test_56_local_decision_preserves_authoritative_fingerprints(
         self,
@@ -2229,8 +2234,9 @@ class TestIntegration:
         }
 
         policy = HybridRoutingPolicy(local_first=True)
-        coordinator, _ = make_governed_coordinator(
-            task_router._registry, heartbeat_registry, metadata, policy)
+        coordinator = HybridRoutingCoordinator(
+            task_router, make_metadata_provider(metadata)
+        )
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
