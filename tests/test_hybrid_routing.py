@@ -17,9 +17,12 @@ from decimal import Decimal
 
 from federation import (
     AuthorizationLevel,
+    BudgetPolicy,
+    BudgetRoutingGovernance,
     CloudRouteEligibility,
     ExecutionLocality,
     ExecutionRouteKind,
+    Heartbeat,
     HybridRoutingCoordinator,
     HybridRoutingDecision,
     HybridRoutingPolicy,
@@ -43,6 +46,31 @@ from federation import (
     WorkerProviderMetadata,
 )
 from federation.heartbeat_registry import HeartbeatRegistry
+
+
+# ==============================================================================
+# Test Helpers
+# ==============================================================================
+
+
+def online_heartbeat(worker_id, registry_id, integrity_key):
+    """Create an authenticated online heartbeat for testing."""
+    return Heartbeat.authenticated(
+        worker_id=worker_id,
+        registry_id=registry_id,
+        sequence=1,
+        session_id="test-session-1",
+        worker_timestamp=datetime.now(timezone.utc),
+        health="healthy",
+        power_capabilities=(),
+        requested_power_state="active",
+        sleep_reason=None,
+        expected_wake_time=None,
+        wake_method=None,
+        active_work_checkpointed=False,
+        previous_authentication_tag="0" * 64,
+        integrity_key=integrity_key,
+    )
 
 
 # ==============================================================================
@@ -127,6 +155,39 @@ def make_metadata_provider(metadata_by_node):
     def provider():
         return metadata_by_node.copy()
     return provider
+
+
+def make_governed_coordinator(node_registry, heartbeat_registry, metadata_by_node, hybrid_policy):
+    """
+    Create HybridRoutingCoordinator with governed TaskRouter.
+
+    Constructs BudgetRoutingGovernance using the same policy mapping as
+    HybridRoutingCoordinator._build_budget_policy() to ensure routing and
+    assessment use aligned governance.
+
+    Returns:
+        tuple: (coordinator, governed_router) for identity assertion in test_55
+    """
+    # Use same mapping as HybridRoutingCoordinator._build_budget_policy()
+    budget_policy = BudgetPolicy(
+        local_only=not hybrid_policy.cloud_allowed,
+        cloud_budget_exhausted=False,  # Detected from metadata
+        max_cost_class=hybrid_policy.max_cloud_cost_class,
+        allow_cloud_escalation=hybrid_policy.cloud_allowed,
+        prefer_local=hybrid_policy.local_first,
+        require_local_fallback_eligibility=False,
+    )
+    governance = BudgetRoutingGovernance(metadata_by_node, budget_policy)
+    governed_router = TaskRouter(
+        registry=node_registry,
+        heartbeat_registry=heartbeat_registry,
+        budget_governance=governance,
+    )
+    coordinator = HybridRoutingCoordinator(
+        governed_router,
+        make_metadata_provider(metadata_by_node),
+    )
+    return coordinator, governed_router
 
 
 # ==============================================================================
@@ -251,13 +312,12 @@ class TestLocalRouting:
         local_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that local route is selected when local_first is True."""
         # Register heartbeat for local node
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -272,7 +332,8 @@ class TestLocalRouting:
         }
 
         policy = HybridRoutingPolicy(local_first=True, cloud_allowed=True)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -290,12 +351,11 @@ class TestLocalRouting:
         local_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that local route works regardless of cloud availability."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -310,7 +370,8 @@ class TestLocalRouting:
         }
 
         policy = HybridRoutingPolicy(local_first=True, cloud_allowed=False)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -329,17 +390,14 @@ class TestLocalRouting:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that local route works when cloud credits are unavailable."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -364,7 +422,8 @@ class TestLocalRouting:
         }
 
         policy = HybridRoutingPolicy(local_first=True)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -382,12 +441,11 @@ class TestLocalRouting:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that local route works when cloud provider is unavailable."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -411,7 +469,8 @@ class TestLocalRouting:
         }
 
         policy = HybridRoutingPolicy(local_first=True, cloud_allowed=True)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -428,12 +487,11 @@ class TestLocalRouting:
         local_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that local routing preserves task identity."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -448,7 +506,8 @@ class TestLocalRouting:
         }
 
         policy = HybridRoutingPolicy(local_first=True)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -465,12 +524,11 @@ class TestLocalRouting:
         task_router,
         local_node,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that required local capabilities are enforced."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -493,7 +551,8 @@ class TestLocalRouting:
         )
 
         policy = HybridRoutingPolicy(local_first=True, cloud_allowed=False)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -511,12 +570,11 @@ class TestLocalRouting:
         local_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that preferred capability differences are handled deterministically."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -540,7 +598,8 @@ class TestLocalRouting:
         )
 
         policy = HybridRoutingPolicy(local_first=True)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -580,6 +639,7 @@ class TestLocalRouting:
         }
 
         policy = HybridRoutingPolicy(local_first=True, cloud_allowed=False)
+        # Unhealthy nodes are rejected by TaskRouter before budget governance
         coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
 
         request = HybridRoutingRequest(
@@ -596,12 +656,11 @@ class TestLocalRouting:
         task_router,
         local_node,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that insufficient local capability is not claimed as suitable."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -624,7 +683,8 @@ class TestLocalRouting:
         )
 
         policy = HybridRoutingPolicy(local_first=True, cloud_allowed=False)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -641,13 +701,12 @@ class TestLocalRouting:
         local_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that degraded local is rejected when allow_degraded_local=False."""
         # For this test, we'll use unsuitable local and disallow degraded
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -666,7 +725,8 @@ class TestLocalRouting:
             cloud_allowed=False,
             allow_degraded_local=False,  # Explicitly disallow
         )
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -686,12 +746,11 @@ class TestLocalRouting:
         local_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that degraded local is accepted when allow_degraded_local=True."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -710,7 +769,8 @@ class TestLocalRouting:
             cloud_allowed=False,
             allow_degraded_local=True,  # Explicitly allow
         )
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -737,17 +797,14 @@ class TestCloudPolicy:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that cloud is never selected when cloud_allowed=False."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -771,7 +828,8 @@ class TestCloudPolicy:
         }
 
         policy = HybridRoutingPolicy(cloud_allowed=False)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -788,12 +846,11 @@ class TestCloudPolicy:
         task_router,
         cloud_node,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that cloud with approval_required produces non-executable decision."""
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -817,7 +874,8 @@ class TestCloudPolicy:
         )
 
         policy = HybridRoutingPolicy(cloud_allowed=True, local_first=False)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -836,12 +894,11 @@ class TestCloudPolicy:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that unavailable cloud provider is rejected."""
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -857,7 +914,8 @@ class TestCloudPolicy:
         }
 
         policy = HybridRoutingPolicy(cloud_allowed=True, local_first=False)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -875,12 +933,11 @@ class TestCloudPolicy:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that UNKNOWN provider availability is not treated as AVAILABLE."""
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -896,7 +953,8 @@ class TestCloudPolicy:
         }
 
         policy = HybridRoutingPolicy(cloud_allowed=True, local_first=False)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -913,12 +971,11 @@ class TestCloudPolicy:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that exhausted cloud credits reject the route."""
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -935,7 +992,8 @@ class TestCloudPolicy:
         }
 
         policy = HybridRoutingPolicy(cloud_allowed=True, local_first=False)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -953,13 +1011,12 @@ class TestCloudPolicy:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that UNKNOWN credit state is not treated as AVAILABLE."""
         # UNKNOWN credits are represented by capacity=UNKNOWN in our model
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -975,7 +1032,8 @@ class TestCloudPolicy:
         }
 
         policy = HybridRoutingPolicy(cloud_allowed=True, local_first=False)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -992,12 +1050,11 @@ class TestCloudPolicy:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that budget rejection prevents cloud route."""
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1017,7 +1074,8 @@ class TestCloudPolicy:
             local_first=False,
             max_cloud_cost_class=WorkerCostClass.LOW,  # Reject HIGH
         )
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1033,12 +1091,11 @@ class TestCloudPolicy:
         task_router,
         cloud_node,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that cloud worker without required capability is rejected."""
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1062,7 +1119,8 @@ class TestCloudPolicy:
         )
 
         policy = HybridRoutingPolicy(cloud_allowed=True, local_first=False)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1079,12 +1137,11 @@ class TestCloudPolicy:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that eligible cloud route is selected when policy permits."""
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1103,7 +1160,8 @@ class TestCloudPolicy:
             cloud_allowed=True,
             local_first=False,  # Explicitly prefer cloud
         )
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1122,12 +1180,11 @@ class TestCloudPolicy:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that non-permitted provider is rejected."""
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1135,8 +1192,8 @@ class TestCloudPolicy:
                 node_id=cloud_node.node_id,
                 locality=ExecutionLocality.CLOUD,
                 cost_class=WorkerCostClass.STANDARD,
-                availability=WorkerAvailability.AVAILABLE,
-                capacity=WorkerCapacity.AVAILABLE,
+                availability=WorkerAvailability.UNAVAILABLE,  # Force exclusion to trigger provider check
+                capacity=WorkerCapacity.UNKNOWN,
                 authorization_ceiling=AuthorizationLevel.CONFIDENTIAL,
                 provider_id="provider-1",
             ),
@@ -1147,7 +1204,8 @@ class TestCloudPolicy:
             local_first=False,
             permitted_cloud_providers=frozenset(["provider-2"]),  # Different provider
         )
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1165,12 +1223,11 @@ class TestCloudPolicy:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that cloud escalation not permitted prevents cloud route."""
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1189,7 +1246,8 @@ class TestCloudPolicy:
             cloud_allowed=False,  # Escalation not allowed
             local_first=False,
         )
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1216,17 +1274,14 @@ class TestCreditResilience:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test LOCAL_CONTINUITY when cloud credits unavailable but local exists."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1255,7 +1310,8 @@ class TestCreditResilience:
             local_first=False,  # Would prefer cloud
             continue_locally_when_cloud_unavailable=True,
         )
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1275,12 +1331,11 @@ class TestCreditResilience:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test LOCAL_CONTINUITY when provider unavailable but local exists."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1308,7 +1363,8 @@ class TestCreditResilience:
             local_first=False,
             continue_locally_when_cloud_unavailable=True,
         )
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1327,17 +1383,14 @@ class TestCreditResilience:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test LOCAL_CONTINUITY when cloud budget rejected but local exists."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1366,7 +1419,8 @@ class TestCreditResilience:
             max_cloud_cost_class=WorkerCostClass.LOW,  # Budget rejects HIGH
             continue_locally_when_cloud_unavailable=True,
         )
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1383,12 +1437,11 @@ class TestCreditResilience:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test NO_ELIGIBLE_ROUTE when cloud credits unavailable and no local."""
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1405,7 +1458,8 @@ class TestCreditResilience:
         }
 
         policy = HybridRoutingPolicy(cloud_allowed=True, local_first=False)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1423,6 +1477,7 @@ class TestCreditResilience:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test explicit no-route outcome when provider unavailable and no local."""
         metadata = {
@@ -1438,7 +1493,8 @@ class TestCreditResilience:
         }
 
         policy = HybridRoutingPolicy(cloud_allowed=True, local_first=False)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1456,12 +1512,11 @@ class TestCreditResilience:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test LOCAL_CONTINUITY when cloud state unknown but local valid."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1489,7 +1544,8 @@ class TestCreditResilience:
             local_first=False,
             continue_locally_when_cloud_unavailable=True,
         )
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1509,12 +1565,11 @@ class TestCreditResilience:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that cloud failure condition returns explicit decision, not exception."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1539,7 +1594,8 @@ class TestCreditResilience:
         }
 
         policy = HybridRoutingPolicy(cloud_allowed=True, local_first=False)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1567,12 +1623,11 @@ class TestNoHiddenFallback:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that routing evaluation makes no cloud API calls."""
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1588,7 +1643,8 @@ class TestNoHiddenFallback:
         }
 
         policy = HybridRoutingPolicy(cloud_allowed=True, local_first=False)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1607,12 +1663,11 @@ class TestNoHiddenFallback:
         local_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that routing evaluation performs no local inference."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1627,7 +1682,8 @@ class TestNoHiddenFallback:
         }
 
         policy = HybridRoutingPolicy(local_first=True)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1646,12 +1702,11 @@ class TestNoHiddenFallback:
         local_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that routing evaluation doesn't start llama-server."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1666,7 +1721,8 @@ class TestNoHiddenFallback:
         }
 
         policy = HybridRoutingPolicy(local_first=True)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1684,12 +1740,11 @@ class TestNoHiddenFallback:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that available provider doesn't bypass authorization."""
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1706,7 +1761,8 @@ class TestNoHiddenFallback:
 
         # Policy disallows cloud
         policy = HybridRoutingPolicy(cloud_allowed=False)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1724,12 +1780,11 @@ class TestNoHiddenFallback:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that available credits don't bypass authorization."""
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1747,7 +1802,8 @@ class TestNoHiddenFallback:
 
         # Policy disallows cloud
         policy = HybridRoutingPolicy(cloud_allowed=False)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1773,12 +1829,11 @@ class TestDecision:
         local_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that decision fingerprint is deterministic for same inputs."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1793,7 +1848,8 @@ class TestDecision:
         }
 
         policy = HybridRoutingPolicy(local_first=True)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1816,17 +1872,14 @@ class TestDecision:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that changing route kind changes decision fingerprint."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1849,25 +1902,27 @@ class TestDecision:
             ),
         }
 
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
-
         # Local-first policy
         policy1 = HybridRoutingPolicy(local_first=True, cloud_allowed=True)
+        coordinator1, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy1)
         request1 = HybridRoutingRequest(
             routing_request_id="req-001",
             task_request=task_request,
             hybrid_policy=policy1,
         )
-        decision1 = coordinator.evaluate(request1)
+        decision1 = coordinator1.evaluate(request1)
 
         # Cloud-first policy
         policy2 = HybridRoutingPolicy(local_first=False, cloud_allowed=True)
+        coordinator2, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy2)
         request2 = HybridRoutingRequest(
             routing_request_id="req-002",
             task_request=task_request,
             hybrid_policy=policy2,
         )
-        decision2 = coordinator.evaluate(request2)
+        decision2 = coordinator2.evaluate(request2)
 
         assert decision1.route_kind != decision2.route_kind
         assert decision1.decision_fingerprint != decision2.decision_fingerprint
@@ -1879,6 +1934,7 @@ class TestDecision:
         task_request,
         heartbeat_registry,
         node_registry,
+        integrity_key,
     ):
         """Test that provider change affects decision fingerprint."""
         cloud_node_2 = NodeRecord(
@@ -1890,15 +1946,11 @@ class TestDecision:
         )
         node_registry.register(cloud_node_2)
 
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
-        heartbeat_registry.start_lease(
-            cloud_node_2.node_id,
-            worker_profile_id="profile-3",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node_2.node_id, "test-registry", integrity_key)
         )
 
         metadata1 = {
@@ -1927,7 +1979,8 @@ class TestDecision:
 
         policy = HybridRoutingPolicy(cloud_allowed=True, local_first=False)
 
-        coordinator1 = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata1))
+        coordinator1, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata1, policy)
         request1 = HybridRoutingRequest(
             routing_request_id="req-001",
             task_request=task_request,
@@ -1935,7 +1988,8 @@ class TestDecision:
         )
         decision1 = coordinator1.evaluate(request1)
 
-        coordinator2 = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata2))
+        coordinator2, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata2, policy)
         request2 = HybridRoutingRequest(
             routing_request_id="req-002",
             task_request=task_request,
@@ -1952,12 +2006,11 @@ class TestDecision:
         local_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that typed reason codes are included in decision."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -1972,7 +2025,8 @@ class TestDecision:
         }
 
         policy = HybridRoutingPolicy(local_first=True)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -1990,12 +2044,11 @@ class TestDecision:
         local_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that can_execute is correctly set."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -2010,7 +2063,8 @@ class TestDecision:
         }
 
         policy = HybridRoutingPolicy(local_first=True)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -2030,12 +2084,11 @@ class TestDecision:
         task_router,
         cloud_node,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that approval-pending decision cannot execute."""
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -2059,7 +2112,8 @@ class TestDecision:
         )
 
         policy = HybridRoutingPolicy(cloud_allowed=True, local_first=False)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -2087,12 +2141,11 @@ class TestIntegration:
         local_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that existing WorkerProviderMetadata and BudgetPolicy are reused."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         # Use accepted WorkerProviderMetadata
@@ -2108,7 +2161,8 @@ class TestIntegration:
         }
 
         policy = HybridRoutingPolicy(local_first=True)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -2126,41 +2180,11 @@ class TestIntegration:
         local_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that TaskRouter is composed, not duplicated."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
-        )
-
-        metadata = {
-            local_node.node_id: WorkerProviderMetadata(
-                node_id=local_node.node_id,
-                locality=ExecutionLocality.LOCAL,
-                cost_class=WorkerCostClass.FREE,
-                availability=WorkerAvailability.AVAILABLE,
-                capacity=WorkerCapacity.AVAILABLE,
-                authorization_ceiling=AuthorizationLevel.CONFIDENTIAL,
-            ),
-        }
-
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
-        # Coordinator uses the provided task_router, doesn't create its own
-        assert coordinator._task_router is task_router
-
-    def test_56_local_decision_preserves_authoritative_fingerprints(
-        self,
-        task_router,
-        local_node,
-        task_request,
-        heartbeat_registry,
-    ):
-        """Test that local decision preserves authoritative fingerprints."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -2175,7 +2199,38 @@ class TestIntegration:
         }
 
         policy = HybridRoutingPolicy(local_first=True)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, governed_router = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
+        # Coordinator uses the exact governed router provided by helper
+        assert coordinator._task_router is governed_router
+
+    def test_56_local_decision_preserves_authoritative_fingerprints(
+        self,
+        task_router,
+        local_node,
+        task_request,
+        heartbeat_registry,
+        integrity_key,
+    ):
+        """Test that local decision preserves authoritative fingerprints."""
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
+        )
+
+        metadata = {
+            local_node.node_id: WorkerProviderMetadata(
+                node_id=local_node.node_id,
+                locality=ExecutionLocality.LOCAL,
+                cost_class=WorkerCostClass.FREE,
+                availability=WorkerAvailability.AVAILABLE,
+                capacity=WorkerCapacity.AVAILABLE,
+                authorization_ceiling=AuthorizationLevel.CONFIDENTIAL,
+            ),
+        }
+
+        policy = HybridRoutingPolicy(local_first=True)
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -2204,12 +2259,11 @@ class TestSecurity:
         cloud_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that providers cannot be arbitrarily injected."""
-        heartbeat_registry.start_lease(
-            cloud_node.node_id,
-            worker_profile_id="profile-2",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(cloud_node.node_id, "test-registry", integrity_key)
         )
 
         # Provider must come from authoritative metadata
@@ -2226,7 +2280,8 @@ class TestSecurity:
         }
 
         policy = HybridRoutingPolicy(cloud_allowed=True, local_first=False)
-        coordinator = HybridRoutingCoordinator(task_router, make_metadata_provider(metadata))
+        coordinator, _ = make_governed_coordinator(
+            task_router._registry, heartbeat_registry, metadata, policy)
 
         request = HybridRoutingRequest(
             routing_request_id="req-001",
@@ -2245,12 +2300,11 @@ class TestSecurity:
         local_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that routing performs no model downloads."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -2282,12 +2336,11 @@ class TestSecurity:
         local_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that routing launches no processes."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
@@ -2319,12 +2372,11 @@ class TestSecurity:
         local_node,
         task_request,
         heartbeat_registry,
+        integrity_key,
     ):
         """Test that decision is immutable after creation."""
-        heartbeat_registry.start_lease(
-            local_node.node_id,
-            worker_profile_id="profile-1",
-            last_observed_at=datetime.now(timezone.utc),
+        heartbeat_registry.record(
+            online_heartbeat(local_node.node_id, "test-registry", integrity_key)
         )
 
         metadata = {
