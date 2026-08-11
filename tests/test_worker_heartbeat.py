@@ -221,6 +221,44 @@ def test_fabricated_and_substituted_worker_identity_are_rejected(tmp_path):
         registry.record(substituted)
 
 
+def test_cross_domain_replay_of_same_worker_id_is_rejected(tmp_path):
+    clock = MutableClock()
+    nodes = NodeRegistry(stale_threshold_seconds=10**9)
+    nodes.register(
+        NodeRecord(
+            domain_id="domain-a",
+            node_id="worker-1",
+            hostname="worker-a.local",
+            operating_system="Linux",
+            capabilities={NodeCapability("python_execution")},
+        ),
+    )
+    nodes.register(
+        NodeRecord(
+            domain_id="domain-b",
+            node_id="worker-1",
+            hostname="worker-b.local",
+            operating_system="Linux",
+            capabilities={NodeCapability("python_execution")},
+        ),
+    )
+    registry = HeartbeatRegistry(
+        tmp_path / "heartbeats.jsonl",
+        registry_id="registry-1",
+        node_registry=nodes,
+        integrity_key=KEY,
+        clock=clock,
+    )
+
+    accepted = registry.record(heartbeat(domain_id="domain-a"))
+
+    with pytest.raises(HeartbeatConflictError, match="duplicate"):
+        registry.record(heartbeat(domain_id="domain-b"))
+
+    assert registry.inspect("worker-1") == accepted
+    assert registry.history("worker-1") == (accepted,)
+
+
 def test_wrong_key_restart_fails_closed_and_correct_key_restores(tmp_path):
     registry = build_registry(tmp_path)
     accepted = registry.record(heartbeat())

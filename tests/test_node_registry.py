@@ -178,6 +178,50 @@ def test_registry_update_rejects_unsupported_fields(registry, fedora_node, field
     assert registry.get("fedora-1") is fedora_node
 
 
+def test_registry_domain_scoped_methods_require_explicit_domain_for_shared_ids():
+    """Shared node IDs must not be resolved arbitrarily across domains."""
+    registry = NodeRegistry(stale_threshold_seconds=300)
+    domain_a = NodeRecord(
+        domain_id="domain-a",
+        node_id="shared-worker",
+        hostname="a-host",
+        operating_system="Linux",
+    )
+    domain_b = NodeRecord(
+        domain_id="domain-b",
+        node_id="shared-worker",
+        hostname="b-host",
+        operating_system="Linux",
+    )
+
+    registry.register(domain_a)
+    registry.register(domain_b)
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        registry.get("shared-worker")
+
+    assert registry.get("shared-worker", domain_id="domain-a") is domain_a
+    assert registry.get("shared-worker", domain_id="domain-b") is domain_b
+
+    original_last_seen = domain_a.last_seen
+    updated = registry.update(
+        "shared-worker",
+        domain_id="domain-b",
+        hostname="updated-host",
+    )
+    assert updated is domain_b
+    assert domain_b.hostname == "updated-host"
+    assert domain_a.hostname == "a-host"
+
+    assert registry.heartbeat("shared-worker", domain_id="domain-a") is True
+    assert domain_a.last_seen > original_last_seen
+
+    assert registry.remove("shared-worker", domain_id="domain-a") is True
+    assert registry.count() == 1
+    assert registry.get("shared-worker", domain_id="domain-a") is None
+    assert registry.get("shared-worker", domain_id="domain-b") is domain_b
+
+
 def test_registry_list_nodes(registry, fedora_node, windows_node):
     """Test listing all nodes."""
     registry.register(fedora_node)

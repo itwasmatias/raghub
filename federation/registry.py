@@ -39,6 +39,24 @@ class NodeRegistry:
         self._nodes: dict[tuple[str, str], NodeRecord] = {}
         self._stale_threshold = timedelta(seconds=stale_threshold_seconds)
 
+    def _matches_for_node_id(
+        self,
+        node_id: str,
+        *,
+        domain_id: str | None = None,
+    ) -> list[tuple[tuple[str, str], NodeRecord]]:
+        matches = [
+            ((domain, nid), node)
+            for (domain, nid), node in self._nodes.items()
+            if nid == node_id and (domain_id is None or domain == domain_id)
+        ]
+        if domain_id is None and len(matches) > 1:
+            raise ValueError(
+                f"node_id {node_id!r} is ambiguous across domains; "
+                "provide domain_id",
+            )
+        return matches
+
     def register(self, node: NodeRecord) -> None:
         """
         Register a new node.
@@ -62,11 +80,20 @@ class NodeRegistry:
         node.update_heartbeat()
         self._nodes[key] = node
 
-    def update(self, node_id: str, **kwargs) -> NodeRecord | None:
+    def update(
+        self,
+        node_id: str,
+        *,
+        domain_id: str | None = None,
+        **kwargs,
+    ) -> NodeRecord | None:
         """
-        Update a node's properties (backward compatibility - updates first match).
+        Update a node's properties (backward compatibility - updates the
+        resolved match).
 
         DEPRECATED: Use update_by_domain() for domain-scoped updates.
+        When domain_id is omitted, the lookup fails closed if node_id is
+        ambiguous across domains.
 
         Args:
             node_id: The ID of the node to update.
@@ -76,8 +103,8 @@ class NodeRegistry:
         Returns:
             The updated NodeRecord, or None if the node was not found.
         """
-        # Find first matching node across all domains for backward compat
-        node = self.get(node_id)
+        # Resolve the legacy node_id lookup without guessing across domains.
+        node = self.get(node_id, domain_id=domain_id)
         if node is None:
             return None
 
@@ -105,11 +132,14 @@ class NodeRegistry:
         node.update_heartbeat()
         return node
 
-    def remove(self, node_id: str) -> bool:
+    def remove(self, node_id: str, *, domain_id: str | None = None) -> bool:
         """
-        Remove a node from the registry (backward compatibility - removes first match).
+        Remove a node from the registry (backward compatibility - removes the
+        resolved match).
 
         DEPRECATED: Use remove_by_domain() for domain-scoped removal.
+        When domain_id is omitted, the lookup fails closed if node_id is
+        ambiguous across domains.
 
         Args:
             node_id: The ID of the node to remove.
@@ -117,12 +147,13 @@ class NodeRegistry:
         Returns:
             True if the node was removed, False if it was not found.
         """
-        # Find and remove first matching node across all domains for backward compat
-        for (domain, nid) in list(self._nodes.keys()):
-            if nid == node_id:
-                del self._nodes[(domain, nid)]
-                return True
-        return False
+        # Resolve the legacy node_id lookup without guessing across domains.
+        matches = self._matches_for_node_id(node_id, domain_id=domain_id)
+        if not matches:
+            return False
+        (domain, nid), _ = matches[0]
+        del self._nodes[(domain, nid)]
+        return True
 
     def remove_by_domain(self, node_id: str, domain_id: str) -> bool:
         """
@@ -141,23 +172,29 @@ class NodeRegistry:
             return True
         return False
 
-    def get(self, node_id: str) -> NodeRecord | None:
+    def get(
+        self,
+        node_id: str,
+        *,
+        domain_id: str | None = None,
+    ) -> NodeRecord | None:
         """
-        Get a node by its ID (backward compatibility - returns first match).
+        Get a node by its ID (backward compatibility - returns the resolved
+        match).
 
         DEPRECATED: Use get_by_domain() for domain-scoped lookup.
+        When domain_id is omitted, the lookup fails closed if node_id is
+        ambiguous across domains.
 
         Args:
             node_id: The ID of the node to retrieve.
 
         Returns:
-            The NodeRecord, or None if not found. Returns first match across
-            all domains for backward compatibility.
+            The NodeRecord, or None if not found. If domain_id is omitted and
+            more than one domain contains node_id, the lookup fails closed.
         """
-        for (domain, nid), node in self._nodes.items():
-            if nid == node_id:
-                return node
-        return None
+        matches = self._matches_for_node_id(node_id, domain_id=domain_id)
+        return None if not matches else matches[0][1]
 
     def get_by_domain(self, node_id: str, domain_id: str) -> NodeRecord | None:
         """
@@ -283,12 +320,21 @@ class NodeRegistry:
 
         return nodes
 
-    def heartbeat(self, node_id: str) -> bool:
+    def heartbeat(
+        self,
+        node_id: str,
+        *,
+        domain_id: str | None = None,
+    ) -> bool:
         """
-        Record a heartbeat for a node (backward compatibility - updates first match).
+        Record a heartbeat for a node (backward compatibility - updates the
+        resolved match).
 
         Updates the last_seen timestamp. If the node was offline,
         it will be marked as online.
+
+        When domain_id is omitted, the lookup fails closed if node_id is
+        ambiguous across domains.
 
         Args:
             node_id: The ID of the node sending the heartbeat.
@@ -296,7 +342,7 @@ class NodeRegistry:
         Returns:
             True if the heartbeat was recorded, False if node not found.
         """
-        node = self.get(node_id)
+        node = self.get(node_id, domain_id=domain_id)
         if node is None:
             return False
 
