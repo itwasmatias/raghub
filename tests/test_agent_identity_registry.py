@@ -156,6 +156,24 @@ def test_inactive_domain_rejected(control_domain_registry, identity_registry_pat
         registry.register(_agent(domain_id="domain-b", agent_id="agent-9"))
 
 
+def test_exact_duplicate_registration_revalidates_domain_context(
+    identity_registry_path,
+    control_domain_registry,
+):
+    registry = DurableAgentIdentityRegistry(
+        identity_registry_path,
+        domain_registry=control_domain_registry,
+        integrity_key=KEY,
+        clock=MutableClock(),
+    )
+    identity = _agent()
+    registry.register(identity)
+    control_domain_registry.update_lifecycle("domain-a", DomainLifecycle.ARCHIVED)
+
+    with pytest.raises(AgentIdentityDomainError, match="not active"):
+        registry.register(identity)
+
+
 def test_ambiguous_lookup_requires_domain_context(identity_registry):
     identity_registry.register(_agent(domain_id="domain-a", agent_id="shared-agent", name="Agent A"))
     identity_registry.register(_agent(domain_id="domain-b", agent_id="shared-agent", name="Agent B"))
@@ -165,6 +183,23 @@ def test_ambiguous_lookup_requires_domain_context(identity_registry):
 
     assert identity_registry.get("shared-agent", domain_id="domain-a").name == "Agent A"
     assert identity_registry.get("shared-agent", domain_id="domain-b").name == "Agent B"
+
+
+def test_lifecycle_mutations_require_explicit_domain_context(identity_registry):
+    identity_registry.register(_agent())
+
+    with pytest.raises(AgentIdentityDomainError, match="explicit ControlDomain context"):
+        identity_registry.revoke("agent-1", reason="compromised")
+
+    with pytest.raises(AgentIdentityDomainError, match="explicit ControlDomain context"):
+        identity_registry.archive("agent-1", reason="retired")
+
+    with pytest.raises(AgentIdentityDomainError, match="explicit ControlDomain context"):
+        identity_registry.update_lifecycle(
+            "agent-1",
+            AgentIdentityLifecycle.REVOKED,
+            reason="compromised",
+        )
 
 
 def test_revoke_and_archive_non_widening(identity_registry):
@@ -188,6 +223,58 @@ def test_revoke_and_archive_non_widening(identity_registry):
             AgentIdentityLifecycle.ACTIVE,
             domain_id="domain-a",
         )
+
+
+def test_inactive_domain_rejects_lifecycle_mutation(
+    control_domain_registry,
+    identity_registry_path,
+):
+    registry = DurableAgentIdentityRegistry(
+        identity_registry_path,
+        domain_registry=control_domain_registry,
+        integrity_key=KEY,
+        clock=MutableClock(),
+    )
+    registry.register(_agent())
+    control_domain_registry.update_lifecycle("domain-a", DomainLifecycle.ARCHIVED)
+
+    with pytest.raises(AgentIdentityDomainError, match="not active"):
+        registry.revoke("agent-1", domain_id="domain-a", reason="compromised")
+
+    with pytest.raises(AgentIdentityDomainError, match="not active"):
+        registry.archive("agent-1", domain_id="domain-a", reason="retired")
+
+    with pytest.raises(AgentIdentityDomainError, match="not active"):
+        registry.update_lifecycle(
+            "agent-1",
+            AgentIdentityLifecycle.REVOKED,
+            domain_id="domain-a",
+            reason="compromised",
+        )
+
+
+def test_idempotent_lifecycle_mutation_revalidates_domain_context(
+    control_domain_registry,
+    identity_registry_path,
+):
+    registry = DurableAgentIdentityRegistry(
+        identity_registry_path,
+        domain_registry=control_domain_registry,
+        integrity_key=KEY,
+        clock=MutableClock(),
+    )
+    registry.register(_agent())
+    registry.revoke("agent-1", domain_id="domain-a", reason="compromised")
+    registry.register(_agent(domain_id="domain-b", agent_id="agent-2"))
+    registry.archive("agent-2", domain_id="domain-b", reason="retired")
+    control_domain_registry.update_lifecycle("domain-a", DomainLifecycle.ARCHIVED)
+    control_domain_registry.update_lifecycle("domain-b", DomainLifecycle.ARCHIVED)
+
+    with pytest.raises(AgentIdentityDomainError, match="not active"):
+        registry.revoke("agent-1", domain_id="domain-a", reason="compromised")
+
+    with pytest.raises(AgentIdentityDomainError, match="not active"):
+        registry.archive("agent-2", domain_id="domain-b", reason="retired")
 
 
 def test_idempotent_revoke_and_archive_keep_existing_evidence(identity_registry):
@@ -296,4 +383,3 @@ def test_cross_process_duplicate_registration_is_idempotent(tmp_path):
         clock=MutableClock(),
     )
     assert len(registry.list_identities()) == 1
-

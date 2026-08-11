@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -164,6 +165,19 @@ class DurableAgentIdentityRegistry:
             raise ValueError("agent identity clock must return an aware datetime")
         return value.astimezone(timezone.utc)
 
+    @contextmanager
+    def _domain_registry_lock(self):
+        path = self.domain_registry.path
+        if not path.exists():
+            yield
+            return
+        with path.open("rb") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     def _domain_fingerprint(self, domain_id: str) -> str:
         try:
             domain = self.domain_registry.get(domain_id)
@@ -189,45 +203,46 @@ class DurableAgentIdentityRegistry:
 
         now = self._now()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a+b") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                handle.seek(0)
-                records = self._decode(handle.read())
-                current = self._current_by_key(records)
-                key = (identity.domain_id, identity.agent_id)
-                existing = current.get(key)
-                if existing is not None:
-                    candidate_fingerprint = identity_fingerprint(
-                        agent_id=identity.agent_id,
-                        domain_id=identity.domain_id,
-                        domain_fingerprint=existing.domain_fingerprint,
-                        name=identity.name,
-                        created_at=identity.created_at,
-                    )
-                    if (
-                        existing.lifecycle is AgentIdentityLifecycle.ACTIVE
-                        and existing.identity_fingerprint == candidate_fingerprint
-                    ):
-                        return existing
-                    raise AgentIdentityConflictError(
-                        f"agent identity already exists: {identity.agent_id!r} in domain {identity.domain_id!r}",
-                    )
+        with self._domain_registry_lock():
+            with self.path.open("a+b") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    handle.seek(0)
+                    records = self._decode(handle.read())
+                    current = self._current_by_key(records)
+                    domain_fingerprint = self._domain_fingerprint(identity.domain_id)
+                    key = (identity.domain_id, identity.agent_id)
+                    existing = current.get(key)
+                    if existing is not None:
+                        candidate_fingerprint = identity_fingerprint(
+                            agent_id=identity.agent_id,
+                            domain_id=identity.domain_id,
+                            domain_fingerprint=domain_fingerprint,
+                            name=identity.name,
+                            created_at=identity.created_at,
+                        )
+                        if (
+                            existing.lifecycle is AgentIdentityLifecycle.ACTIVE
+                            and existing.identity_fingerprint == candidate_fingerprint
+                        ):
+                            return existing
+                        raise AgentIdentityConflictError(
+                            f"agent identity already exists: {identity.agent_id!r} in domain {identity.domain_id!r}",
+                        )
 
-                domain_fingerprint = self._domain_fingerprint(identity.domain_id)
-                payload = self._register_payload(
-                    identity,
-                    domain_fingerprint=domain_fingerprint,
-                    last_transition_at=now,
-                )
-                record = self._append_record(records, payload)
-                handle.seek(0, 2)
-                handle.write(_canonical(record) + b"\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-                return self._from_record(record)
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    payload = self._register_payload(
+                        identity,
+                        domain_fingerprint=domain_fingerprint,
+                        last_transition_at=now,
+                    )
+                    record = self._append_record(records, payload)
+                    handle.seek(0, 2)
+                    handle.write(_canonical(record) + b"\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    return self._from_record(record)
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def get(
         self,
@@ -290,54 +305,61 @@ class DurableAgentIdentityRegistry:
 
         if not isinstance(new_lifecycle, AgentIdentityLifecycle):
             raise TypeError("new_lifecycle must be an AgentIdentityLifecycle")
+        if domain_id is None:
+            raise AgentIdentityDomainError(
+                "explicit ControlDomain context is required for lifecycle mutations",
+            )
         reason = _parse_reason(reason, "reason")
         current = self.get(agent_id, domain_id=domain_id)
+        with self._domain_registry_lock():
+            self._domain_fingerprint(domain_id)
 
-        if _order(new_lifecycle) < _order(current.lifecycle):
-            raise AgentIdentityLifecycleError(
-                f"Cannot transition from {current.lifecycle.value} to {new_lifecycle.value} (non-widening invariant)",
-            )
-
-        if current.lifecycle is new_lifecycle:
-            if new_lifecycle is AgentIdentityLifecycle.REVOKED and current.revocation_reason != reason:
-                raise AgentIdentityConflictError(
-                    "revocation reason conflicts with existing evidence",
+            if _order(new_lifecycle) < _order(current.lifecycle):
+                raise AgentIdentityLifecycleError(
+                    f"Cannot transition from {current.lifecycle.value} to {new_lifecycle.value} (non-widening invariant)",
                 )
-            if new_lifecycle is AgentIdentityLifecycle.ARCHIVED and current.archive_reason != reason:
-                raise AgentIdentityConflictError(
-                    "archive reason conflicts with existing evidence",
-                )
-            return current
 
-        now = self._now()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a+b") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                handle.seek(0)
-                records = self._decode(handle.read())
-                current_by_key = self._current_by_key(records)
-                key = (current.domain_id, current.agent_id)
-                latest = current_by_key.get(key)
-                if latest is None or latest != current:
+            if current.lifecycle is new_lifecycle:
+                if new_lifecycle is AgentIdentityLifecycle.REVOKED and current.revocation_reason != reason:
                     raise AgentIdentityConflictError(
-                        "identity evidence changed during lifecycle transition",
+                        "revocation reason conflicts with existing evidence",
                     )
+                if new_lifecycle is AgentIdentityLifecycle.ARCHIVED and current.archive_reason != reason:
+                    raise AgentIdentityConflictError(
+                        "archive reason conflicts with existing evidence",
+                    )
+                return current
 
-                payload = self._transition_payload(
-                    current,
-                    new_lifecycle=new_lifecycle,
-                    last_transition_at=now,
-                    reason=reason,
-                )
-                record = self._append_record(records, payload)
-                handle.seek(0, 2)
-                handle.write(_canonical(record) + b"\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-                return self._from_record(record)
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            now = self._now()
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a+b") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    handle.seek(0)
+                    records = self._decode(handle.read())
+                    current_by_key = self._current_by_key(records)
+                    key = (current.domain_id, current.agent_id)
+                    latest = current_by_key.get(key)
+                    if latest is None or latest != current:
+                        raise AgentIdentityConflictError(
+                            "identity evidence changed during lifecycle transition",
+                        )
+                    self._domain_fingerprint(domain_id)
+
+                    payload = self._transition_payload(
+                        current,
+                        new_lifecycle=new_lifecycle,
+                        last_transition_at=now,
+                        reason=reason,
+                    )
+                    record = self._append_record(records, payload)
+                    handle.seek(0, 2)
+                    handle.write(_canonical(record) + b"\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    return self._from_record(record)
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def revoke(
         self,
