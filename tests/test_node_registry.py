@@ -24,7 +24,7 @@ def fedora_node():
         NodeCapability.from_known(KnownCapability.LINUX_SERVICES),
         NodeCapability.from_known(KnownCapability.PYTHON_EXECUTION),
     }
-    return NodeRecord(
+    return NodeRecord(domain_id="test-domain", 
         node_id="fedora-1",
         hostname="hp-pavilion",
         operating_system="Fedora 44",
@@ -39,7 +39,7 @@ def windows_node():
         NodeCapability.from_known(KnownCapability.WINDOWS_DESKTOP),
         NodeCapability.from_known(KnownCapability.PYTHON_EXECUTION),
     }
-    return NodeRecord(
+    return NodeRecord(domain_id="test-domain", 
         node_id="windows-1",
         hostname="hp-14",
         operating_system="Windows 11",
@@ -72,7 +72,7 @@ def test_registry_duplicate_registration_raises_without_replacing_record(
     """A duplicate ID fails and leaves the registered record unchanged."""
     registry.register(fedora_node)
     original_last_seen = fedora_node.last_seen
-    duplicate = NodeRecord(
+    duplicate = NodeRecord(domain_id="test-domain", 
         node_id=fedora_node.node_id,
         hostname="duplicate-host",
         operating_system="Fedora 45",
@@ -419,7 +419,7 @@ def test_registry_find_nodes_no_matches(registry, fedora_node):
 def test_registry_complex_capability_search(registry):
     """Test complex capability-based node discovery."""
     # Create nodes with different capability combinations
-    gpu_node = NodeRecord(
+    gpu_node = NodeRecord(domain_id="test-domain", 
         node_id="gpu-1",
         hostname="gpu-server",
         operating_system="Ubuntu 24.04",
@@ -430,7 +430,7 @@ def test_registry_complex_capability_search(registry):
         },
     )
 
-    storage_node = NodeRecord(
+    storage_node = NodeRecord(domain_id="test-domain", 
         node_id="storage-1",
         hostname="storage-server",
         operating_system="Ubuntu 24.04",

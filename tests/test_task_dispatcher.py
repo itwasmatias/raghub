@@ -60,7 +60,7 @@ def make_assignment(
         authorization_level=AuthorizationLevel.RESTRICTED,
         approval_required=True,
     )
-    worker = NodeRecord(
+    worker = NodeRecord(domain_id="test-domain", 
         node_id=worker_id,
         hostname=f"{worker_id}.local",
         operating_system="Fedora",
@@ -80,7 +80,7 @@ def build_liveness(
     nodes = NodeRegistry(stale_threshold_seconds=10**9)
     for worker_id in worker_ids:
         nodes.register(
-            NodeRecord(
+            NodeRecord(domain_id="test-domain", 
                 node_id=worker_id,
                 hostname=f"{worker_id}.local",
                 operating_system="Fedora",
@@ -100,6 +100,7 @@ def build_liveness(
                 Heartbeat.authenticated(
                     worker_id=worker_id,
                     registry_id="task-dispatch-tests",
+                    domain_id="test-domain",
                     sequence=1,
                     session_id="boot-1",
                     worker_timestamp=START,

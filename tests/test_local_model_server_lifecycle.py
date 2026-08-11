@@ -129,7 +129,10 @@ def make_authority(root: Path, *, worker: str = "worker-1", fingerprint=EXECUTIO
     assignment = TaskAssignment(
         task,
         NodeRecord(
-            worker, "worker.local", "Fedora",
+            domain_id="test-domain",
+            node_id=worker,
+            hostname="worker.local",
+            operating_system="Fedora",
             capabilities={NodeCapability("python_execution")},
         ),
     )
@@ -142,7 +145,10 @@ def make_authority(root: Path, *, worker: str = "worker-1", fingerprint=EXECUTIO
     nodes = NodeRegistry(stale_threshold_seconds=10**9)
     nodes.register(
         NodeRecord(
-            worker, "worker.local", "Fedora",
+            domain_id="test-domain",
+            node_id=worker,
+            hostname="worker.local",
+            operating_system="Fedora",
             capabilities={NodeCapability("python_execution")},
         )
     )
@@ -157,6 +163,7 @@ def make_authority(root: Path, *, worker: str = "worker-1", fingerprint=EXECUTIO
         Heartbeat.authenticated(
             worker_id=worker,
             registry_id="lifecycle-tests",
+            domain_id="test-domain",
             sequence=1,
             session_id="boot-1",
             worker_timestamp=NOW,

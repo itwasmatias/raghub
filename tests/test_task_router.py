@@ -22,10 +22,11 @@ ROUTER_NOW = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
 ROUTER_KEY = b"task-router-heartbeat-test-integrity-key"
 
 
-def online_heartbeat(worker_id):
+def online_heartbeat(worker_id, domain_id="test-domain"):
     return Heartbeat.authenticated(
         worker_id=worker_id,
         registry_id="task-router-tests",
+        domain_id=domain_id,
         sequence=1,
         session_id="boot-1",
         worker_timestamp=ROUTER_NOW,
@@ -76,7 +77,7 @@ def router(registry, heartbeat_registry):
 @pytest.fixture
 def python_node():
     """Create a node with Python execution capability."""
-    return NodeRecord(
+    return NodeRecord(domain_id="test-domain", 
         node_id="python-1",
         hostname="python-host",
         operating_system="Linux",
@@ -87,7 +88,7 @@ def python_node():
 @pytest.fixture
 def gpu_node():
     """Create a node with GPU capability."""
-    return NodeRecord(
+    return NodeRecord(domain_id="test-domain", 
         node_id="gpu-1",
         hostname="gpu-host",
         operating_system="Linux",
@@ -101,7 +102,7 @@ def gpu_node():
 @pytest.fixture
 def storage_node():
     """Create a node with storage capability."""
-    return NodeRecord(
+    return NodeRecord(domain_id="test-domain", 
         node_id="storage-1",
         hostname="storage-host",
         operating_system="Linux",
@@ -309,13 +310,13 @@ def test_task_router_preferred_capabilities_not_mandatory(
 def test_task_router_deterministic_ranking_by_node_id(router, registry):
     """Test that routing is deterministic using node_id for tie-breaking."""
     # Create two identical nodes (same capabilities)
-    node_a = NodeRecord(
+    node_a = NodeRecord(domain_id="test-domain", 
         node_id="a-node",
         hostname="host-a",
         operating_system="Linux",
         capabilities={NodeCapability("python_execution")},
     )
-    node_b = NodeRecord(
+    node_b = NodeRecord(domain_id="test-domain", 
         node_id="b-node",
         hostname="host-b",
         operating_system="Linux",
@@ -354,7 +355,7 @@ def test_task_router_is_independent_of_registration_order(tmp_path):
     def route_with_order(node_ids, evidence_name):
         registry = NodeRegistry(stale_threshold_seconds=300)
         for node_id in node_ids:
-            node = NodeRecord(
+            node = NodeRecord(domain_id="test-domain", 
                 node_id=node_id,
                 hostname=f"{node_id}-host",
                 operating_system="Linux",
@@ -546,7 +547,7 @@ def test_task_router_degraded_status_excluded(router, registry, python_node):
 def test_task_router_personal_mission_inbox_cleanup(router, registry):
     """Test routing a personal mission like Inbox Cleanup."""
     # Create a node suitable for inbox cleanup
-    inbox_node = NodeRecord(
+    inbox_node = NodeRecord(domain_id="test-domain", 
         node_id="personal-assistant",
         hostname="laptop",
         operating_system="Fedora 44",
@@ -680,7 +681,7 @@ def test_router_does_not_record_failed_routing(
 def test_task_router_ranking_prefers_more_preferred_matches(router, registry):
     """Test that nodes with more preferred matches rank higher."""
     # Node with 1 preferred match
-    node_1_pref = NodeRecord(
+    node_1_pref = NodeRecord(domain_id="test-domain", 
         node_id="node-1-pref",
         hostname="host-1",
         operating_system="Linux",
@@ -691,7 +692,7 @@ def test_task_router_ranking_prefers_more_preferred_matches(router, registry):
     )
 
     # Node with 2 preferred matches
-    node_2_pref = NodeRecord(
+    node_2_pref = NodeRecord(domain_id="test-domain", 
         node_id="node-2-pref",
         hostname="host-2",
         operating_system="Linux",

@@ -144,7 +144,7 @@ def make_coordinator(
 ):
     nodes = NodeRegistry()
     nodes.register(
-        NodeRecord(
+        NodeRecord(domain_id="test-domain", 
             node_id="worker-1",
             hostname="worker",
             operating_system="test",

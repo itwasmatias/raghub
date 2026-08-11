@@ -75,7 +75,11 @@ def runtime(tmp_path, *, checkpoint_attempts=(), completed=()):
 
 
 def routing(task, metadata_by_node, policy, selected):
-    nodes = tuple(NodeRecord(node_id, f"{node_id}.local", "generic",
+    nodes = tuple(NodeRecord(
+        domain_id="test-domain",
+        node_id=node_id,
+        hostname=f"{node_id}.local",
+        operating_system="generic",
         capabilities={NodeCapability("python_execution")}) for node_id in metadata_by_node)
     governance = BudgetRoutingGovernance(metadata_by_node, policy)
     task_request = task.to_task_request()

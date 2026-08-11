@@ -78,7 +78,11 @@ def add_authoritative_links(item, *, fingerprint="a" * 64):
     for task in item.plan.tasks:
         request_value = task.to_task_request()
         assignment = TaskAssignment(request_value, NodeRecord(
-            "worker-1", "worker.local", "Fedora", capabilities=set(task.required_capabilities)))
+            domain_id="test-domain",
+            node_id="worker-1",
+            hostname="worker.local",
+            operating_system="Fedora",
+            capabilities=set(task.required_capabilities)))
         assignment_id = f"assignment-{task.task_id}"
         decisions.append(RoutingDecision(request_value, RoutingOutcome.SUCCESS,
             assignment=assignment, assignment_id=assignment_id))

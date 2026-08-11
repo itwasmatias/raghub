@@ -35,7 +35,8 @@ class NodeRegistry:
         if stale_threshold_seconds < 0:
             raise ValueError("stale_threshold_seconds must be non-negative")
 
-        self._nodes: dict[str, NodeRecord] = {}
+        # Store nodes by (domain_id, node_id) composite key
+        self._nodes: dict[tuple[str, str], NodeRecord] = {}
         self._stale_threshold = timedelta(seconds=stale_threshold_seconds)
 
     def register(self, node: NodeRecord) -> None:
@@ -46,19 +47,26 @@ class NodeRegistry:
             node: The NodeRecord to register.
 
         Raises:
-            ValueError: If the node ID is already registered.
+            ValueError: If the (domain_id, node_id) pair is already registered.
         """
         if not isinstance(node, NodeRecord):
             raise TypeError("node must be a NodeRecord")
-        if node.node_id in self._nodes:
-            raise ValueError(f"Node ID already registered: {node.node_id}")
+
+        key = (node.domain_id, node.node_id)
+        if key in self._nodes:
+            raise ValueError(
+                f"Node already registered in domain: {node.node_id!r} "
+                f"in domain {node.domain_id!r}"
+            )
 
         node.update_heartbeat()
-        self._nodes[node.node_id] = node
+        self._nodes[key] = node
 
     def update(self, node_id: str, **kwargs) -> NodeRecord | None:
         """
-        Update a node's properties.
+        Update a node's properties (backward compatibility - updates first match).
+
+        DEPRECATED: Use update_by_domain() for domain-scoped updates.
 
         Args:
             node_id: The ID of the node to update.
@@ -68,7 +76,8 @@ class NodeRegistry:
         Returns:
             The updated NodeRecord, or None if the node was not found.
         """
-        node = self._nodes.get(node_id)
+        # Find first matching node across all domains for backward compat
+        node = self.get(node_id)
         if node is None:
             return None
 
@@ -80,6 +89,7 @@ class NodeRegistry:
 
         candidate = NodeRecord(
             node_id=node.node_id,
+            domain_id=node.domain_id,
             hostname=kwargs.get("hostname", node.hostname),
             operating_system=kwargs.get(
                 "operating_system",
@@ -97,7 +107,9 @@ class NodeRegistry:
 
     def remove(self, node_id: str) -> bool:
         """
-        Remove a node from the registry.
+        Remove a node from the registry (backward compatibility - removes first match).
+
+        DEPRECATED: Use remove_by_domain() for domain-scoped removal.
 
         Args:
             node_id: The ID of the node to remove.
@@ -105,22 +117,60 @@ class NodeRegistry:
         Returns:
             True if the node was removed, False if it was not found.
         """
-        if node_id in self._nodes:
-            del self._nodes[node_id]
+        # Find and remove first matching node across all domains for backward compat
+        for (domain, nid) in list(self._nodes.keys()):
+            if nid == node_id:
+                del self._nodes[(domain, nid)]
+                return True
+        return False
+
+    def remove_by_domain(self, node_id: str, domain_id: str) -> bool:
+        """
+        Remove a node from a specific domain.
+
+        Args:
+            node_id: The ID of the node to remove.
+            domain_id: The domain to remove from.
+
+        Returns:
+            True if the node was removed, False if it was not found.
+        """
+        key = (domain_id, node_id)
+        if key in self._nodes:
+            del self._nodes[key]
             return True
         return False
 
     def get(self, node_id: str) -> NodeRecord | None:
         """
-        Get a node by its ID.
+        Get a node by its ID (backward compatibility - returns first match).
+
+        DEPRECATED: Use get_by_domain() for domain-scoped lookup.
 
         Args:
             node_id: The ID of the node to retrieve.
 
         Returns:
-            The NodeRecord, or None if not found.
+            The NodeRecord, or None if not found. Returns first match across
+            all domains for backward compatibility.
         """
-        return self._nodes.get(node_id)
+        for (domain, nid), node in self._nodes.items():
+            if nid == node_id:
+                return node
+        return None
+
+    def get_by_domain(self, node_id: str, domain_id: str) -> NodeRecord | None:
+        """
+        Get a node by ID within a specific domain.
+
+        Args:
+            node_id: The ID of the node to retrieve.
+            domain_id: The domain to search within.
+
+        Returns:
+            The NodeRecord, or None if not found in the specified domain.
+        """
+        return self._nodes.get((domain_id, node_id))
 
     def list_nodes(
         self,
@@ -180,9 +230,62 @@ class NodeRegistry:
 
         return nodes
 
+    def list_by_domain(self, domain_id: str) -> list[NodeRecord]:
+        """
+        List all nodes in a specific domain.
+
+        Args:
+            domain_id: The domain to list nodes from.
+
+        Returns:
+            List of NodeRecords in the specified domain.
+        """
+        return [
+            node
+            for (domain, nid), node in self._nodes.items()
+            if domain == domain_id
+        ]
+
+    def search_by_domain(
+        self,
+        capabilities: set[NodeCapability] | frozenset[NodeCapability],
+        domain_id: str,
+        status_filter: NodeStatus | None = NodeStatus.ONLINE,
+        include_stale: bool = False,
+    ) -> list[NodeRecord]:
+        """
+        Find all nodes with specific capabilities within a domain.
+
+        Args:
+            capabilities: The capabilities to search for.
+            domain_id: The domain to search within.
+            status_filter: If provided, only return nodes with this status.
+                Defaults to ONLINE nodes only.
+            include_stale: If False, exclude stale nodes. Default is False.
+
+        Returns:
+            List of NodeRecords that match the criteria.
+        """
+        # Get all nodes in the domain
+        nodes = self.list_by_domain(domain_id)
+
+        # Filter by capabilities
+        capability_set = set(capabilities) if not isinstance(capabilities, (set, frozenset)) else capabilities
+        nodes = [n for n in nodes if capability_set.issubset(n.capabilities)]
+
+        # Filter by staleness
+        if not include_stale:
+            nodes = [n for n in nodes if not self.is_stale(n)]
+
+        # Filter by status
+        if status_filter is not None:
+            nodes = [n for n in nodes if n.status == status_filter]
+
+        return nodes
+
     def heartbeat(self, node_id: str) -> bool:
         """
-        Record a heartbeat for a node.
+        Record a heartbeat for a node (backward compatibility - updates first match).
 
         Updates the last_seen timestamp. If the node was offline,
         it will be marked as online.
@@ -193,7 +296,7 @@ class NodeRegistry:
         Returns:
             True if the heartbeat was recorded, False if node not found.
         """
-        node = self._nodes.get(node_id)
+        node = self.get(node_id)
         if node is None:
             return False
 

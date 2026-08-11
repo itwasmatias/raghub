@@ -69,7 +69,7 @@ def node_registry(tmp_path: Path) -> NodeRegistry:
     registry = NodeRegistry(stale_threshold_seconds=300)
 
     # Register a test node
-    test_node = NodeRecord(
+    test_node = NodeRecord(domain_id="test-domain", 
         node_id="test-node-1",
         hostname="test-host",
         operating_system="linux",
@@ -101,6 +101,7 @@ def heartbeat_registry(node_registry: NodeRegistry, tmp_path: Path) -> Heartbeat
         integrity_key=integrity_key,
         worker_id="test-node-1",
         registry_id="test-registry",
+        domain_id="test-domain",
         sequence=1,
         session_id="test-session",
         worker_timestamp=datetime.now(timezone.utc),

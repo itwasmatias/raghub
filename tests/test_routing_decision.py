@@ -64,7 +64,7 @@ def test_routing_decision_success():
         mission_id="mission-1",
         required_capabilities={NodeCapability("python_execution")},
     )
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="node-1",
         hostname="test-host",
         operating_system="Linux",
@@ -164,7 +164,7 @@ def test_routing_decision_success_requires_assignment():
 def test_routing_decision_no_eligible_nodes_forbids_assignment():
     """Test that NO_ELIGIBLE_NODES outcome forbids an assignment."""
     request = TaskRequest(task_id="task-1", mission_id="mission-1")
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="node-1",
         hostname="test-host",
         operating_system="Linux",
@@ -183,7 +183,7 @@ def test_routing_decision_validates_assignment_task_request():
     """Test that assignment.task_request must match routing decision task_request."""
     request1 = TaskRequest(task_id="task-1", mission_id="mission-1")
     request2 = TaskRequest(task_id="task-2", mission_id="mission-2")
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="node-1",
         hostname="test-host",
         operating_system="Linux",
@@ -266,7 +266,7 @@ def test_routing_decision_get_summary_success():
         required_capabilities={NodeCapability("python_execution")},
         preferred_capabilities={NodeCapability("gpu_available")},
     )
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="node-1",
         hostname="test-host",
         operating_system="Linux",
@@ -325,7 +325,7 @@ def test_routing_decision_with_multiple_preferred_matches():
             NodeCapability("network_access"),
         },
     )
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="node-1",
         hostname="test-host",
         operating_system="Linux",

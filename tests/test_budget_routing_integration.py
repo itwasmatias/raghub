@@ -39,10 +39,10 @@ def router_for(tmp_path, node_specs, metadata_by_node=None, policy=None, assignm
         registry_id="budget-routing-tests", node_registry=registry,
         integrity_key=KEY, clock=lambda: NOW)
     for node_id, capabilities in node_specs:
-        registry.register(NodeRecord(node_id, f"{node_id}.local", "generic",
+        registry.register(NodeRecord(domain_id="test-domain", node_id=node_id, hostname=f"{node_id}.local", operating_system="generic",
             capabilities={NodeCapability(item) for item in capabilities}))
         heartbeats.record(Heartbeat.authenticated(worker_id=node_id,
-            registry_id="budget-routing-tests", sequence=1, session_id="boot-1",
+            registry_id="budget-routing-tests", domain_id="test-domain", sequence=1, session_id="boot-1",
             worker_timestamp=NOW, health="healthy", power_capabilities=(),
             requested_power_state="active", sleep_reason=None, expected_wake_time=None,
             wake_method=None, active_work_checkpointed=False,

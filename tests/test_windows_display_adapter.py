@@ -719,7 +719,7 @@ def coordinator(tmp_path, native=None, worker_probe=None):
     )
     nodes = NodeRegistry()
     nodes.register(
-        NodeRecord(
+        NodeRecord(domain_id="test-domain", 
             node_id="worker-1",
             hostname="worker",
             operating_system="windows",

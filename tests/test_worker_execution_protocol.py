@@ -35,20 +35,28 @@ def environment(path, *, approval=False, verifier=None, worker="worker-1", accep
         required_capabilities={NodeCapability("python_execution")},
         authorization_level=AuthorizationLevel.RESTRICTED,
         approval_required=approval, expected_result="structured evidence")
-    assignment = TaskAssignment(request, NodeRecord(worker, "worker.local", "Fedora",
+    assignment = TaskAssignment(request, NodeRecord(
+        domain_id="test-domain",
+        node_id=worker,
+        hostname="worker.local",
+        operating_system="Fedora",
         capabilities={NodeCapability("python_execution")}))
     registry = DurableAssignmentRegistry(path / "assignments.jsonl",
         coordinator_node_id="coordinator-1", integrity_key=KEY)
     authority = registry.record(assignment)
     nodes = NodeRegistry(stale_threshold_seconds=10**9)
-    nodes.register(NodeRecord(worker, "worker.local", "Fedora",
+    nodes.register(NodeRecord(
+        domain_id="test-domain",
+        node_id=worker,
+        hostname="worker.local",
+        operating_system="Fedora",
         capabilities={NodeCapability("python_execution")}))
     heartbeats = HeartbeatRegistry(path / "heartbeats.jsonl",
         registry_id="worker-execution-tests", node_registry=nodes,
         integrity_key=KEY, clock=clock)
     heartbeats.record(Heartbeat.authenticated(
-        worker_id=worker, registry_id="worker-execution-tests", sequence=1,
-        session_id="boot-1", worker_timestamp=NOW, health="healthy",
+        worker_id=worker, registry_id="worker-execution-tests", domain_id="test-domain",
+        sequence=1, session_id="boot-1", worker_timestamp=NOW, health="healthy",
         power_capabilities=(), requested_power_state="active",
         sleep_reason=None, expected_wake_time=None, wake_method=None,
         active_work_checkpointed=False, previous_authentication_tag="0" * 64,

@@ -34,6 +34,7 @@ class PowerCapability(str, Enum):
 class WorkerLease:
     worker_id: str
     registry_id: str
+    domain_id: str
     sequence: int
     session_id: str
     worker_timestamp: datetime

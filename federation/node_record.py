@@ -35,11 +35,12 @@ class NodeRecord:
     """
     Represents a compute node in the RAGHub federation.
 
-    Tracks node identity, operating environment, status, health,
-    and advertised capabilities.
+    Tracks node identity, domain membership, operating environment, status,
+    health, and advertised capabilities.
     """
 
     node_id: str
+    domain_id: str
     hostname: str
     operating_system: str
     status: NodeStatus = NodeStatus.ONLINE
@@ -50,8 +51,20 @@ class NodeRecord:
 
     def __post_init__(self) -> None:
         """Validate node record fields."""
+        # Maximum field lengths matching ControlDomain validation
+        MAX_DOMAIN_ID_LENGTH = 255
+
         if not self.node_id or not isinstance(self.node_id, str):
             raise ValueError("node_id must be a non-empty string")
+
+        # Validate domain_id
+        if not isinstance(self.domain_id, str) or not self.domain_id.strip():
+            raise ValueError("domain_id must be a non-empty string")
+        if len(self.domain_id) > MAX_DOMAIN_ID_LENGTH:
+            raise ValueError(f"domain_id exceeds {MAX_DOMAIN_ID_LENGTH} characters")
+        if "\x00" in self.domain_id:
+            raise ValueError("domain_id must not contain NULL bytes")
+
         if not self.hostname or not isinstance(self.hostname, str):
             raise ValueError("hostname must be a non-empty string")
         if not self.operating_system or not isinstance(self.operating_system, str):

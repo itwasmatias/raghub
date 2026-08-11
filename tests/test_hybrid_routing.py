@@ -53,11 +53,12 @@ from federation.heartbeat_registry import HeartbeatRegistry
 # ==============================================================================
 
 
-def online_heartbeat(worker_id, registry_id, integrity_key):
+def online_heartbeat(worker_id, registry_id, integrity_key, domain_id="test-domain"):
     """Create an authenticated online heartbeat for testing."""
     return Heartbeat.authenticated(
         worker_id=worker_id,
         registry_id=registry_id,
+        domain_id=domain_id,
         sequence=1,
         session_id="test-session-1",
         worker_timestamp=datetime.now(timezone.utc),
@@ -113,7 +114,7 @@ def task_router(node_registry, heartbeat_registry):
 @pytest.fixture
 def local_node(node_registry):
     """Create a local worker node."""
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="local-worker-1",
         hostname="localhost",
         operating_system="Linux",
@@ -127,7 +128,7 @@ def local_node(node_registry):
 @pytest.fixture
 def cloud_node(node_registry):
     """Create a cloud worker node."""
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="cloud-worker-1",
         hostname="cloud.example.com",
         operating_system="Linux",
@@ -615,7 +616,7 @@ class TestLocalRouting:
         task_request,
     ):
         """Test that unhealthy local nodes are rejected."""
-        unhealthy_node = NodeRecord(
+        unhealthy_node = NodeRecord(domain_id="test-domain", 
             node_id="unhealthy-local",
             hostname="localhost",
             operating_system="Linux",
@@ -1941,7 +1942,7 @@ class TestDecision:
         integrity_key,
     ):
         """Test that provider change affects decision fingerprint."""
-        cloud_node_2 = NodeRecord(
+        cloud_node_2 = NodeRecord(domain_id="test-domain", 
             node_id="cloud-worker-2",
             hostname="cloud2.example.com",
             operating_system="Linux",

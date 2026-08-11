@@ -13,7 +13,7 @@ from federation import (
 def test_task_assignment_creation():
     """Test creating a task assignment."""
     request = TaskRequest(task_id="task-1", mission_id="mission-1")
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="node-1",
         hostname="test-host",
         operating_system="Linux",
@@ -27,7 +27,7 @@ def test_task_assignment_creation():
 
 def test_task_assignment_requires_task_request():
     """Test that task_request is required."""
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="node-1",
         hostname="test-host",
         operating_system="Linux",
@@ -48,7 +48,7 @@ def test_task_assignment_requires_assigned_node():
 def test_task_assignment_task_id_property():
     """Test getting task_id from the assignment."""
     request = TaskRequest(task_id="task-1", mission_id="mission-1")
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="node-1",
         hostname="test-host",
         operating_system="Linux",
@@ -62,7 +62,7 @@ def test_task_assignment_task_id_property():
 def test_task_assignment_mission_id_property():
     """Test getting mission_id from the assignment."""
     request = TaskRequest(task_id="task-1", mission_id="mission-1")
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="node-1",
         hostname="test-host",
         operating_system="Linux",
@@ -76,7 +76,7 @@ def test_task_assignment_mission_id_property():
 def test_task_assignment_node_id_property():
     """Test getting node_id from the assignment."""
     request = TaskRequest(task_id="task-1", mission_id="mission-1")
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="node-1",
         hostname="test-host",
         operating_system="Linux",
@@ -97,7 +97,7 @@ def test_task_assignment_with_capabilities():
             NodeCapability("network_access"),
         },
     )
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="node-1",
         hostname="test-host",
         operating_system="Linux",
@@ -118,7 +118,7 @@ def test_task_assignment_with_capabilities():
 def test_task_assignment_immutability_of_slots():
     """Test that TaskAssignment uses slots (for memory efficiency)."""
     request = TaskRequest(task_id="task-1", mission_id="mission-1")
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="node-1",
         hostname="test-host",
         operating_system="Linux",

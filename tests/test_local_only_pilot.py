@@ -37,7 +37,11 @@ AUTHORITY_NOW = datetime(2026, 8, 9, tzinfo=timezone.utc)
 
 def authoritative_environment(path, definition=None, *, worker=NODE_ID):
     definition = definition or build_default_pilot_definition()
-    node = NodeRecord(worker, "worker.local", "Fedora",
+    node = NodeRecord(
+        domain_id="test-domain",
+        node_id=worker,
+        hostname="worker.local",
+        operating_system="Fedora",
         capabilities={NodeCapability("local_model_inference")})
     nodes = NodeRegistry(stale_threshold_seconds=10**9)
     nodes.register(node)
@@ -46,8 +50,8 @@ def authoritative_environment(path, definition=None, *, worker=NODE_ID):
     heartbeats = HeartbeatRegistry(path / "heartbeats.jsonl", registry_id="pilot-tests",
         node_registry=nodes, integrity_key=AUTHORITY_KEY, clock=lambda: AUTHORITY_NOW)
     heartbeats.record(Heartbeat.authenticated(worker_id=worker, registry_id="pilot-tests",
-        sequence=1, session_id="boot-1", worker_timestamp=AUTHORITY_NOW, health="healthy",
-        power_capabilities=(), requested_power_state="active", sleep_reason=None,
+        domain_id="test-domain", sequence=1, session_id="boot-1", worker_timestamp=AUTHORITY_NOW,
+        health="healthy", power_capabilities=(), requested_power_state="active", sleep_reason=None,
         expected_wake_time=None, wake_method=None, active_work_checkpointed=False,
         previous_authentication_tag="0" * 64, integrity_key=AUTHORITY_KEY))
     dispatch = TaskDispatchCoordinator("coordinator-1", assignment_store=assignments,

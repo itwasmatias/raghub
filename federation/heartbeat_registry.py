@@ -30,6 +30,7 @@ _FIELDS = {
     "event_sequence",
     "worker_id",
     "registry_id",
+    "domain_id",
     "heartbeat_sequence",
     "session_id",
     "worker_timestamp",
@@ -131,10 +132,21 @@ class HeartbeatRegistry:
             raise HeartbeatAuthenticationError(
                 "heartbeat registry identity does not match",
             )
-        if self.node_registry.get(heartbeat.worker_id) is None:
+
+        # Validate worker is registered in the correct domain
+        node = self.node_registry.get_by_domain(heartbeat.worker_id, heartbeat.domain_id)
+        if node is None:
             raise HeartbeatAuthenticationError(
-                "heartbeat worker is not registered",
+                f"heartbeat worker {heartbeat.worker_id!r} not registered in domain {heartbeat.domain_id!r}",
             )
+
+        # Verify domain_id in heartbeat matches node's domain
+        if node.domain_id != heartbeat.domain_id:
+            raise HeartbeatAuthenticationError(
+                f"heartbeat domain {heartbeat.domain_id!r} does not match "
+                f"node domain {node.domain_id!r}",
+            )
+
         if not authenticates(
             self._integrity_key,
             HEARTBEAT_SUBMISSION_DOMAIN,
@@ -405,6 +417,7 @@ class HeartbeatRegistry:
         return Heartbeat(
             worker_id=record["worker_id"],
             registry_id=record["registry_id"],
+            domain_id=record["domain_id"],
             sequence=record["heartbeat_sequence"],
             session_id=record["session_id"],
             worker_timestamp=parse_timestamp(
@@ -439,6 +452,7 @@ class HeartbeatRegistry:
         placeholder = WorkerLease(
             worker_id=heartbeat.worker_id,
             registry_id=heartbeat.registry_id,
+            domain_id=heartbeat.domain_id,
             sequence=heartbeat.sequence,
             session_id=heartbeat.session_id,
             worker_timestamp=heartbeat.worker_timestamp,
@@ -475,6 +489,7 @@ class HeartbeatRegistry:
             == {
                 "worker_id": lease.worker_id,
                 "registry_id": lease.registry_id,
+                "domain_id": lease.domain_id,
                 "sequence": lease.sequence,
                 "session_id": lease.session_id,
                 "worker_timestamp": format_timestamp(lease.worker_timestamp),

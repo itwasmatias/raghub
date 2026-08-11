@@ -13,8 +13,13 @@ from federation import (
 
 
 def node(node_id, *capabilities, status=NodeStatus.ONLINE):
-    return NodeRecord(node_id, f"{node_id}.local", "generic",
-        status=status, capabilities={NodeCapability(item) for item in capabilities})
+    return NodeRecord(
+        domain_id="test-domain",
+        node_id=node_id,
+        hostname=f"{node_id}.local",
+        operating_system="generic",
+        status=status,
+        capabilities={NodeCapability(item) for item in capabilities})
 
 
 def metadata(node_id, *, locality=ExecutionLocality.LOCAL, provider=None,

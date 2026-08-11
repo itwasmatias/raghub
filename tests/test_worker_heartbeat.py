@@ -52,7 +52,7 @@ def node_registry(*worker_ids):
     registry = NodeRegistry(stale_threshold_seconds=10**9)
     for worker_id in worker_ids:
         registry.register(
-            NodeRecord(
+            NodeRecord(domain_id="test-domain", 
                 node_id=worker_id,
                 hostname=f"{worker_id}.local",
                 operating_system="Linux",
@@ -65,6 +65,7 @@ def node_registry(*worker_ids):
 def heartbeat(
     *,
     worker_id="worker-1",
+    domain_id="test-domain",
     sequence=1,
     session_id="boot-1",
     worker_timestamp=START,
@@ -86,6 +87,7 @@ def heartbeat(
     return Heartbeat.authenticated(
         worker_id=worker_id,
         registry_id="registry-1",
+        domain_id=domain_id,
         sequence=sequence,
         session_id=session_id,
         worker_timestamp=worker_timestamp,

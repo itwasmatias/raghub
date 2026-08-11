@@ -51,6 +51,18 @@ def _identifier(value, field_name):
     return value
 
 
+def _domain_identifier(value, field_name):
+    """Validate domain identifier matching ControlDomain constraints."""
+    MAX_DOMAIN_ID_LENGTH = 255
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    if len(value) > MAX_DOMAIN_ID_LENGTH:
+        raise ValueError(f"{field_name} exceeds {MAX_DOMAIN_ID_LENGTH} characters")
+    if "\x00" in value:
+        raise ValueError(f"{field_name} must not contain NULL bytes")
+    return value
+
+
 def _optional_text(value, field_name):
     if value is None:
         return None
@@ -74,6 +86,7 @@ def _is_sha256_tag(value):
 class Heartbeat:
     worker_id: str
     registry_id: str
+    domain_id: str
     sequence: int
     session_id: str
     worker_timestamp: datetime
@@ -93,6 +106,11 @@ class Heartbeat:
             self,
             "registry_id",
             _identifier(self.registry_id, "registry_id"),
+        )
+        object.__setattr__(
+            self,
+            "domain_id",
+            _domain_identifier(self.domain_id, "domain_id"),
         )
         if (
             not isinstance(self.sequence, int)
@@ -163,6 +181,7 @@ class Heartbeat:
         return {
             "worker_id": self.worker_id,
             "registry_id": self.registry_id,
+            "domain_id": self.domain_id,
             "sequence": self.sequence,
             "session_id": self.session_id,
             "worker_timestamp": format_timestamp(self.worker_timestamp),

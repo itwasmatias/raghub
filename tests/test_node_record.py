@@ -10,7 +10,7 @@ from federation.node_record import NodeRecord, NodeStatus
 
 def test_node_record_creation():
     """Test basic NodeRecord creation."""
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="fedora-1",
         hostname="hp-pavilion",
         operating_system="Fedora 44",
@@ -34,7 +34,7 @@ def test_node_record_with_capabilities():
         NodeCapability.from_known(KnownCapability.LINUX_SERVICES),
     }
 
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="fedora-1",
         hostname="hp-pavilion",
         operating_system="Fedora 44",
@@ -48,7 +48,7 @@ def test_node_record_with_capabilities():
 
 def test_node_record_add_capability():
     """Test adding capabilities to a node."""
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="fedora-1",
         hostname="hp-pavilion",
         operating_system="Fedora 44",
@@ -65,7 +65,7 @@ def test_node_record_add_capability():
 def test_node_record_remove_capability():
     """Test removing capabilities from a node."""
     cap = NodeCapability.from_known(KnownCapability.PYTHON_EXECUTION)
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="fedora-1",
         hostname="hp-pavilion",
         operating_system="Fedora 44",
@@ -80,7 +80,7 @@ def test_node_record_remove_capability():
 def test_node_record_has_capability_by_string():
     """Test checking capability by string name."""
     cap = NodeCapability.from_known(KnownCapability.CONTAINER_RUNTIME)
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="fedora-1",
         hostname="hp-pavilion",
         operating_system="Fedora 44",
@@ -97,7 +97,7 @@ def test_node_record_has_capability_by_object():
     cap1 = NodeCapability.from_known(KnownCapability.CONTAINER_RUNTIME)
     cap2 = NodeCapability.from_known(KnownCapability.GPU_AVAILABLE)
 
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="fedora-1",
         hostname="hp-pavilion",
         operating_system="Fedora 44",
@@ -110,7 +110,7 @@ def test_node_record_has_capability_by_object():
 
 def test_node_record_update_heartbeat():
     """Test updating the heartbeat timestamp."""
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="fedora-1",
         hostname="hp-pavilion",
         operating_system="Fedora 44",
@@ -127,7 +127,7 @@ def test_node_record_update_heartbeat():
 
 def test_node_record_mark_online():
     """Test marking a node as online."""
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="fedora-1",
         hostname="hp-pavilion",
         operating_system="Fedora 44",
@@ -141,7 +141,7 @@ def test_node_record_mark_online():
 
 def test_node_record_mark_offline():
     """Test marking a node as offline."""
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="fedora-1",
         hostname="hp-pavilion",
         operating_system="Fedora 44",
@@ -155,7 +155,7 @@ def test_node_record_mark_offline():
 
 def test_node_record_is_available():
     """Test checking if a node is available."""
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="fedora-1",
         hostname="hp-pavilion",
         operating_system="Fedora 44",
@@ -174,21 +174,21 @@ def test_node_record_is_available():
 def test_node_record_validation():
     """Test that invalid node records raise errors."""
     with pytest.raises(ValueError, match="node_id"):
-        NodeRecord(
+        NodeRecord(domain_id="test-domain", 
             node_id="",
             hostname="hp-pavilion",
             operating_system="Fedora 44",
         )
 
     with pytest.raises(ValueError, match="hostname"):
-        NodeRecord(
+        NodeRecord(domain_id="test-domain", 
             node_id="fedora-1",
             hostname="",
             operating_system="Fedora 44",
         )
 
     with pytest.raises(ValueError, match="operating_system"):
-        NodeRecord(
+        NodeRecord(domain_id="test-domain", 
             node_id="fedora-1",
             hostname="hp-pavilion",
             operating_system="",
@@ -197,7 +197,7 @@ def test_node_record_validation():
 
 def test_node_record_status_string_conversion():
     """Test that string status values are converted to NodeStatus enum."""
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="fedora-1",
         hostname="hp-pavilion",
         operating_system="Fedora 44",
@@ -215,7 +215,7 @@ def test_node_record_capabilities_list_conversion():
         NodeCapability.from_known(KnownCapability.LINUX_SERVICES),
     ]
 
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="fedora-1",
         hostname="hp-pavilion",
         operating_system="Fedora 44",
@@ -230,7 +230,7 @@ def test_node_record_copies_capability_collection():
     """Mutating the caller's set does not change a node's capabilities."""
     cap = NodeCapability(name="python_execution")
     caps = {cap}
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="fedora-1",
         hostname="hp-pavilion",
         operating_system="Fedora 44",
@@ -244,7 +244,7 @@ def test_node_record_copies_capability_collection():
 def test_node_record_rejects_invalid_capabilities():
     """Capability collections contain only NodeCapability values."""
     with pytest.raises(TypeError, match="NodeCapability"):
-        NodeRecord(
+        NodeRecord(domain_id="test-domain", 
             node_id="fedora-1",
             hostname="hp-pavilion",
             operating_system="Fedora 44",
@@ -255,7 +255,7 @@ def test_node_record_rejects_invalid_capabilities():
 def test_node_record_normalizes_aware_last_seen_to_utc():
     """Aware timestamps are stored in UTC for reliable stale comparisons."""
     eastern = timezone(timedelta(hours=-5))
-    node = NodeRecord(
+    node = NodeRecord(domain_id="test-domain", 
         node_id="fedora-1",
         hostname="hp-pavilion",
         operating_system="Fedora 44",
@@ -268,7 +268,7 @@ def test_node_record_normalizes_aware_last_seen_to_utc():
 def test_node_record_rejects_naive_last_seen():
     """Naive timestamps cannot be mixed with UTC heartbeat timestamps."""
     with pytest.raises(ValueError, match="timezone-aware"):
-        NodeRecord(
+        NodeRecord(domain_id="test-domain", 
             node_id="fedora-1",
             hostname="hp-pavilion",
             operating_system="Fedora 44",
@@ -279,7 +279,7 @@ def test_node_record_rejects_naive_last_seen():
 def test_node_record_rejects_invalid_status_type():
     """Statuses must be NodeStatus values or their string values."""
     with pytest.raises(TypeError, match="status"):
-        NodeRecord(
+        NodeRecord(domain_id="test-domain", 
             node_id="fedora-1",
             hostname="hp-pavilion",
             operating_system="Fedora 44",
@@ -290,7 +290,7 @@ def test_node_record_rejects_invalid_status_type():
 def test_node_record_with_all_statuses():
     """Test creating nodes with all possible statuses."""
     for status in NodeStatus:
-        node = NodeRecord(
+        node = NodeRecord(domain_id="test-domain", 
             node_id="test-node",
             hostname="test-host",
             operating_system="Test OS",
