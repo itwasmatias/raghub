@@ -376,6 +376,36 @@ def test_cross_domain_or_scope_mismatch_fails_closed(
         boundary.propose(request)
 
 
+def test_valid_request_cannot_target_worker_in_other_domain(tmp_path):
+    boundary, _, _ = _boundary(
+        tmp_path,
+        grant_kwargs={
+            "domain_id": "domain-b",
+            "grantor_identity": "grantor-b",
+            "grantee_identity": "agent-b",
+        },
+    )
+    request = _request(domain_id="domain-b", agent_id="agent-b")
+
+    with pytest.raises(
+        EffectAuthorityError,
+        match="requested ControlDomain",
+    ):
+        boundary.propose(request)
+
+    with pytest.raises(
+        EffectAuthorityError,
+        match="requested ControlDomain",
+    ):
+        boundary.authorize(request, expires_at=NOW + timedelta(minutes=5))
+
+    with pytest.raises(
+        EffectAuthorityError,
+        match="requested ControlDomain",
+    ):
+        boundary.execute(request)
+
+
 def test_revoked_grant_fails_closed(tmp_path):
     domain_registry, identity_registry, grant_registry = _registries(tmp_path)
     grant_registry.register(_grant())

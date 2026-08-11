@@ -425,6 +425,14 @@ class EffectBoundary:
             raise EffectAuthorityError(
                 f"control domain {request.domain_id!r} is not active",
             )
+        worker = self.coordinator.node_registry.get(
+            request.proposal.worker_id,
+            domain_id=request.domain_id,
+        )
+        if worker is None:
+            raise EffectAuthorityError(
+                "worker is not registered in the requested ControlDomain",
+            )
         try:
             identity = self.identity_registry.get(
                 request.agent_id,
