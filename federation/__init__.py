@@ -110,6 +110,14 @@ from federation.effect_boundary import (
     EffectRequest,
     EffectRequestError,
 )
+from federation.credential_broker import (
+    CredentialBroker,
+    CredentialBrokerAuthorityError,
+    CredentialBrokerError,
+    CredentialBrokerNotFoundError,
+    CredentialLease,
+    CredentialRef,
+)
 from federation.registry import NodeRegistry
 from federation.routing_decision import ExcludedNode, RoutingDecision, RoutingOutcome
 from federation.task_assignment import TaskAssignment
@@ -241,6 +249,12 @@ __all__ = [
     "EffectAttempt",
     "EffectOutcome",
     "EffectEvidence",
+    "CredentialBroker",
+    "CredentialBrokerAuthorityError",
+    "CredentialBrokerError",
+    "CredentialBrokerNotFoundError",
+    "CredentialLease",
+    "CredentialRef",
     # Task Routing
     "AuthorizationLevel",
     "TaskRequest",
