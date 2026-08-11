@@ -99,6 +99,17 @@ from federation.windows_display_adapter import (
     WindowsDisplayResult,
 )
 from federation.power_coordinator import PowerCoordinator
+from federation.effect_boundary import (
+    EffectAuthorityError,
+    EffectAttempt,
+    EffectBoundary,
+    EffectBoundaryError,
+    EffectDecision,
+    EffectEvidence,
+    EffectOutcome,
+    EffectRequest,
+    EffectRequestError,
+)
 from federation.registry import NodeRegistry
 from federation.routing_decision import ExcludedNode, RoutingDecision, RoutingOutcome
 from federation.task_assignment import TaskAssignment
@@ -221,6 +232,15 @@ __all__ = [
     "WindowsDisplayFailureCode",
     "WindowsDisplayResult",
     "PowerCoordinator",
+    "EffectBoundary",
+    "EffectBoundaryError",
+    "EffectRequestError",
+    "EffectAuthorityError",
+    "EffectRequest",
+    "EffectDecision",
+    "EffectAttempt",
+    "EffectOutcome",
+    "EffectEvidence",
     # Task Routing
     "AuthorizationLevel",
     "TaskRequest",
