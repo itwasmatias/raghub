@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,7 @@ from .mission import (
     load_outline_file,
     save_mission_file,
 )
+from .milestone import MilestoneController, MilestoneError
 
 
 def _runner(config: ControllerConfig) -> LocalRunner:
@@ -71,6 +73,7 @@ def _ensure_local_directories(config: ControllerConfig) -> None:
     config.queue_root.mkdir(parents=True, exist_ok=True)
     config.reports_root.mkdir(parents=True, exist_ok=True)
     config.logs_root.mkdir(parents=True, exist_ok=True)
+    config.milestones_root.mkdir(parents=True, exist_ok=True)
     config.experience_path.parent.mkdir(parents=True, exist_ok=True)
     config.process_lock_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -231,6 +234,58 @@ def parser() -> argparse.ArgumentParser:
     m_migrate_mode.add_argument("--plan", action="store_true", dest="plan_migration", help="Deterministic action proposal")
     m_migrate_mode.add_argument("--apply", action="store_true", help="Safe mutation (requires explicit flag)")
     m_migrate.add_argument("--json", action="store_true", dest="json_output")
+
+    # Milestone development controller subcommand
+    milestone_cmd = commands.add_parser("milestone")
+    milestone_sub = milestone_cmd.add_subparsers(dest="milestone_action", required=True)
+
+    milestone_create = milestone_sub.add_parser("create")
+    milestone_create.add_argument("name")
+    milestone_create.add_argument("--base-ref", required=True, dest="base_ref")
+    milestone_create.add_argument("--implementation-area", required=True, dest="implementation_area")
+    milestone_create.add_argument("--milestone-id", dest="milestone_id")
+    milestone_create.add_argument(
+        "--focused-test",
+        action="append",
+        type=str,
+        dest="focused_tests",
+        default=[],
+        metavar="COMMAND",
+        help="Shell-style focused validation command; repeat for multiple commands",
+    )
+    milestone_create.add_argument(
+        "--invariant",
+        action="append",
+        dest="invariants",
+        default=[],
+        help="Invariant supplied by the human; repeat as needed",
+    )
+    milestone_create.add_argument(
+        "--scope-path",
+        action="append",
+        dest="scope_paths",
+        default=[],
+        help="Relevant implementation path; repeat as needed",
+    )
+    milestone_create.add_argument("--json", action="store_true", dest="json_output")
+
+    milestone_status = milestone_sub.add_parser("status")
+    milestone_status.add_argument("milestone_id", nargs="?")
+    milestone_status.add_argument("--json", action="store_true", dest="json_output")
+
+    milestone_validate = milestone_sub.add_parser("validate")
+    milestone_validate.add_argument("milestone_id")
+    milestone_validate.add_argument("--json", action="store_true", dest="json_output")
+
+    milestone_evidence = milestone_sub.add_parser("evidence")
+    milestone_evidence.add_argument("milestone_id")
+    milestone_evidence.add_argument("--output-dir", type=Path, default=None, dest="output_dir")
+    milestone_evidence.add_argument("--json", action="store_true", dest="json_output")
+
+    milestone_handoff = milestone_sub.add_parser("handoff")
+    milestone_handoff.add_argument("milestone_id")
+    milestone_handoff.add_argument("--output-path", type=Path, default=None, dest="output_path")
+    milestone_handoff.add_argument("--json", action="store_true", dest="json_output")
 
     return result
 
@@ -1015,6 +1070,180 @@ def _mission_command(args: argparse.Namespace, settings: ControllerConfig) -> in
     return 1
 
 
+def _milestone_command(
+    args: argparse.Namespace,
+    settings: ControllerConfig,
+    runner: LocalRunner,
+) -> int:
+    controller = MilestoneController(config=settings, runner=runner)
+    action = args.milestone_action
+
+    if action == "create":
+        focused_tests = [shlex.split(value) for value in getattr(args, "focused_tests", [])]
+        try:
+            state = controller.create(
+                name=args.name,
+                base_ref=args.base_ref,
+                implementation_area=args.implementation_area,
+                milestone_id=getattr(args, "milestone_id", None),
+                focused_tests=focused_tests,
+                invariants=getattr(args, "invariants", None),
+                scope_paths=getattr(args, "scope_paths", None),
+            )
+        except MilestoneError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        payload = state.to_dict()
+        if getattr(args, "json_output", False):
+            _print_json(payload)
+            return 0
+        print(f"OK: milestone {state.milestone_id!r} created")
+        print(f"Repository: {state.repository_root}")
+        print(f"Worktree:   {state.worktree}")
+        print(f"Branch:     {state.branch}")
+        print(f"Base ref:   {state.base_ref}")
+        print(f"Base commit:{'' if state.current_base is None else f' {state.current_base}'}")
+        print(f"HEAD:       {state.current_head}")
+        print(f"Status:     {state.status}")
+        if state.canonical_base_ref and state.canonical_base_commit:
+            print(f"Canonical:  {state.canonical_base_ref} @ {state.canonical_base_commit}")
+        print(f"Next:       {state.next_safe_action}")
+        return 0
+
+    if action == "status":
+        try:
+            payload = controller.status(getattr(args, "milestone_id", None))
+        except MilestoneError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        if getattr(args, "json_output", False):
+            _print_json(payload)
+            return 0
+        inventory = payload["inventory"]
+        print(f"Repository: {inventory['repository_root']}")
+        print(f"Current branch: {inventory['current_branch']}")
+        print(f"Current HEAD:   {inventory['current_head']}")
+        if inventory.get("canonical_base"):
+            canonical = inventory["canonical_base"]
+            print(f"Canonical base: {canonical['ref']} @ {canonical['commit']}")
+        print(f"Clean:          {inventory['clean']}")
+        print(f"Worktrees:      {len(inventory['worktrees'])}")
+        print(f"Branches:       {len(inventory['branches'])}")
+        if inventory.get("worktrees"):
+            print("Active worktrees:")
+            for item in inventory["worktrees"]:
+                print(
+                    f"  - {item.get('worktree')}: {item.get('branch') or 'detached'} "
+                    f"@ {item.get('head')} clean={item.get('clean')}"
+                )
+        if inventory.get("branches"):
+            print("Branches:")
+            for item in inventory["branches"]:
+                print(f"  - {item['branch']} @ {item['commit']}")
+        milestones = payload.get("milestones")
+        if milestones is not None:
+            print("Milestones:")
+            for item in milestones:
+                print(
+                    f"  - {item['milestone_id']}: {item['status']} "
+                    f"({item.get('branch') or 'no branch'}) "
+                    f"ancestry={item.get('ancestry')}"
+                )
+            return 0
+        milestone = payload["milestone"]
+        print(f"Milestone:      {milestone['milestone_id']}")
+        print(f"Name:           {milestone['name']}")
+        print(f"Implementation: {milestone['implementation_area']}")
+        print(f"Base ref:       {milestone['base_ref']}")
+        print(f"Current base:   {milestone['current_base']}")
+        print(f"Current HEAD:   {milestone['current_head']}")
+        print(f"Worktree:       {milestone['worktree']}")
+        print(f"Branch:         {milestone['branch']}")
+        print(f"Status:         {milestone['status']}")
+        print(f"Next action:    {milestone['next_safe_action']}")
+        print(f"Ancestry:       {milestone.get('ancestry')}")
+        return 0
+
+    if action == "validate":
+        try:
+            summary = controller.validate(args.milestone_id)
+            state = controller.load_state(args.milestone_id)
+        except MilestoneError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        payload = {
+            "milestone": state.to_dict(),
+            "validation": summary.to_dict(),
+        }
+        if getattr(args, "json_output", False):
+            _print_json(payload)
+            return 0 if summary.success else 1
+        print(f"Milestone: {state.milestone_id}")
+        print(f"Status:    {state.status}")
+        print(f"Exit code: {summary.overall_exit_code}")
+        print(
+            "Completed: "
+            + (", ".join(summary.completed_phases) if summary.completed_phases else "none")
+        )
+        print(
+            "Remaining: "
+            + (", ".join(summary.remaining_phases) if summary.remaining_phases else "none")
+        )
+        if summary.failures:
+            print("Failures:")
+            for item in summary.failures:
+                print(f"  - {item}")
+        if summary.blockers:
+            print("Blockers:")
+            for item in summary.blockers:
+                print(f"  - {item}")
+        print(f"Next action: {state.next_safe_action}")
+        return 0 if summary.success else 1
+
+    if action == "evidence":
+        try:
+            payload = controller.evidence(
+                args.milestone_id,
+                output_dir=getattr(args, "output_dir", None),
+            )
+            state = controller.load_state(args.milestone_id)
+        except MilestoneError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        if getattr(args, "json_output", False):
+            _print_json(payload)
+            return 0
+        print(f"Milestone: {state.milestone_id}")
+        print(f"Report SHA-256:   {payload.get('report_sha256')}")
+        print(f"Evidence SHA-256: {payload.get('evidence_sha256')}")
+        print(f"Report path:      {state.artifacts.get('report_md')}")
+        print(f"Evidence path:    {state.artifacts.get('evidence_json')}")
+        print(f"Next action:      {state.next_safe_action}")
+        return 0
+
+    if action == "handoff":
+        try:
+            payload = controller.handoff(
+                args.milestone_id,
+                output_path=getattr(args, "output_path", None),
+            )
+        except MilestoneError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        if getattr(args, "json_output", False):
+            _print_json(payload)
+            return 0
+        print(f"Milestone: {payload['milestone_objective']}")
+        print(f"Handoff path:   {payload.get('handoff_path')}")
+        print(f"Handoff SHA-256: {payload.get('handoff_sha256')}")
+        print(f"Evidence SHA-256: {payload.get('evidence_sha256')}")
+        print(f"Next action:    {payload.get('next_safe_action')}")
+        return 0
+
+    print(f"Unknown milestone action: {action}", file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     settings = ControllerConfig.from_json(args.config)
@@ -1063,6 +1292,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "mission":
         return _mission_command(args, settings)
+
+    if args.command == "milestone":
+        return _milestone_command(args, settings, runner)
 
     controller = build(settings)
     if args.command == "run":
