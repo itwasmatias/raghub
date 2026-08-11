@@ -79,6 +79,23 @@ from research_mission.confidence import (
     ResearchConfidenceSynthesis,
     ResearchConfidenceSynthesisRuntime,
 )
+from research_mission.evidence_spine import (
+    EvidenceChain,
+    EvidenceCorrelationKey,
+    EvidenceExport,
+    EvidenceRecord,
+    EvidenceReference,
+    EvidenceSpine,
+    EvidenceSpineConflictError,
+    EvidenceSpineCorruptionError,
+    EvidenceSpineError,
+    approval_records,
+    checkpoint_record,
+    event_records,
+    recovery_record,
+    research_evidence_record,
+    worker_attempt_record,
+)
 
 __all__ = [
     "ChallengerAssessment",
@@ -145,4 +162,19 @@ __all__ = [
     "ResearchConfidenceError",
     "ResearchConfidenceSynthesis",
     "ResearchConfidenceSynthesisRuntime",
+    "EvidenceChain",
+    "EvidenceCorrelationKey",
+    "EvidenceExport",
+    "EvidenceRecord",
+    "EvidenceReference",
+    "EvidenceSpine",
+    "EvidenceSpineConflictError",
+    "EvidenceSpineCorruptionError",
+    "EvidenceSpineError",
+    "approval_records",
+    "checkpoint_record",
+    "event_records",
+    "recovery_record",
+    "research_evidence_record",
+    "worker_attempt_record",
 ]
