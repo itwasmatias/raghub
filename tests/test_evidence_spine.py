@@ -55,6 +55,16 @@ SOURCE_REVISIONS = {
 }
 
 
+def _source_revisions_for(spine: EvidenceSpine, source: str) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            revision
+            for recorded_source, revision in spine.source_revisions
+            if recorded_source == source
+        )
+    )
+
+
 def make_checkpoint() -> MissionCheckpoint:
     task = TaskCheckpoint(
         task_id=TASK_ID,
@@ -233,7 +243,22 @@ def test_spine_normalizes_and_orders_records_deterministically() -> None:
     assert len(spine.records_for_task(MISSION_ID, TASK_ID)) == 5
     assert len(spine.records_for_source("approval_log")) == 2
     assert len(spine.records_for_source("mission_event")) == 2
-    assert dict(spine.source_revisions) == SOURCE_REVISIONS
+    assert _source_revisions_for(spine, "mission_checkpoint") == (SOURCE_REVISIONS["mission_checkpoint"],)
+    assert _source_revisions_for(spine, "mission_recovery") == (SOURCE_REVISIONS["mission_recovery"],)
+    assert _source_revisions_for(spine, "research_evidence") == (SOURCE_REVISIONS["research_evidence"],)
+    assert _source_revisions_for(spine, "worker_execution") == (SOURCE_REVISIONS["worker_execution"],)
+    assert _source_revisions_for(spine, "mission_event") == tuple(
+        sorted(
+            record.reference.source_revision
+            for record in event_records(make_event_snapshot(), domain_id=DOMAIN_ID)
+        )
+    )
+    assert _source_revisions_for(spine, "approval_log") == tuple(
+        sorted(
+            record.reference.source_revision
+            for record in approval_records(make_approval_snapshot(), domain_id=DOMAIN_ID)
+        )
+    )
 
     export = spine.export(generated_at=NOW)
     exported = export.to_dict()
@@ -243,6 +268,34 @@ def test_spine_normalizes_and_orders_records_deterministically() -> None:
     assert exported["chain"]["chain_fingerprint"] == spine.chain_fingerprint
     assert exported["records"][0]["record_fingerprint"] == spine.records[0].record_fingerprint
     assert json.loads(json.dumps(exported)) == exported
+
+
+def test_event_records_ignore_enclosing_snapshot_revision() -> None:
+    original_snapshot = make_event_snapshot()
+    shifted_snapshot = replace(original_snapshot, revision="event-revision-2")
+
+    original_records = event_records(original_snapshot, domain_id=DOMAIN_ID)
+    shifted_records = event_records(shifted_snapshot, domain_id=DOMAIN_ID)
+
+    assert original_records == shifted_records
+
+    spine = EvidenceSpine.from_records((*original_records, *shifted_records))
+    assert len(spine) == len(original_records)
+    assert len(spine.records_for_source("mission_event")) == len(original_records)
+
+
+def test_approval_records_ignore_enclosing_snapshot_revision() -> None:
+    original_snapshot = make_approval_snapshot()
+    shifted_snapshot = replace(original_snapshot, revision="approval-revision-2")
+
+    original_records = approval_records(original_snapshot, domain_id=DOMAIN_ID)
+    shifted_records = approval_records(shifted_snapshot, domain_id=DOMAIN_ID)
+
+    assert original_records == shifted_records
+
+    spine = EvidenceSpine.from_records((*original_records, *shifted_records))
+    assert len(spine) == len(original_records)
+    assert len(spine.records_for_source("approval_log")) == len(original_records)
 
 
 def test_exact_duplicate_record_is_idempotent() -> None:
@@ -300,6 +353,40 @@ def test_adapter_inputs_fail_closed_for_invalid_context() -> None:
 
     with pytest.raises(ValueError):
         research_evidence_record(make_research_evidence(), source_revision=" ", domain_id=DOMAIN_ID)
+
+
+def test_worker_attempt_history_keeps_distinct_lifecycle_snapshots() -> None:
+    completed_attempt = make_worker_attempt()
+    claimed_attempt = replace(
+        completed_attempt,
+        status=WorkerExecutionStatus.CLAIMED,
+        started_at=None,
+        terminal_at=None,
+        result=None,
+        failure_reason=None,
+    )
+    running_attempt = replace(
+        completed_attempt,
+        status=WorkerExecutionStatus.RUNNING,
+        terminal_at=None,
+        result=None,
+        failure_reason=None,
+    )
+
+    records = (
+        worker_attempt_record(claimed_attempt, domain_id=DOMAIN_ID),
+        worker_attempt_record(running_attempt, domain_id=DOMAIN_ID),
+        worker_attempt_record(completed_attempt, domain_id=DOMAIN_ID),
+    )
+
+    spine = EvidenceSpine.from_records(records)
+
+    assert len(spine) == 3
+    assert len(spine.records_for_source("worker_execution")) == 3
+    assert len({record.key.record_id for record in records}) == 3
+
+    duplicate_spine = EvidenceSpine.from_records((records[-1], replace(records[-1])))
+    assert len(duplicate_spine) == 1
 
 
 def test_non_spine_inputs_fail_closed() -> None:

@@ -51,6 +51,10 @@ def _fingerprint(value: Any) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
+def _stable_source_revision(value: Any) -> str:
+    return _fingerprint(_normalize_json(value))
+
+
 def _require_text(value: Any, field_name: str) -> str:
     if type(value) is not str or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
@@ -331,7 +335,7 @@ class EvidenceSpine:
         return self.export(generated_at=generated_at).to_dict()
 
     def _summary(self) -> str:
-        sources = len(self.source_revisions)
+        sources = len({record.key.source for record in self._records})
         missions = len({record.key.mission_id for record in self._records if record.key.mission_id is not None})
         tasks = len({(record.key.mission_id, record.key.task_id) for record in self._records if record.key.task_id is not None})
         return f"{len(self._records)} records from {sources} sources across {missions} missions and {tasks} task scopes"
@@ -500,8 +504,9 @@ def event_records(
         fingerprint = _fingerprint(event_payload)
         mission_id = event_payload["mission_id"]
         task_id = event_payload.get("task_id")
+        source_revision = _stable_source_revision(event_payload)
         reference = EvidenceReference(
-            source_revision=snapshot.revision,
+            source_revision=source_revision,
             fingerprint=fingerprint,
             observed_at=_require_timestamp(
                 datetime.fromisoformat(event_payload["timestamp"]),
@@ -578,8 +583,9 @@ def approval_records(
             task_id = fallback[1] if fallback else None
         payload = _normalize_json(wrapper)
         fingerprint = _fingerprint(payload)
+        source_revision = _stable_source_revision(payload)
         reference = EvidenceReference(
-            source_revision=snapshot.revision,
+            source_revision=source_revision,
             fingerprint=fingerprint,
             observed_at=_require_timestamp(
                 datetime.fromisoformat(
@@ -604,7 +610,7 @@ def approval_records(
                 metadata={
                     "record_type": record_type,
                     "action_id": action_id,
-                    "snapshot_revision": snapshot.revision,
+                    "record_index": index,
                 },
             )
         )
@@ -629,6 +635,13 @@ def worker_attempt_record(
     source_revision = _require_timestamp(source_revision_dt, "execution timestamp").isoformat()
     normalized_payload = _normalize_json(payload)
     fingerprint = attempt.request.execution_fingerprint or _fingerprint(normalized_payload)
+    record_id = _fingerprint(
+        {
+            "execution_attempt_id": attempt.request.execution_attempt_id,
+            "status": attempt.status.value,
+            "source_revision": source_revision,
+        }
+    )
     reference = EvidenceReference(
         source_revision=source_revision,
         fingerprint=fingerprint,
@@ -639,7 +652,7 @@ def worker_attempt_record(
     return EvidenceRecord(
         key=EvidenceCorrelationKey(
             source="worker_execution",
-            record_id=attempt.request.execution_attempt_id,
+            record_id=record_id,
             mission_id=attempt.request.mission_id,
             task_id=attempt.request.task_id,
             domain_id=domain_id,
