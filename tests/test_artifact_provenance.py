@@ -561,6 +561,28 @@ def test_windows_path_forms_are_handled_explicitly() -> None:
         provenance._normalize_logical_path("C:\\nested\\file.txt", error_cls=UnsafePathError)
 
 
+def test_trailing_space_dot_normalized() -> None:
+    """Trailing spaces and dots in path components are normalized to prevent Windows filesystem confusion."""
+    # These pass initial whitespace check but have trailing space/dot in components
+    assert provenance._normalize_logical_path("file.txt.", error_cls=UnsafePathError) == "file.txt"
+    assert provenance._normalize_logical_path("nested./file.txt", error_cls=UnsafePathError) == "nested/file.txt"
+    assert provenance._normalize_logical_path("nested /file.txt", error_cls=UnsafePathError) == "nested/file.txt"
+    assert provenance._normalize_logical_path("a./b.", error_cls=UnsafePathError) == "a/b"
+    # Surrounding whitespace is still rejected
+    with pytest.raises(UnsafePathError, match="surrounding whitespace"):
+        provenance._normalize_logical_path("file.txt ", error_cls=UnsafePathError)
+    with pytest.raises(UnsafePathError, match="surrounding whitespace"):
+        provenance._normalize_logical_path(" file.txt", error_cls=UnsafePathError)
+
+
+def test_oversized_manifest_rejected(tmp_path: Path) -> None:
+    """Manifests exceeding MAX_MANIFEST_SIZE are rejected to prevent memory exhaustion."""
+    manifest_path = tmp_path / "huge.json"
+    manifest_path.write_bytes(b"x" * (provenance.MAX_MANIFEST_SIZE + 1))
+    with pytest.raises(ManifestFormatError, match="exceeds maximum size"):
+        load_manifest(manifest_path)
+
+
 def test_dirfd_fallback_is_feature_detected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "root"
     write_file(root, "a.txt", b"alpha")

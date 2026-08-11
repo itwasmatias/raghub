@@ -17,6 +17,7 @@ MANIFEST_SCHEMA_VERSION = "artifact-provenance-manifest-v0.1"
 DIGEST_VERIFIED = "DIGEST_VERIFIED"
 DEFAULT_DIGEST_ALGORITHM = "sha256"
 DEFAULT_CHUNK_SIZE = 1024 * 1024
+MAX_MANIFEST_SIZE = 10 * 1024 * 1024  # 10MB reasonable limit
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:")
@@ -185,13 +186,15 @@ def _normalize_logical_path(
     parts = candidate.split("/")
     if any(part in {"", ".", ".."} for part in parts):
         raise error_cls("logical_path contains an unsafe component")
+    normalized_parts = []
     for part in parts:
         collapsed = part.rstrip(" .")
         if not collapsed:
             raise error_cls("logical_path contains an unsafe component")
         if collapsed.upper() in _WINDOWS_RESERVED_NAMES:
             raise error_cls("logical_path contains a Windows reserved name")
-    return "/".join(parts)
+        normalized_parts.append(collapsed)
+    return "/".join(normalized_parts)
 
 
 def _resolve_root(root: str | os.PathLike[str]) -> Path:
@@ -422,6 +425,11 @@ def _validate_manifest_dict(
 def load_manifest(path: str | os.PathLike[str]) -> ArtifactProvenanceManifest:
     manifest_path = Path(os.fspath(path))
     try:
+        stat_result = manifest_path.stat()
+        if stat_result.st_size > MAX_MANIFEST_SIZE:
+            raise ManifestFormatError(
+                f"manifest exceeds maximum size of {MAX_MANIFEST_SIZE} bytes"
+            )
         raw = manifest_path.read_bytes()
     except FileNotFoundError as exc:
         raise ManifestFormatError("manifest file is missing") from exc
