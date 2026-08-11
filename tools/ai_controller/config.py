@@ -104,6 +104,10 @@ class ControllerConfig:
     def missions_root(self) -> Path:
         return self.controller_root / "missions"
 
+    @property
+    def milestones_root(self) -> Path:
+        return self.controller_root / "milestones"
+
     @classmethod
     def from_json(cls, path: Path) -> "ControllerConfig":
         data: dict[str, Any] = json.loads(Path(path).read_text(encoding="utf-8"))
