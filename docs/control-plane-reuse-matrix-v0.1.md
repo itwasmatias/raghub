@@ -279,3 +279,33 @@ PowerCoordinator demonstrates the ideal M4 universal effect boundary pattern:
 This matrix is now frozen and authoritative for M0 ControlDomain implementation.
 
 ---
+
+## Provenance Addendum (2026-08-11)
+
+**Architectural Classifications Status:** The component reuse verdicts, critical path, risk assessment, and migration strategy documented in this matrix remain **independently verified and authoritative**.
+
+**Audit Artifact Provenance Status:** **UNRESOLVED_EVIDENCE_DRIFT** detected for source audit artifact. See: [control-plane-reuse-audit-provenance-v0.1.md](./control-plane-reuse-audit-provenance-v0.1.md)
+
+### Competing Digest Records
+
+**Originally Recorded (line 8 above):**
+```
+bc3cb6d3e024fe87983e85988e5e2bb30830fb7cc14720e74b8bb5fcd93dfdc2
+```
+
+**Currently Observed:**
+```
+fa994854fb8098bba546ab97b12929f9225476c2c5efbf8e3de18aaa8527a791
+```
+
+**Relationship:** Unresolved. Neither digest has been proven authoritative. Both are preserved as disputed provenance pending forensic investigation.
+
+**Impact on Matrix Validity:** None. The architectural analysis was independently verified through code inspection and remains valid regardless of the audit artifact's byte provenance status.
+
+**Critical Distinction:**
+- **Authoritative:** Component reuse classifications, risk assessments, critical path
+- **Unresolved:** Cryptographic chain-of-custody for source audit artifact bytes
+
+No historical artifact was modified to manufacture digest agreement. The originally recorded digest (line 8) has been preserved without substitution.
+
+---
