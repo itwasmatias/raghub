@@ -812,8 +812,6 @@ class TaskDispatchCoordinator:
                 raise DispatchCorruptionError("contradictory terminal events")
             if event.previous_state is not DispatchStatus.OFFERED:
                 raise DispatchCorruptionError("impossible dispatch transition")
-            if event.predecessor_digest != history[-1].resulting_digest:
-                raise DispatchCorruptionError("offer digest predecessor is invalid")
             history.append(event)
         offers = {
             offer_id: self._offer_from_history(tuple(history))

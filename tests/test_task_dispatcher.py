@@ -117,9 +117,10 @@ def build_liveness(
     return liveness
 
 
-def build_coordinator(tmp_path, clock=None, **assignment_overrides):
+def build_coordinator(tmp_path, clock=None, worker_ids=None, **assignment_overrides):
     assignment, coordinator_id = make_assignment(**assignment_overrides)
     coordinator_clock = clock or MutableClock()
+    heartbeat_worker_ids = worker_ids or (assignment.node_id,)
     assignments = DurableAssignmentRegistry(
         tmp_path / "assignments.jsonl",
         coordinator_node_id=coordinator_id,
@@ -133,7 +134,7 @@ def build_coordinator(tmp_path, clock=None, **assignment_overrides):
         integrity_key=INTEGRITY_KEY,
         heartbeat_registry=build_liveness(
             tmp_path,
-            worker_ids=(assignment.node_id,),
+            worker_ids=heartbeat_worker_ids,
             clock=coordinator_clock,
         ),
         clock=coordinator_clock,
@@ -378,6 +379,73 @@ def test_offered_and_terminal_state_survive_restart(tmp_path):
         clock=clock,
     )
     assert restarted_again.inspect_offer(offered.offer_id) == accepted
+
+
+def test_interleaved_offer_histories_survive_restart(tmp_path):
+    clock = MutableClock()
+    coordinator, first_assignment = build_coordinator(
+        tmp_path,
+        clock,
+        worker_ids=("worker-1", "worker-2"),
+    )
+    second, _ = make_assignment(task_id="task-2", worker_id="worker-2")
+    second_assignment = coordinator.assignment_store.record(second)
+    first_offer = create_offer(coordinator, first_assignment, clock)
+    second_offer = coordinator.create_offer(
+        assignment_id=second_assignment.assignment_id,
+        actor_node_id="coordinator-1",
+        expires_at=clock.current + timedelta(minutes=5),
+    )
+
+    accepted = coordinator.accept_offer(
+        offer_id=first_offer.offer_id,
+        actor_node_id="worker-1",
+    )
+    restarted = TaskDispatchCoordinator(
+        "coordinator-1",
+        assignment_store=coordinator.assignment_store,
+        dispatch_store_path=tmp_path / "dispatch.jsonl",
+        integrity_key=INTEGRITY_KEY,
+        heartbeat_registry=coordinator._heartbeat_registry,
+        clock=clock,
+    )
+
+    assert restarted.inspect_offer(first_offer.offer_id) == accepted
+    assert restarted.inspect_offer(second_offer.offer_id) == second_offer
+    assert [event.offer_id for event in restarted.audit_log()] == [
+        first_offer.offer_id,
+        second_offer.offer_id,
+        first_offer.offer_id,
+    ]
+
+
+def test_expire_due_offers_handles_interleaved_offer_histories(tmp_path):
+    clock = MutableClock()
+    coordinator, first_assignment = build_coordinator(
+        tmp_path,
+        clock,
+        worker_ids=("worker-1", "worker-2"),
+    )
+    second, _ = make_assignment(task_id="task-2", worker_id="worker-2")
+    second_assignment = coordinator.assignment_store.record(second)
+    first_offer = create_offer(coordinator, first_assignment, clock)
+    second_offer = coordinator.create_offer(
+        assignment_id=second_assignment.assignment_id,
+        actor_node_id="coordinator-1",
+        expires_at=clock.current + timedelta(minutes=5),
+    )
+    clock.advance(timedelta(minutes=5))
+
+    expired = coordinator.expire_due_offers()
+
+    assert {offer.offer_id for offer in expired} == {
+        first_offer.offer_id,
+        second_offer.offer_id,
+    }
+    assert all(offer.status is DispatchStatus.EXPIRED for offer in expired)
+    assert all(
+        offer.status is DispatchStatus.EXPIRED for offer in coordinator.list_offers()
+    )
 
 
 def test_identical_creation_after_restart_is_idempotent(tmp_path):
