@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 from federation.agent_identity import AuthoritativeAgentIdentity
@@ -43,6 +46,7 @@ from federation.integrity import authentication_tag, authenticates, require_inte
 from federation.power_action import PowerAction, PowerAuditEvent, PowerProposal, PowerSnapshot, PowerStatus, require_text, timestamp
 from federation.power_adapter import PowerRefusalError
 from federation.power_coordinator import PowerCoordinator
+from federation.file_lock import fcntl
 
 
 _SCHEMA_VERSION = 1
@@ -400,6 +404,31 @@ class EffectBoundary:
         self.identity_registry = identity_registry
         self.grant_registry = grant_registry
         self._integrity_key = require_integrity_key(integrity_key)
+        self._authority_lock = threading.RLock()
+
+    @contextmanager
+    def _shared_lock(self, path: Path):
+        if not path.exists():
+            yield
+            return
+        with path.open("rb") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
+    def _authority_scope(self):
+        # Hold the authority registries closed over the full boundary call so
+        # revocations or lifecycle changes cannot race validation.
+        with self._authority_lock:
+            with (
+                self._shared_lock(self.domain_registry.path),
+                self._shared_lock(self.identity_registry.path),
+                self._shared_lock(self.grant_registry.path),
+            ):
+                yield
 
     def _authenticate_request(self, request: EffectRequest) -> None:
         if type(request) is not EffectRequest:
@@ -492,71 +521,75 @@ class EffectBoundary:
         )
 
     def propose(self, request: EffectRequest) -> EffectDecision:
-        domain, identity, grant = self._resolve_context(request)
-        snapshot = self.coordinator.propose(request.proposal)
-        return self._decision(request, domain, identity, grant, snapshot)
+        with self._authority_scope():
+            domain, identity, grant = self._resolve_context(request)
+            snapshot = self.coordinator.propose(request.proposal)
+            return self._decision(request, domain, identity, grant, snapshot)
 
     def authorize(self, request: EffectRequest, *, expires_at: datetime) -> EffectAttempt:
-        domain, identity, grant = self._resolve_context(request)
-        current = self.coordinator.inspect(request.proposal.proposal_id)
-        decision = self._decision(request, domain, identity, grant, current)
-        snapshot = self.coordinator.authorize(
-            request.proposal.proposal_id,
-            expires_at=expires_at,
-        )
-        return self._attempt(
-            request,
-            decision,
-            snapshot,
-            include_without_expiration=True,
-        )
+        with self._authority_scope():
+            domain, identity, grant = self._resolve_context(request)
+            current = self.coordinator.inspect(request.proposal.proposal_id)
+            decision = self._decision(request, domain, identity, grant, current)
+            snapshot = self.coordinator.authorize(
+                request.proposal.proposal_id,
+                expires_at=expires_at,
+            )
+            return self._attempt(
+                request,
+                decision,
+                snapshot,
+                include_without_expiration=True,
+            )
 
     def execute(self, request: EffectRequest) -> EffectOutcome:
-        domain, identity, grant = self._resolve_context(request)
-        current = self.coordinator.inspect(request.proposal.proposal_id)
-        decision = self._decision(request, domain, identity, grant, current)
-        snapshot = self.coordinator.execute(request.proposal.proposal_id)
-        attempt = self._attempt(
-            request,
-            decision,
-            snapshot,
-            include_without_expiration=False,
-        )
-        return EffectOutcome(
-            request=request,
-            decision=decision,
-            attempt=attempt,
-            snapshot=snapshot,
-        )
+        with self._authority_scope():
+            domain, identity, grant = self._resolve_context(request)
+            current = self.coordinator.inspect(request.proposal.proposal_id)
+            decision = self._decision(request, domain, identity, grant, current)
+            snapshot = self.coordinator.execute(request.proposal.proposal_id)
+            attempt = self._attempt(
+                request,
+                decision,
+                snapshot,
+                include_without_expiration=False,
+            )
+            return EffectOutcome(
+                request=request,
+                decision=decision,
+                attempt=attempt,
+                snapshot=snapshot,
+            )
 
     def inspect(self, request: EffectRequest) -> EffectEvidence:
-        domain, identity, grant = self._resolve_context(request)
-        snapshot = self.coordinator.inspect(request.proposal.proposal_id)
-        decision = self._decision(request, domain, identity, grant, snapshot)
-        attempt = self._attempt(
-            request,
-            decision,
-            snapshot,
-            include_without_expiration=False,
-        )
-        outcome = EffectOutcome(
-            request=request,
-            decision=decision,
-            attempt=attempt,
-            snapshot=snapshot,
-        )
-        audit_history = tuple(
-            event
-            for event in self.coordinator.audit_history()
-            if event.proposal_id == request.proposal.proposal_id
-        )
-        return EffectEvidence(
-            request=request,
-            decision=decision,
-            attempt=attempt,
-            outcome=outcome,
-            audit_history=audit_history,
-        )
+        with self._authority_scope():
+            domain, identity, grant = self._resolve_context(request)
+            snapshot = self.coordinator.inspect(request.proposal.proposal_id)
+            decision = self._decision(request, domain, identity, grant, snapshot)
+            attempt = self._attempt(
+                request,
+                decision,
+                snapshot,
+                include_without_expiration=False,
+            )
+            outcome = EffectOutcome(
+                request=request,
+                decision=decision,
+                attempt=attempt,
+                snapshot=snapshot,
+            )
+            audit_history = tuple(
+                event
+                for event in self.coordinator.audit_history()
+                if event.proposal_id == request.proposal.proposal_id
+            )
+            return EffectEvidence(
+                request=request,
+                decision=decision,
+                attempt=attempt,
+                outcome=outcome,
+                audit_history=audit_history,
+            )
 
 
 __all__ = [

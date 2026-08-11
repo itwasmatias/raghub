@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import threading
 
 import pytest
 
@@ -426,6 +427,64 @@ def test_revoked_grant_fails_closed(tmp_path):
 
     with pytest.raises(EffectAuthorityError, match="not active"):
         boundary.propose(_request())
+
+
+def test_concurrent_grant_revocation_blocks_until_execute_completes(
+    tmp_path,
+    monkeypatch,
+):
+    domain_registry, identity_registry, grant_registry = _registries(tmp_path)
+    grant_registry.register(_grant())
+    coordinator, _ = _make_coordinator(tmp_path)
+    boundary = EffectBoundary(
+        coordinator=coordinator,
+        domain_registry=domain_registry,
+        identity_registry=identity_registry,
+        grant_registry=grant_registry,
+        integrity_key=KEY,
+    )
+    request = _request()
+
+    boundary.propose(request)
+    boundary.authorize(request, expires_at=NOW + timedelta(minutes=5))
+
+    started = threading.Event()
+    finished = threading.Event()
+    state = {}
+    original_execute = coordinator.execute
+
+    def racing_execute(proposal_id):
+        def revoke():
+            started.set()
+            grant_registry.revoke(
+                "grant-1",
+                domain_id="domain-a",
+                mission_id="mission-a",
+                reason="revoked during execute",
+            )
+            finished.set()
+
+        worker = threading.Thread(target=revoke, daemon=True)
+        state["worker"] = worker
+        worker.start()
+        assert started.wait(timeout=1)
+        assert not finished.wait(timeout=0.1)
+        return original_execute(proposal_id)
+
+    monkeypatch.setattr(coordinator, "execute", racing_execute)
+
+    outcome = boundary.execute(request)
+
+    assert outcome.snapshot.status is PowerStatus.SUCCEEDED
+    assert finished.wait(timeout=1)
+    state["worker"].join(timeout=1)
+    assert not state["worker"].is_alive()
+    revoked = grant_registry.get(
+        "grant-1",
+        domain_id="domain-a",
+        mission_id="mission-a",
+    )
+    assert revoked.status is DelegationGrantStatus.REVOKED
 
 
 def test_inspect_is_idempotent(tmp_path):
