@@ -7,6 +7,20 @@ work across federated compute nodes without embedding execution transport.
 """
 
 from federation.capability import KnownCapability, NodeCapability
+from federation.agent_identity import (
+    AgentIdentity,
+    AgentIdentityLifecycle,
+    AuthoritativeAgentIdentity,
+)
+from federation.agent_identity_registry import (
+    AgentIdentityConflictError,
+    AgentIdentityCorruptionError,
+    AgentIdentityDomainError,
+    AgentIdentityError,
+    AgentIdentityLifecycleError,
+    AgentIdentityNotFoundError,
+    DurableAgentIdentityRegistry,
+)
 from federation.assignment_registry import (
     AssignmentConflictError,
     AssignmentCorruptionError,
@@ -131,6 +145,17 @@ __all__ = [
     "NodeRecord",
     "NodeStatus",
     "NodeRegistry",
+    # Agent Identity
+    "AgentIdentity",
+    "AgentIdentityLifecycle",
+    "AuthoritativeAgentIdentity",
+    "AgentIdentityConflictError",
+    "AgentIdentityCorruptionError",
+    "AgentIdentityDomainError",
+    "AgentIdentityError",
+    "AgentIdentityLifecycleError",
+    "AgentIdentityNotFoundError",
+    "DurableAgentIdentityRegistry",
     "Heartbeat",
     "HeartbeatError",
     "HeartbeatAuthenticationError",
