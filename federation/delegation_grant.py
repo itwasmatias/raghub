@@ -22,6 +22,7 @@ class DelegationGrantStatus(str, Enum):
     """Lifecycle state of a durable delegation grant."""
 
     ACTIVE = "active"
+    PENDING = "pending"
     REVOKED = "revoked"
     EXPIRED = "expired"
 
@@ -210,6 +211,8 @@ class AuthoritativeDelegationGrant:
             return DelegationGrantStatus.REVOKED
         if self.status is DelegationGrantStatus.EXPIRED:
             return DelegationGrantStatus.EXPIRED
+        if current < self.effective_at:
+            return DelegationGrantStatus.PENDING
         if current >= self.expires_at:
             return DelegationGrantStatus.EXPIRED
         return DelegationGrantStatus.ACTIVE

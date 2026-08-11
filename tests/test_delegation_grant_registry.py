@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import multiprocessing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -247,6 +248,26 @@ def test_exact_duplicate_registration_is_idempotent(grant_registry):
     assert len(grant_registry.list_grants()) == 1
 
 
+def test_exact_duplicate_registration_revalidates_domain_context(
+    control_domain_registry,
+    identity_registry,
+    grant_registry_path,
+):
+    registry = DelegationGrantRegistry(
+        grant_registry_path,
+        domain_registry=control_domain_registry,
+        identity_registry=identity_registry,
+        integrity_key=KEY,
+        clock=MutableClock(),
+    )
+    identity = _grant()
+    registry.register(identity)
+    control_domain_registry.update_lifecycle("domain-a", DomainLifecycle.ARCHIVED)
+
+    with pytest.raises(DelegationGrantDomainError, match="not active"):
+        registry.register(identity)
+
+
 def test_conflicting_duplicate_registration_fails_closed(grant_registry):
     grant_registry.register(_grant())
 
@@ -342,6 +363,74 @@ def test_expiration_handling(grant_clock, grant_registry):
     assert not expired.is_active()
     assert expired.to_dict()["status"] == "expired"
     assert grant_registry.list_grants(status_filter=DelegationGrantStatus.EXPIRED)[0] == expired
+
+
+def test_future_effective_registration_stays_pending_until_effective(
+    grant_clock,
+    grant_registry,
+):
+    grant_registry.register(
+        _grant(
+            grant_id="grant-future",
+            effective_at=NOW + timedelta(minutes=5),
+            expires_at=NOW + timedelta(minutes=15),
+        )
+    )
+
+    pending = grant_registry.get(
+        "grant-future",
+        domain_id="domain-a",
+        mission_id="mission-a",
+    )
+
+    assert pending.status is DelegationGrantStatus.PENDING
+    assert not pending.is_active()
+    assert grant_registry.list_grants(status_filter=DelegationGrantStatus.PENDING)[0] == pending
+
+    grant_clock.advance(timedelta(minutes=6))
+    active = grant_registry.get(
+        "grant-future",
+        domain_id="domain-a",
+        mission_id="mission-a",
+    )
+
+    assert active.status is DelegationGrantStatus.ACTIVE
+    assert active.is_active(grant_clock.current)
+
+
+def test_revoked_to_expired_rewrite_is_rejected(grant_registry):
+    grant_registry.register(_grant(grant_id="grant-rewrite"))
+    grant_registry.revoke(
+        "grant-rewrite",
+        domain_id="domain-a",
+        mission_id="mission-a",
+        reason="compromised",
+    )
+
+    records = grant_registry._read()
+    current = grant_registry._current_by_key(records)[
+        ("domain-a", "mission-a", "grant-rewrite")
+    ]
+    forged_payload = current.to_dict()
+    forged_payload["status"] = DelegationGrantStatus.EXPIRED.value
+    forged_payload["revoked_at"] = None
+    forged_payload["revocation_reason"] = None
+    forged_record = grant_registry._append_record(records, forged_payload)
+    serialized = json.dumps(
+        forged_record,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    grant_registry.path.write_text(grant_registry.path.read_text() + serialized + "\n")
+
+    with pytest.raises(DelegationGrantCorruptionError, match="status is invalid"):
+        grant_registry.get(
+            "grant-rewrite",
+            domain_id="domain-a",
+            mission_id="mission-a",
+        )
 
 
 def test_tampering_detection(grant_registry):

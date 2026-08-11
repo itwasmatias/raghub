@@ -158,6 +158,11 @@ def _parse_reason(value: Any, field_name: str) -> str | None:
 def _parse_status(value: Any) -> DelegationGrantStatus:
     if not isinstance(value, str):
         raise DelegationGrantCorruptionError("delegation grant status is invalid")
+    if value not in {
+        DelegationGrantStatus.ACTIVE.value,
+        DelegationGrantStatus.REVOKED.value,
+    }:
+        raise DelegationGrantCorruptionError("delegation grant status is invalid")
     try:
         return DelegationGrantStatus(value)
     except ValueError as exc:
@@ -165,11 +170,11 @@ def _parse_status(value: Any) -> DelegationGrantStatus:
 
 
 def _status_order(status: DelegationGrantStatus) -> int:
-    return {
-        DelegationGrantStatus.ACTIVE: 0,
-        DelegationGrantStatus.REVOKED: 1,
-        DelegationGrantStatus.EXPIRED: 2,
-    }[status]
+    if status is DelegationGrantStatus.ACTIVE:
+        return 0
+    if status is DelegationGrantStatus.REVOKED:
+        return 1
+    raise DelegationGrantCorruptionError("delegation grant status is invalid")
 
 
 def _grant_key(grant: AuthoritativeDelegationGrant) -> tuple[str, str, str]:
@@ -335,8 +340,13 @@ class DelegationGrantRegistry:
             result = grant.status
             if result is DelegationGrantStatus.ACTIVE and now >= grant.expires_at:
                 result = DelegationGrantStatus.EXPIRED
+            if result is DelegationGrantStatus.ACTIVE and now < grant.effective_at:
+                result = DelegationGrantStatus.PENDING
 
-            if result is DelegationGrantStatus.ACTIVE:
+            if result in {
+                DelegationGrantStatus.ACTIVE,
+                DelegationGrantStatus.PENDING,
+            }:
                 if self._domain_status(
                     grant.domain_id,
                     strict=strict_identity,
@@ -344,7 +354,10 @@ class DelegationGrantRegistry:
                 ) is not DelegationGrantStatus.ACTIVE:
                     result = DelegationGrantStatus.REVOKED
 
-            if result is DelegationGrantStatus.ACTIVE:
+            if result in {
+                DelegationGrantStatus.ACTIVE,
+                DelegationGrantStatus.PENDING,
+            }:
                 if self._identity_status(
                     grant.domain_id,
                     grant.grantor_identity,
@@ -353,7 +366,10 @@ class DelegationGrantRegistry:
                 ) is not DelegationGrantStatus.ACTIVE:
                     result = DelegationGrantStatus.REVOKED
 
-            if result is DelegationGrantStatus.ACTIVE:
+            if result in {
+                DelegationGrantStatus.ACTIVE,
+                DelegationGrantStatus.PENDING,
+            }:
                 if self._identity_status(
                     grant.domain_id,
                     grant.grantee_identity,
@@ -362,7 +378,10 @@ class DelegationGrantRegistry:
                 ) is not DelegationGrantStatus.ACTIVE:
                     result = DelegationGrantStatus.REVOKED
 
-            if result is DelegationGrantStatus.ACTIVE and grant.parent_grant_id is not None:
+            if result in {
+                DelegationGrantStatus.ACTIVE,
+                DelegationGrantStatus.PENDING,
+            } and grant.parent_grant_id is not None:
                 parent_key = (grant.domain_id, grant.mission_id, grant.parent_grant_id)
                 parent = current_by_key.get(parent_key)
                 if parent is None:
@@ -540,19 +559,6 @@ class DelegationGrantRegistry:
                     records = self._decode(handle.read())
                     current_by_key = self._current_by_key(records)
                     candidate = self._candidate_from_grant(grant, current_by_key)
-                    current = current_by_key.get(_grant_key(candidate))
-                    if current is not None and current.grant_fingerprint == candidate.grant_fingerprint:
-                        return self._materialize(
-                            current,
-                            current_by_key,
-                            now,
-                            strict_identity=False,
-                        )
-                    if current is not None:
-                        raise DelegationGrantConflictError(
-                            f"grant already exists: {grant.grant_id!r} in domain {grant.domain_id!r} mission {grant.mission_id!r}",
-                        )
-
                     self._domain_status(
                         grant.domain_id,
                         strict=True,
@@ -570,7 +576,6 @@ class DelegationGrantRegistry:
                         strict=True,
                         cache={},
                     )
-
                     if grant.parent_grant_id is not None:
                         parent_key = (grant.domain_id, grant.mission_id, grant.parent_grant_id)
                         parent = current_by_key.get(parent_key)
@@ -607,6 +612,18 @@ class DelegationGrantRegistry:
                             raise DelegationGrantLifecycleError(
                                 "child grant timing widens the parent grant",
                             )
+                    current = current_by_key.get(_grant_key(candidate))
+                    if current is not None and current.grant_fingerprint == candidate.grant_fingerprint:
+                        return self._materialize(
+                            current,
+                            current_by_key,
+                            now,
+                            strict_identity=False,
+                        )
+                    if current is not None:
+                        raise DelegationGrantConflictError(
+                            f"grant already exists: {grant.grant_id!r} in domain {grant.domain_id!r} mission {grant.mission_id!r}",
+                        )
 
                     payload = self._register_payload(candidate)
                     record = self._append_record(records, payload)

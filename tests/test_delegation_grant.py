@@ -107,3 +107,25 @@ def test_authoritative_grant_status_tracks_expiry_and_revocation() -> None:
 
     assert revoked.current_status(NOW) is DelegationGrantStatus.REVOKED
     assert not revoked.is_active(NOW)
+
+
+def test_authoritative_grant_respects_effective_window() -> None:
+    grant = AuthoritativeDelegationGrant(
+        grant_id="grant-3",
+        domain_id="domain-1",
+        mission_id="mission-1",
+        grantor_identity="agent-1",
+        grantee_identity="agent-2",
+        authority_scope=("read",),
+        parent_grant_id=None,
+        parent_grant_fingerprint=None,
+        created_at=NOW,
+        effective_at=NOW + timedelta(minutes=5),
+        expires_at=NOW + timedelta(minutes=10),
+        status=DelegationGrantStatus.ACTIVE,
+        grant_fingerprint="f" * 64,
+    )
+
+    assert grant.current_status(NOW) is DelegationGrantStatus.PENDING
+    assert not grant.is_active(NOW)
+    assert grant.current_status(NOW + timedelta(minutes=6)) is DelegationGrantStatus.ACTIVE
