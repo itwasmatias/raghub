@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from federation.dispatch_offer import DispatchStatus
 from federation.task_dispatcher import DispatchOfferNotFoundError
+from federation.subprocess_environment import build_subprocess_environment
 from tools.ai_controller.operations_api.serialization import scrub_sensitive_text
 
 from .actions import ActionCatalog, ActionType, execution_fingerprint
@@ -59,6 +60,7 @@ def _run_bounded(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         pass_fds=pass_fds,
+        env=build_subprocess_environment(),
     )
 
     stdout_data = io.BytesIO()

@@ -6,6 +6,11 @@ import subprocess
 from pathlib import Path
 from typing import Sequence
 
+from federation.subprocess_environment import (
+    build_subprocess_environment,
+    subprocess_environment_assignments,
+)
+
 from .models import ProcessResult, utc_now
 
 
@@ -19,6 +24,7 @@ class LocalRunner:
         timeout_seconds: float = 600,
     ) -> ProcessResult:
         started = utc_now()
+        environment = build_subprocess_environment()
         try:
             completed = subprocess.run(
                 list(argv),
@@ -28,6 +34,7 @@ class LocalRunner:
                 text=True,
                 timeout=timeout_seconds,
                 check=False,
+                env=environment,
             )
             return ProcessResult(
                 list(argv), str(cwd), completed.returncode, completed.stdout,
@@ -69,9 +76,15 @@ class SSHRunner:
         input_text: str | None = None,
         timeout_seconds: float = 600,
     ) -> ProcessResult:
+        environment = build_subprocess_environment()
         payload = base64.b64encode(
             json.dumps(
-                {"argv": list(argv), "cwd": str(cwd), "stdin": input_text},
+                {
+                    "argv": list(argv),
+                    "cwd": str(cwd),
+                    "environment": environment,
+                    "stdin": input_text,
+                },
                 ensure_ascii=False,
             ).encode("utf-8")
         ).decode("ascii")
@@ -80,7 +93,7 @@ class SSHRunner:
             f"p=json.loads(base64.b64decode({payload!r}).decode('utf-8'))\n"
             "try:\n"
             " r=subprocess.run(p['argv'],cwd=p['cwd'],input=p['stdin'],text=True,"
-            "capture_output=True,check=False)\n"
+            "capture_output=True,check=False,env=p['environment'])\n"
             " d={'exit_code':r.returncode,'stdout':r.stdout,'stderr':r.stderr}\n"
             "except OSError as e:\n"
             " d={'exit_code':None,'stdout':'','stderr':str(e)}\n"
@@ -95,6 +108,9 @@ class SSHRunner:
                 "-o",
                 "BatchMode=yes",
                 self.host,
+                "/usr/bin/env",
+                "-i",
+                *subprocess_environment_assignments(environment),
                 self.remote_python,
                 "-",
             ],

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +11,29 @@ import pytest
 from tools.ai_controller.models import Task
 from tools.ai_controller.providers.codex import classify
 from tools.ai_controller.remote import LocalRunner, SSHRunner
+
+
+SECRET_NAMES = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AZURE_CLIENT_SECRET",
+    "DB_PASSWORD",
+    "DATABASE_URL",
+    "RAGHUB_CONTROLLER_TOKENS",
+    "RAGHUB_INTEGRITY_KEY",
+)
+
+SAFE_NAMES = ("HOME", "LANG", "LC_ALL", "PATH", "TMPDIR")
+
+CHILD_ENV_PROBE = (
+    "import json, os, sys\n"
+    "names = sys.argv[1:]\n"
+    "print(json.dumps({name: os.environ.get(name) for name in names}, sort_keys=True))\n"
+)
 
 
 def test_task_json_round_trip_preserves_prompt_and_path_characters():
@@ -84,6 +108,31 @@ def test_local_runner_preserves_stdin_and_argument_boundaries(tmp_path):
     assert payload["stdin"] == prompt
 
 
+def test_local_runner_contains_ambient_environment(tmp_path, monkeypatch):
+    synthetic = {name: f"synthetic-{index}" for index, name in enumerate(SECRET_NAMES, start=1)}
+    for name, value in synthetic.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("PATH", "/tmp/evil/bin")
+
+    result = LocalRunner().run(
+        [sys.executable, "-c", CHILD_ENV_PROBE, *SECRET_NAMES, *SAFE_NAMES],
+        cwd=tmp_path,
+        timeout_seconds=5,
+    )
+    payload = json.loads(result.stdout)
+
+    assert result.exit_code == 0
+    assert all(payload[name] is None for name in SECRET_NAMES)
+    assert payload["PATH"] == "/usr/bin:/bin"
+    assert payload["HOME"] == "/"
+    assert payload["LANG"] == "C.UTF-8"
+    assert payload["LC_ALL"] == "C.UTF-8"
+    assert payload["TMPDIR"] == "/tmp"
+    assert os.environ["PATH"] == "/tmp/evil/bin"
+    for name, value in synthetic.items():
+        assert os.environ[name] == value
+
+
 def test_ssh_transport_round_trip_does_not_truncate_first_character(tmp_path):
     capture = tmp_path / "capture.json"
     fake_ssh = tmp_path / "fake ssh.py"
@@ -123,6 +172,72 @@ def test_ssh_transport_round_trip_does_not_truncate_first_character(tmp_path):
     assert json.loads(capture.read_text(encoding="utf-8"))["script"].startswith(
         "import base64"
     )
+
+
+def test_ssh_transport_contains_local_and_remote_environment(tmp_path, monkeypatch):
+    capture = tmp_path / "capture.json"
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import json, os, sys\n"
+        "names = sys.argv[1:]\n"
+        "print(json.dumps({name: os.environ.get(name) for name in names}, sort_keys=True))\n",
+        encoding="utf-8",
+    )
+    fake_ssh = tmp_path / "fake ssh.py"
+    fake_ssh.write_text(
+        "import json,os,subprocess,sys\n"
+        "capture=sys.argv[1]\n"
+        "script=sys.stdin.read()\n"
+        "with open(capture,'w',encoding='utf-8') as handle:\n"
+        " json.dump({'ssh_argv':sys.argv[2:], 'script':script, 'ssh_env':dict(os.environ)}, handle, ensure_ascii=False)\n"
+        "raise SystemExit(subprocess.run([sys.executable,'-'],input=script,text=True).returncode)\n",
+        encoding="utf-8",
+    )
+    ssh_wrapper = tmp_path / "ssh-wrapper"
+    ssh_wrapper.write_text(
+        f"#!/bin/sh\nexec '{sys.executable}' '{fake_ssh}' '{capture}' \"$@\"\n",
+        encoding="utf-8",
+    )
+    ssh_wrapper.chmod(0o755)
+    synthetic = {name: f"synthetic-{index}" for index, name in enumerate(SECRET_NAMES, start=1)}
+    for name, value in synthetic.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("PATH", "/tmp/evil/bin")
+    runner = SSHRunner(
+        ssh_executable=str(ssh_wrapper),
+        host="matias@100.93.102.93",
+        key_path="C:\\Users\\mr\\.ssh\\id_ed25519_raghub_operator",
+        remote_python=sys.executable,
+    )
+
+    result = runner.run(
+        [sys.executable, str(child), *SECRET_NAMES, *SAFE_NAMES],
+        cwd=tmp_path,
+        input_text=None,
+        timeout_seconds=10,
+    )
+
+    capture_payload = json.loads(capture.read_text(encoding="utf-8"))
+    remote_payload = json.loads(result.stdout)
+
+    assert result.exit_code == 0
+    assert capture_payload["ssh_argv"][4:7] == [runner.host, "/usr/bin/env", "-i"]
+    assert capture_payload["ssh_argv"][-2:] == [sys.executable, "-"]
+    assert all(capture_payload["ssh_env"].get(name) is None for name in SECRET_NAMES)
+    assert capture_payload["ssh_env"]["PATH"] == "/usr/bin:/bin"
+    assert capture_payload["ssh_env"]["HOME"] == "/"
+    assert capture_payload["ssh_env"]["LANG"] == "C.UTF-8"
+    assert capture_payload["ssh_env"]["LC_ALL"] == "C.UTF-8"
+    assert capture_payload["ssh_env"]["TMPDIR"] == "/tmp"
+    assert all(remote_payload[name] is None for name in SECRET_NAMES)
+    assert remote_payload["PATH"] == "/usr/bin:/bin"
+    assert remote_payload["HOME"] == "/"
+    assert remote_payload["LANG"] == "C.UTF-8"
+    assert remote_payload["LC_ALL"] == "C.UTF-8"
+    assert remote_payload["TMPDIR"] == "/tmp"
+    assert os.environ["PATH"] == "/tmp/evil/bin"
+    for name, value in synthetic.items():
+        assert os.environ[name] == value
 
 
 def test_runner_timeout_is_explicit(tmp_path):

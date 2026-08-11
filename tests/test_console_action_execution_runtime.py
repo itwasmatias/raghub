@@ -25,6 +25,29 @@ from test_console_server import (  # noqa: F401
 )
 
 
+SECRET_NAMES = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AZURE_CLIENT_SECRET",
+    "DB_PASSWORD",
+    "DATABASE_URL",
+    "RAGHUB_CONTROLLER_TOKENS",
+    "RAGHUB_INTEGRITY_KEY",
+)
+
+SAFE_NAMES = ("HOME", "LANG", "LC_ALL", "PATH", "TMPDIR")
+
+CHILD_ENV_PROBE = (
+    "import json, os, sys\n"
+    "names = sys.argv[1:]\n"
+    "print(json.dumps({name: os.environ.get(name) for name in names}, sort_keys=True))\n"
+)
+
+
 class FakeRunner:
     def __init__(self, *, returncode=0, stdout=" M tracked.py\n", stderr=""):
         self.returncode = returncode
@@ -517,6 +540,38 @@ def test_default_runner_drains_large_stdout_and_stderr_with_fixed_memory_bound()
     assert len(result.stderr) <= maximum
     assert result.stdout_truncated is True
     assert result.stderr_truncated is True
+
+
+def test_default_runner_contains_ambient_environment(tmp_path, monkeypatch):
+    synthetic = {name: f"synthetic-{index}" for index, name in enumerate(SECRET_NAMES, start=1)}
+    for name, value in synthetic.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("PATH", "/tmp/evil/bin")
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        CHILD_ENV_PROBE,
+        encoding="utf-8",
+    )
+
+    result = _run_bounded(
+        [sys.executable, str(probe), *SECRET_NAMES, *SAFE_NAMES],
+        cwd=tmp_path,
+        timeout=10,
+        max_output_bytes=4096,
+        pass_fds=(),
+    )
+    payload = json.loads(result.stdout.decode("utf-8"))
+
+    assert result.returncode == 0
+    assert all(payload[name] is None for name in SECRET_NAMES)
+    assert payload["PATH"] == "/usr/bin:/bin"
+    assert payload["HOME"] == "/"
+    assert payload["LANG"] == "C.UTF-8"
+    assert payload["LC_ALL"] == "C.UTF-8"
+    assert payload["TMPDIR"] == "/tmp"
+    assert os.environ["PATH"] == "/tmp/evil/bin"
+    for name, value in synthetic.items():
+        assert os.environ[name] == value
 
 
 def test_h3_missing_job_execution_fingerprint_rejects_execution(client, console):
