@@ -21,6 +21,22 @@ from federation.agent_identity_registry import (
     AgentIdentityNotFoundError,
     DurableAgentIdentityRegistry,
 )
+from federation.delegation_grant import (
+    AuthoritativeDelegationGrant,
+    DelegationGrant,
+    DelegationGrantStatus,
+)
+from federation.delegation_grant_registry import (
+    DelegationGrantConflictError,
+    DelegationGrantCorruptionError,
+    DelegationGrantDomainError,
+    DelegationGrantError,
+    DelegationGrantIdentityError,
+    DelegationGrantLifecycleError,
+    DelegationGrantNotFoundError,
+    DelegationGrantRegistry,
+    DelegationGrantScopeError,
+)
 from federation.assignment_registry import (
     AssignmentConflictError,
     AssignmentCorruptionError,
@@ -156,6 +172,18 @@ __all__ = [
     "AgentIdentityLifecycleError",
     "AgentIdentityNotFoundError",
     "DurableAgentIdentityRegistry",
+    "AuthoritativeDelegationGrant",
+    "DelegationGrant",
+    "DelegationGrantStatus",
+    "DelegationGrantConflictError",
+    "DelegationGrantCorruptionError",
+    "DelegationGrantDomainError",
+    "DelegationGrantError",
+    "DelegationGrantIdentityError",
+    "DelegationGrantLifecycleError",
+    "DelegationGrantNotFoundError",
+    "DelegationGrantRegistry",
+    "DelegationGrantScopeError",
     "Heartbeat",
     "HeartbeatError",
     "HeartbeatAuthenticationError",
