@@ -249,3 +249,93 @@ def test_control_domain_with_all_lifecycles():
             lifecycle=lifecycle,
         )
         assert domain.lifecycle == lifecycle
+
+
+def test_control_domain_rejects_whitespace_only_domain_id():
+    """Test that whitespace-only domain_id raises error."""
+    with pytest.raises(ValueError, match="domain_id"):
+        ControlDomain(
+            domain_id="   ",
+            name="Test Org",
+            owner="admin",
+        )
+
+
+def test_control_domain_rejects_whitespace_only_name():
+    """Test that whitespace-only name raises error."""
+    with pytest.raises(ValueError, match="name"):
+        ControlDomain(
+            domain_id="test-domain",
+            name="   ",
+            owner="admin",
+        )
+
+
+def test_control_domain_rejects_whitespace_only_owner():
+    """Test that whitespace-only owner raises error."""
+    with pytest.raises(ValueError, match="owner"):
+        ControlDomain(
+            domain_id="test-domain",
+            name="Test Org",
+            owner="   ",
+        )
+
+
+def test_control_domain_rejects_excessively_long_domain_id():
+    """Test that domain_id exceeding 255 characters raises error."""
+    with pytest.raises(ValueError, match="exceeds"):
+        ControlDomain(
+            domain_id="x" * 256,
+            name="Test Org",
+            owner="admin",
+        )
+
+
+def test_control_domain_rejects_excessively_long_name():
+    """Test that name exceeding 1024 characters raises error."""
+    with pytest.raises(ValueError, match="exceeds"):
+        ControlDomain(
+            domain_id="test-domain",
+            name="x" * 1025,
+            owner="admin",
+        )
+
+
+def test_control_domain_rejects_excessively_long_owner():
+    """Test that owner exceeding 512 characters raises error."""
+    with pytest.raises(ValueError, match="exceeds"):
+        ControlDomain(
+            domain_id="test-domain",
+            name="Test Org",
+            owner="x" * 513,
+        )
+
+
+def test_control_domain_rejects_null_bytes_in_domain_id():
+    """Test that NULL bytes in domain_id raise error."""
+    with pytest.raises(ValueError, match="NULL"):
+        ControlDomain(
+            domain_id="test\x00hidden",
+            name="Test Org",
+            owner="admin",
+        )
+
+
+def test_control_domain_rejects_null_bytes_in_name():
+    """Test that NULL bytes in name raise error."""
+    with pytest.raises(ValueError, match="NULL"):
+        ControlDomain(
+            domain_id="test-domain",
+            name="Test\x00Org",
+            owner="admin",
+        )
+
+
+def test_control_domain_rejects_null_bytes_in_owner():
+    """Test that NULL bytes in owner raise error."""
+    with pytest.raises(ValueError, match="NULL"):
+        ControlDomain(
+            domain_id="test-domain",
+            name="Test Org",
+            owner="admin\x00",
+        )

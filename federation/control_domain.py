@@ -53,12 +53,34 @@ class ControlDomain:
 
     def __post_init__(self) -> None:
         """Validate control domain fields."""
-        if not self.domain_id or not isinstance(self.domain_id, str):
+        # Maximum field lengths
+        MAX_DOMAIN_ID_LENGTH = 255
+        MAX_NAME_LENGTH = 1024
+        MAX_OWNER_LENGTH = 512
+
+        # Validate domain_id
+        if not isinstance(self.domain_id, str) or not self.domain_id.strip():
             raise ValueError("domain_id must be a non-empty string")
-        if not self.name or not isinstance(self.name, str):
+        if len(self.domain_id) > MAX_DOMAIN_ID_LENGTH:
+            raise ValueError(f"domain_id exceeds {MAX_DOMAIN_ID_LENGTH} characters")
+        if "\x00" in self.domain_id:
+            raise ValueError("domain_id must not contain NULL bytes")
+
+        # Validate name
+        if not isinstance(self.name, str) or not self.name.strip():
             raise ValueError("name must be a non-empty string")
-        if not self.owner or not isinstance(self.owner, str):
+        if len(self.name) > MAX_NAME_LENGTH:
+            raise ValueError(f"name exceeds {MAX_NAME_LENGTH} characters")
+        if "\x00" in self.name:
+            raise ValueError("name must not contain NULL bytes")
+
+        # Validate owner
+        if not isinstance(self.owner, str) or not self.owner.strip():
             raise ValueError("owner must be a non-empty string")
+        if len(self.owner) > MAX_OWNER_LENGTH:
+            raise ValueError(f"owner exceeds {MAX_OWNER_LENGTH} characters")
+        if "\x00" in self.owner:
+            raise ValueError("owner must not contain NULL bytes")
 
         if not isinstance(self.lifecycle, DomainLifecycle):
             if not isinstance(self.lifecycle, str):
