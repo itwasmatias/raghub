@@ -702,7 +702,10 @@ class DelegationGrantRegistry:
                         domain_cache={},
                         visiting=set(),
                     )
-                    if current_status is not DelegationGrantStatus.ACTIVE:
+                    if current_status not in {
+                        DelegationGrantStatus.ACTIVE,
+                        DelegationGrantStatus.PENDING,
+                    }:
                         raise DelegationGrantLifecycleError(
                             "grant is not active",
                         )

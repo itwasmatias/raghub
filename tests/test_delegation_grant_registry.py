@@ -344,6 +344,38 @@ def test_revoke_is_non_widening_and_idempotent(grant_registry):
         )
 
 
+def test_future_effective_grant_can_be_revoked_before_effective(
+    grant_clock,
+    grant_registry,
+):
+    grant_registry.register(
+        _grant(
+            grant_id="grant-scheduled",
+            effective_at=NOW + timedelta(minutes=5),
+            expires_at=NOW + timedelta(minutes=15),
+        )
+    )
+
+    revoked = grant_registry.revoke(
+        "grant-scheduled",
+        domain_id="domain-a",
+        mission_id="mission-a",
+        reason="cancelled-before-effective",
+    )
+
+    assert revoked.status is DelegationGrantStatus.REVOKED
+    assert not revoked.is_active()
+    assert revoked.revocation_reason == "cancelled-before-effective"
+    assert (
+        grant_registry.get(
+            "grant-scheduled",
+            domain_id="domain-a",
+            mission_id="mission-a",
+        ).status
+        is DelegationGrantStatus.REVOKED
+    )
+
+
 def test_expiration_handling(grant_clock, grant_registry):
     grant_registry.register(
         _grant(
