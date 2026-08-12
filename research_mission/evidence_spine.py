@@ -864,6 +864,121 @@ def worker_attempt_record(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class TerminalEffectDecisionEvidence:
+    """Terminal effect decision evidence for conservative disposition.
+
+    Records authoritative operator, escalation, or policy decisions to
+    conservatively dispose of permanently indeterminate effects as
+    ASSUMED_CONSUMED_UNRECONCILED.
+
+    This is the ONLY valid source for terminal conservative dispositions.
+    """
+    decision_id: str
+    decision_type: str  # "assume_consumed_unreconciled"
+    decision_kind: str  # "operator_decision", "escalation_decision", "policy_decision"
+    effect_intent_id: str
+    reservation_id: str | None
+    obligation_id: str | None
+    dispatch_id: str | None
+    disposition: str  # "assumed_consumed_unreconciled"
+    decided_at: datetime
+    mission_id: str | None
+    task_id: str | None
+    domain_id: str | None
+    decision_rationale: str
+
+    def __post_init__(self) -> None:
+        for field_name in ("decision_id", "decision_type", "decision_kind", "disposition", "decision_rationale"):
+            object.__setattr__(self, field_name, _require_text(getattr(self, field_name), field_name))
+
+        object.__setattr__(self, "effect_intent_id", _require_text(self.effect_intent_id, "effect_intent_id"))
+
+        if self.decision_type != "assume_consumed_unreconciled":
+            raise ValueError(f"decision_type must be 'assume_consumed_unreconciled', got {self.decision_type!r}")
+
+        if self.decision_kind not in ("operator_decision", "escalation_decision", "policy_decision"):
+            raise ValueError(
+                f"decision_kind must be 'operator_decision', 'escalation_decision', or 'policy_decision', "
+                f"got {self.decision_kind!r}"
+            )
+
+        if self.disposition != "assumed_consumed_unreconciled":
+            raise ValueError(f"disposition must be 'assumed_consumed_unreconciled', got {self.disposition!r}")
+
+        # At least one of reservation_id or obligation_id must be present
+        if self.reservation_id is None and self.obligation_id is None:
+            raise ValueError("At least one of reservation_id or obligation_id must be provided")
+
+        for field_name in ("reservation_id", "obligation_id", "dispatch_id", "mission_id", "task_id", "domain_id"):
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(self, field_name, _require_text(value, field_name))
+
+        object.__setattr__(self, "decided_at", _require_timestamp(self.decided_at, "decided_at"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "decision_id": self.decision_id,
+            "decision_type": self.decision_type,
+            "decision_kind": self.decision_kind,
+            "effect_intent_id": self.effect_intent_id,
+            "reservation_id": self.reservation_id,
+            "obligation_id": self.obligation_id,
+            "dispatch_id": self.dispatch_id,
+            "disposition": self.disposition,
+            "decided_at": self.decided_at.isoformat(),
+            "mission_id": self.mission_id,
+            "task_id": self.task_id,
+            "domain_id": self.domain_id,
+            "decision_rationale": self.decision_rationale,
+        }
+
+
+def terminal_effect_decision_record(
+    evidence: TerminalEffectDecisionEvidence,
+    *,
+    source_revision: str | None = None,
+) -> EvidenceRecord:
+    """Convert terminal effect decision evidence to spine record."""
+    if type(evidence) is not TerminalEffectDecisionEvidence:
+        raise TypeError("evidence must be a TerminalEffectDecisionEvidence")
+
+    source_revision = source_revision or evidence.decision_id
+    payload = evidence.to_dict()
+    payload["source_revision"] = source_revision
+    normalized_payload = _normalize_json(payload)
+
+    reference = EvidenceReference(
+        source_revision=source_revision,
+        fingerprint=_fingerprint(normalized_payload),
+        observed_at=evidence.decided_at,
+        summary=f"{evidence.decision_kind}: {evidence.decision_type}",
+        reference=evidence.decision_id,
+    )
+
+    return EvidenceRecord(
+        key=EvidenceCorrelationKey(
+            source=f"terminal_effect_decision_{evidence.decision_kind}",
+            record_id=evidence.decision_id,
+            mission_id=evidence.mission_id,
+            task_id=evidence.task_id,
+            domain_id=evidence.domain_id,
+        ),
+        reference=reference,
+        payload=payload,
+        metadata={
+            "decision_type": evidence.decision_type,
+            "decision_kind": evidence.decision_kind,
+            "effect_intent_id": evidence.effect_intent_id,
+            "reservation_id": evidence.reservation_id,
+            "obligation_id": evidence.obligation_id,
+            "dispatch_id": evidence.dispatch_id,
+            "disposition": evidence.disposition,
+        },
+    )
+
+
 __all__ = [
     "SCHEMA_VERSION",
     "EvidenceChain",
@@ -877,11 +992,13 @@ __all__ = [
     "EvidenceSpineCorruptionError",
     "EvidenceSpineError",
     "ProviderBoundaryReconciliationEvidence",
+    "TerminalEffectDecisionEvidence",
     "approval_records",
     "checkpoint_record",
     "event_records",
     "provider_boundary_reconciliation_record",
     "recovery_record",
     "research_evidence_record",
+    "terminal_effect_decision_record",
     "worker_attempt_record",
 ]

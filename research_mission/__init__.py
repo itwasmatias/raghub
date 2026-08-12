@@ -91,12 +91,14 @@ from research_mission.evidence_spine import (
     EvidenceSpineCorruptionError,
     EvidenceSpineError,
     ProviderBoundaryReconciliationEvidence,
+    TerminalEffectDecisionEvidence,
     approval_records,
     checkpoint_record,
     event_records,
     provider_boundary_reconciliation_record,
     recovery_record,
     research_evidence_record,
+    terminal_effect_decision_record,
     worker_attempt_record,
 )
 
@@ -176,11 +178,13 @@ __all__ = [
     "EvidenceSpineCorruptionError",
     "EvidenceSpineError",
     "ProviderBoundaryReconciliationEvidence",
+    "TerminalEffectDecisionEvidence",
     "approval_records",
     "checkpoint_record",
     "event_records",
     "provider_boundary_reconciliation_record",
     "recovery_record",
     "research_evidence_record",
+    "terminal_effect_decision_record",
     "worker_attempt_record",
 ]

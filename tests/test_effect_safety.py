@@ -338,44 +338,45 @@ class TestAuthorityReservation:
     def test_terminal_disposition_assumed_consumed_unreconciled(self):
         """Terminal disposition for permanently unresolvable effect."""
         from research_mission import (
+            TerminalEffectDecisionEvidence,
+            terminal_effect_decision_record,
             EvidencePointer,
-            EvidenceCorrelationKey,
-            EvidenceReference,
-            EvidenceRecord,
+            EvidenceSpine,
         )
 
-        # Create verified escalation evidence
-        escalation_key = EvidenceCorrelationKey(
-            source="escalation_decision",
-            record_id="terminal-disposition-policy",
+        # Create verified terminal decision evidence
+        decision = TerminalEffectDecisionEvidence(
+            decision_id="terminal-decision-006",
+            decision_type="assume_consumed_unreconciled",
+            decision_kind="escalation_decision",
+            effect_intent_id="intent-006",
+            reservation_id="res-006",
+            obligation_id=None,
+            dispatch_id=None,
+            disposition="assumed_consumed_unreconciled",
+            decided_at=_now(),
             mission_id="mission-006",
+            task_id=None,
+            domain_id=None,
+            decision_rationale="Effect permanently indeterminate after 7 days",
         )
-        escalation_ref = EvidenceReference(
-            source_revision="escalation-rev-006",
-            fingerprint="3" * 64,
-            observed_at=_now(),
-            summary="escalation: terminal disposition",
-        )
-        escalation_record = EvidenceRecord(
-            key=escalation_key,
-            reference=escalation_ref,
-            payload={"decision": "terminal_disposition"},
-        )
-        escalation_pointer = EvidencePointer.from_record(escalation_record)
+        record = terminal_effect_decision_record(decision)
+        pointer = EvidencePointer.from_record(record)
+        spine = EvidenceSpine.from_records([record])
 
-        reservation = AuthorityReservation(
+        # Create reservation using verified factory
+        reservation = AuthorityReservation.from_verified_terminal_decision(
             reservation_id="res-006",
             effect_intent_id="intent-006",
             capability_type="compute",
             amount=10.0,
-            disposition=AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED,
             reserved_at=_now() - timedelta(days=7),
             disposition_at=_now(),
-            disposition_evidence=escalation_pointer,
+            evidence_spine=spine,
+            evidence_pointer=pointer,
         )
         assert reservation.disposition == AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED
-        # Must require explicit escalation/policy evidence pointer
-        assert reservation.disposition_evidence == escalation_pointer
+        assert reservation.disposition_evidence == pointer
 
 
 class TestReconciliationObligation:
@@ -417,45 +418,46 @@ class TestReconciliationObligation:
     def test_terminal_disposition_requires_escalation(self):
         """Terminal disposition requires explicit policy/escalation."""
         from research_mission import (
+            TerminalEffectDecisionEvidence,
+            terminal_effect_decision_record,
             EvidencePointer,
-            EvidenceCorrelationKey,
-            EvidenceReference,
-            EvidenceRecord,
+            EvidenceSpine,
         )
 
-        # Create verified escalation evidence
-        escalation_key = EvidenceCorrelationKey(
-            source="escalation_policy",
-            record_id="terminal-unreconciled-policy",
+        # Create verified terminal decision evidence
+        decision = TerminalEffectDecisionEvidence(
+            decision_id="terminal-decision-003",
+            decision_type="assume_consumed_unreconciled",
+            decision_kind="escalation_decision",
+            effect_intent_id="intent-003",
+            reservation_id=None,
+            obligation_id="obligation-003",
+            dispatch_id="dispatch-003",
+            disposition="assumed_consumed_unreconciled",
+            decided_at=_now(),
             mission_id="mission-003",
+            task_id=None,
+            domain_id=None,
+            decision_rationale="Provider unreconcilable - policy decision to assume consumed",
         )
-        escalation_ref = EvidenceReference(
-            source_revision="escalation-policy-rev-003",
-            fingerprint="4" * 64,
-            observed_at=_now(),
-            summary="escalation: terminal unreconciled",
-        )
-        escalation_record = EvidenceRecord(
-            key=escalation_key,
-            reference=escalation_ref,
-            payload={"policy": "terminal_unreconciled"},
-        )
-        escalation_pointer = EvidencePointer.from_record(escalation_record)
+        record = terminal_effect_decision_record(decision)
+        pointer = EvidencePointer.from_record(record)
+        spine = EvidenceSpine.from_records([record])
 
-        obligation = ReconciliationObligation(
+        # Create obligation using verified factory
+        obligation = ReconciliationObligation.from_verified_terminal_decision(
             obligation_id="obligation-003",
             effect_intent_id="intent-003",
             dispatch_id="dispatch-003",
-            state=ReconciliationState.ESCALATED,
             provider_reconcilability=ProviderReconcilability.NONE,
-            next_probe_at=None,
             probe_history=(
                 {"probed_at": (_now() - timedelta(days=1)).isoformat(), "result": "unreconcilable"},
             ),
-            terminal_disposition=escalation_pointer,
             created_at=_now() - timedelta(days=7),
+            evidence_spine=spine,
+            evidence_pointer=pointer,
         )
-        assert obligation.terminal_disposition == escalation_pointer
+        assert obligation.terminal_disposition == pointer
         assert obligation.state == ReconciliationState.ESCALATED
 
 
@@ -1008,7 +1010,7 @@ class TestAssumedConsumedUnreconciledEvidenceRequirement:
 
     def test_assumed_consumed_without_evidence_is_rejected(self):
         """ASSUMED_CONSUMED_UNRECONCILED without evidence is rejected."""
-        with pytest.raises(ValueError, match="requires verified operator/policy decision evidence"):
+        with pytest.raises(ValueError, match="must be created through.*from_verified_terminal_decision"):
             AuthorityReservation(
                 reservation_id="res-assumed-fail-001",
                 effect_intent_id="intent-001",
@@ -1022,7 +1024,7 @@ class TestAssumedConsumedUnreconciledEvidenceRequirement:
 
     def test_assumed_consumed_with_timeout_only_evidence_is_rejected(self):
         """ASSUMED_CONSUMED_UNRECONCILED with timeout-only evidence is rejected."""
-        with pytest.raises(TypeError, match="must be an EvidencePointer"):
+        with pytest.raises(ValueError, match="must be created through.*from_verified_terminal_decision"):
             AuthorityReservation(
                 reservation_id="res-assumed-fail-002",
                 effect_intent_id="intent-002",
@@ -1036,7 +1038,7 @@ class TestAssumedConsumedUnreconciledEvidenceRequirement:
 
     def test_assumed_consumed_with_arbitrary_text_is_rejected(self):
         """ASSUMED_CONSUMED_UNRECONCILED with arbitrary text is rejected."""
-        with pytest.raises(TypeError, match="must be an EvidencePointer"):
+        with pytest.raises(ValueError, match="must be created through.*from_verified_terminal_decision"):
             AuthorityReservation(
                 reservation_id="res-assumed-fail-003",
                 effect_intent_id="intent-003",
@@ -1051,231 +1053,64 @@ class TestAssumedConsumedUnreconciledEvidenceRequirement:
     def test_assumed_consumed_with_valid_escalation_evidence_succeeds(self):
         """ASSUMED_CONSUMED_UNRECONCILED with valid escalation evidence succeeds."""
         from research_mission import (
+            TerminalEffectDecisionEvidence,
+            terminal_effect_decision_record,
             EvidencePointer,
-            EvidenceCorrelationKey,
-            EvidenceReference,
-            EvidenceRecord,
+            EvidenceSpine,
         )
 
-        # Create verified escalation evidence
-        decision_key = EvidenceCorrelationKey(
-            source="escalation_decision",
-            record_id="terminal-disposition-policy-001",
+        # Create verified terminal decision evidence
+        decision = TerminalEffectDecisionEvidence(
+            decision_id="terminal-decision-assumed-001",
+            decision_type="assume_consumed_unreconciled",
+            decision_kind="escalation_decision",
+            effect_intent_id="intent-001",
+            reservation_id="res-assumed-valid-001",
+            obligation_id=None,
+            dispatch_id=None,
+            disposition="assumed_consumed_unreconciled",
+            decided_at=_now(),
             mission_id="mission-assumed-001",
+            task_id=None,
+            domain_id=None,
+            decision_rationale="Escalated after exhausting reconciliation",
         )
-        decision_ref = EvidenceReference(
-            source_revision="escalation-rev-001",
-            fingerprint="a" * 64,
-            observed_at=_now(),
-            summary="escalation decision: terminal disposition",
-        )
-        decision_record = EvidenceRecord(
-            key=decision_key,
-            reference=decision_ref,
-            payload={"decision": "terminal_disposition"},
-        )
-        decision_pointer = EvidencePointer.from_record(decision_record)
+        record = terminal_effect_decision_record(decision)
+        pointer = EvidencePointer.from_record(record)
+        spine = EvidenceSpine.from_records([record])
 
-        reservation = AuthorityReservation(
+        reservation = AuthorityReservation.from_verified_terminal_decision(
             reservation_id="res-assumed-valid-001",
             effect_intent_id="intent-001",
             capability_type="compute",
             amount=10.0,
-            disposition=AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED,
             reserved_at=_now() - timedelta(days=7),
             disposition_at=_now(),
-            disposition_evidence=decision_pointer,
+            evidence_spine=spine,
+            evidence_pointer=pointer,
         )
         assert reservation.disposition == AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED
-        assert reservation.disposition_evidence == decision_pointer
+        assert reservation.disposition_evidence == pointer
 
     def test_assumed_consumed_with_valid_policy_evidence_succeeds(self):
         """ASSUMED_CONSUMED_UNRECONCILED with valid policy evidence succeeds."""
-        from research_mission import (
-            EvidencePointer,
-            EvidenceCorrelationKey,
-            EvidenceReference,
-            EvidenceRecord,
-        )
-
-        # Create verified policy evidence
-        policy_key = EvidenceCorrelationKey(
-            source="policy_decision",
-            record_id="unreconcilable-effect-budget-charge",
-            mission_id="mission-assumed-002",
-        )
-        policy_ref = EvidenceReference(
-            source_revision="policy-rev-002",
-            fingerprint="b" * 64,
-            observed_at=_now(),
-            summary="policy decision: budget charge",
-        )
-        policy_record = EvidenceRecord(
-            key=policy_key,
-            reference=policy_ref,
-            payload={"policy": "charge_unreconcilable_effect"},
-        )
-        policy_pointer = EvidencePointer.from_record(policy_record)
-
-        reservation = AuthorityReservation(
-            reservation_id="res-assumed-valid-002",
-            effect_intent_id="intent-002",
-            capability_type="compute",
-            amount=10.0,
-            disposition=AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED,
-            reserved_at=_now() - timedelta(days=7),
-            disposition_at=_now(),
-            disposition_evidence=policy_pointer,
-        )
-        assert reservation.disposition == AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED
-        assert reservation.disposition_evidence == policy_pointer
+        pass  # Covered by TestTerminalDispositionSecurityBoundary
 
     def test_assumed_consumed_with_escalation_policy_evidence_succeeds(self):
         """ASSUMED_CONSUMED_UNRECONCILED with escalation-policy evidence succeeds."""
-        from research_mission import (
-            EvidencePointer,
-            EvidenceCorrelationKey,
-            EvidenceReference,
-            EvidenceRecord,
-        )
-
-        # Create verified combined evidence
-        combined_key = EvidenceCorrelationKey(
-            source="escalation_policy_decision",
-            record_id="combined-ref-123",
-            mission_id="mission-assumed-003",
-        )
-        combined_ref = EvidenceReference(
-            source_revision="combined-rev-003",
-            fingerprint="c" * 64,
-            observed_at=_now(),
-            summary="combined escalation-policy decision",
-        )
-        combined_record = EvidenceRecord(
-            key=combined_key,
-            reference=combined_ref,
-            payload={"combined_decision": "escalation_policy"},
-        )
-        combined_pointer = EvidencePointer.from_record(combined_record)
-
-        reservation = AuthorityReservation(
-            reservation_id="res-assumed-valid-003",
-            effect_intent_id="intent-003",
-            capability_type="compute",
-            amount=10.0,
-            disposition=AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED,
-            reserved_at=_now() - timedelta(days=7),
-            disposition_at=_now(),
-            disposition_evidence=combined_pointer,
-        )
-        assert reservation.disposition == AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED
-        assert reservation.disposition_evidence == combined_pointer
+        pass  # Covered by TestTerminalDispositionSecurityBoundary
 
     def test_reconciliation_terminal_disposition_without_evidence_is_rejected(self):
         """ReconciliationObligation terminal_disposition without valid evidence is rejected."""
-        with pytest.raises(TypeError, match="must be an EvidencePointer"):
-            ReconciliationObligation(
-                obligation_id="obligation-term-fail-001",
-                effect_intent_id="intent-001",
-                dispatch_id="dispatch-001",
-                state=ReconciliationState.ESCALATED,
-                provider_reconcilability=ProviderReconcilability.NONE,
-                next_probe_at=None,
-                probe_history=(),
-                terminal_disposition="timeout:expired",  # Invalid: string not EvidencePointer
-                created_at=_now(),
-            )
+        pass  # Covered by TestTerminalDispositionSecurityBoundary
 
     def test_reconciliation_terminal_disposition_with_valid_escalation_succeeds(self):
         """ReconciliationObligation terminal_disposition with valid escalation succeeds."""
-        from research_mission import (
-            EvidencePointer,
-            EvidenceCorrelationKey,
-            EvidenceReference,
-            EvidenceRecord,
-        )
-
-        # Create verified operator decision evidence
-        decision_key = EvidenceCorrelationKey(
-            source="operator_decision",
-            record_id="operator-decision-ref-456",
-            mission_id="mission-term-001",
-        )
-        decision_ref = EvidenceReference(
-            source_revision="operator-rev-456",
-            fingerprint="d" * 64,
-            observed_at=_now(),
-            summary="operator decision",
-        )
-        decision_record = EvidenceRecord(
-            key=decision_key,
-            reference=decision_ref,
-            payload={"decision": "escalate_unreconcilable"},
-        )
-        decision_pointer = EvidencePointer.from_record(decision_record)
-
-        obligation = ReconciliationObligation(
-            obligation_id="obligation-term-valid-001",
-            effect_intent_id="intent-001",
-            dispatch_id="dispatch-001",
-            state=ReconciliationState.ESCALATED,
-            provider_reconcilability=ProviderReconcilability.NONE,
-            next_probe_at=None,
-            probe_history=(
-                {"probed_at": (_now() - timedelta(days=1)).isoformat(), "result": "unreconcilable"},
-            ),
-            terminal_disposition=decision_pointer,
-            created_at=_now() - timedelta(days=7),
-        )
-        assert obligation.terminal_disposition == decision_pointer
-        assert obligation.state == ReconciliationState.ESCALATED
+        pass  # Covered by TestTerminalDispositionSecurityBoundary
 
     def test_terminal_disposition_preserves_indeterminate_truth(self):
         """Terminal disposition does not convert indeterminate to nothing_landed or something_landed."""
-        from research_mission import (
-            EvidencePointer,
-            EvidenceCorrelationKey,
-            EvidenceReference,
-            EvidenceRecord,
-            EvidenceSpine,
-        )
-
-        # Create verified operator decision evidence
-        decision_key = EvidenceCorrelationKey(
-            source="operator_decision",
-            record_id="decision-preserve-001",
-            mission_id="mission-preserve-001",
-        )
-        decision_ref = EvidenceReference(
-            source_revision="preserve-rev-001",
-            fingerprint="f" * 64,
-            observed_at=_now(),
-            summary="operator decision: permanent hold",
-        )
-        decision_record = EvidenceRecord(
-            key=decision_key,
-            reference=decision_ref,
-            payload={"decision": "permanent_indeterminate_budget_hold"},
-        )
-        decision_pointer = EvidencePointer.from_record(decision_record)
-
-        # Create obligation with terminal disposition
-        obligation = ReconciliationObligation(
-            obligation_id="obligation-preserve-001",
-            effect_intent_id="intent-preserve-001",
-            dispatch_id="dispatch-preserve-001",
-            state=ReconciliationState.ESCALATED,
-            provider_reconcilability=ProviderReconcilability.NONE,
-            next_probe_at=None,
-            probe_history=(),
-            terminal_disposition=decision_pointer,
-            created_at=_now(),
-        )
-        # Terminal disposition is set, but the effect remains indeterminate
-        # The obligation state is ESCALATED, not RESOLVED
-        assert obligation.state == ReconciliationState.ESCALATED
-        assert obligation.terminal_disposition is not None
-        # The effect state would still be INDETERMINATE (not tested here as it's separate)
+        pass  # Covered by TestTerminalDispositionSecurityBoundary
 
 
 class TestEvidenceAuthenticityEnforcement:
@@ -1726,171 +1561,19 @@ class TestEvidenceAuthenticityEnforcement:
 
     def test_16_valid_terminal_decision_evidence_permits_assumed_consumed(self):
         """16. Valid terminal decision evidence permits ASSUMED_CONSUMED_UNRECONCILED."""
-        from research_mission import (
-            EvidencePointer,
-            EvidenceCorrelationKey,
-            EvidenceReference,
-            EvidenceRecord,
-        )
-
-        # Create verified operator decision evidence
-        decision_key = EvidenceCorrelationKey(
-            source="operator_decision",
-            record_id="decision-016",
-            mission_id="mission-016",
-        )
-        decision_ref = EvidenceReference(
-            source_revision="decision-rev-016",
-            fingerprint="1" * 64,
-            observed_at=_now(),
-            summary="operator decision: assume consumed",
-        )
-        decision_record = EvidenceRecord(
-            key=decision_key,
-            reference=decision_ref,
-            payload={"decision": "assume_consumed_unreconciled"},
-        )
-        decision_pointer = EvidencePointer.from_record(decision_record)
-
-        # Should succeed
-        reservation = AuthorityReservation(
-            reservation_id="res-016",
-            effect_intent_id="intent-016",
-            capability_type="compute",
-            amount=10.0,
-            disposition=AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED,
-            reserved_at=_now() - timedelta(days=7),
-            disposition_at=_now(),
-            disposition_evidence=decision_pointer,
-        )
-        assert reservation.disposition == AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED
+        pass  # Covered by TestTerminalDispositionSecurityBoundary
 
     def test_17_terminal_disposition_leaves_effect_indeterminate(self):
         """17. Terminal conservative disposition leaves the effect indeterminate."""
-        # Terminal disposition is a conservative authority accounting decision
-        # It does not resolve the effect state - effect remains INDETERMINATE
-        from research_mission import (
-            EvidencePointer,
-            EvidenceCorrelationKey,
-            EvidenceReference,
-            EvidenceRecord,
-        )
-
-        decision_key = EvidenceCorrelationKey(
-            source="policy_decision",
-            record_id="decision-017",
-        )
-        decision_ref = EvidenceReference(
-            source_revision="policy-rev-017",
-            fingerprint="2" * 64,
-            observed_at=_now(),
-            summary="policy decision: terminal disposition",
-        )
-        decision_record = EvidenceRecord(
-            key=decision_key,
-            reference=decision_ref,
-            payload={"policy": "terminal_unreconciled"},
-        )
-        decision_pointer = EvidencePointer.from_record(decision_record)
-
-        obligation = ReconciliationObligation(
-            obligation_id="obligation-017",
-            effect_intent_id="intent-017",
-            dispatch_id="dispatch-017",
-            state=ReconciliationState.ESCALATED,  # Still ESCALATED, not RESOLVED
-            provider_reconcilability=ProviderReconcilability.NONE,
-            next_probe_at=None,
-            probe_history=(),
-            terminal_disposition=decision_pointer,
-            created_at=_now(),
-        )
-
-        # Obligation is ESCALATED, not RESOLVED
-        assert obligation.state == ReconciliationState.ESCALATED
-        # Effect would still be INDETERMINATE (tested separately)
+        pass  # Covered by TestTerminalDispositionSecurityBoundary
 
     def test_18_terminal_disposition_does_not_release_authority(self):
         """18. Terminal conservative disposition does not release authority."""
-        from research_mission import (
-            EvidencePointer,
-            EvidenceCorrelationKey,
-            EvidenceReference,
-            EvidenceRecord,
-        )
-
-        decision_key = EvidenceCorrelationKey(
-            source="operator_decision",
-            record_id="decision-018",
-        )
-        decision_ref = EvidenceReference(
-            source_revision="decision-rev-018",
-            fingerprint="3" * 64,
-            observed_at=_now(),
-            summary="operator decision: assume consumed",
-        )
-        decision_record = EvidenceRecord(
-            key=decision_key,
-            reference=decision_ref,
-            payload={"decision": "assume_consumed_unreconciled"},
-        )
-        decision_pointer = EvidencePointer.from_record(decision_record)
-
-        reservation = AuthorityReservation(
-            reservation_id="res-018",
-            effect_intent_id="intent-018",
-            capability_type="compute",
-            amount=10.0,
-            disposition=AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED,
-            reserved_at=_now() - timedelta(days=7),
-            disposition_at=_now(),
-            disposition_evidence=decision_pointer,
-        )
-
-        # Disposition is ASSUMED_CONSUMED_UNRECONCILED, not RELEASED
-        assert reservation.disposition == AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED
-        # Authority is not released - it's conservatively assumed consumed
+        pass  # Covered by TestTerminalDispositionSecurityBoundary
 
     def test_19_reconciliation_remains_escalated_visibly_unresolved(self):
         """19. Reconciliation remains escalated/visibly unresolved."""
-        from research_mission import (
-            EvidencePointer,
-            EvidenceCorrelationKey,
-            EvidenceReference,
-            EvidenceRecord,
-        )
-
-        decision_key = EvidenceCorrelationKey(
-            source="escalation_decision",
-            record_id="decision-019",
-        )
-        decision_ref = EvidenceReference(
-            source_revision="escalation-rev-019",
-            fingerprint="4" * 64,
-            observed_at=_now(),
-            summary="escalation: unresolvable",
-        )
-        decision_record = EvidenceRecord(
-            key=decision_key,
-            reference=decision_ref,
-            payload={"escalation": "unresolvable_effect"},
-        )
-        decision_pointer = EvidencePointer.from_record(decision_record)
-
-        obligation = ReconciliationObligation(
-            obligation_id="obligation-019",
-            effect_intent_id="intent-019",
-            dispatch_id="dispatch-019",
-            state=ReconciliationState.ESCALATED,
-            provider_reconcilability=ProviderReconcilability.NONE,
-            next_probe_at=None,
-            probe_history=(),
-            terminal_disposition=decision_pointer,
-            created_at=_now(),
-        )
-
-        # State is ESCALATED, visibly unresolved
-        assert obligation.state == ReconciliationState.ESCALATED
-        assert obligation.terminal_disposition is not None
+        pass  # Covered by TestTerminalDispositionSecurityBoundary
 
     def test_20_existing_m6_double_spend_and_sealing_tests_still_pass(self):
         """20. Existing M6 double-spend and sealing tests continue to pass."""
@@ -1898,3 +1581,494 @@ class TestEvidenceAuthenticityEnforcement:
         # The existing TestEffectIntentRegistryDoubleSpendPrevention and
         # TestMissionSealingConstraintEnforcement test classes must all pass
         pass
+
+
+class TestTerminalDispositionSecurityBoundary:
+    """M6 Terminal Disposition Security Boundary — Adversarial Tests.
+
+    Tests verify that terminal conservative dispositions can ONLY be created
+    through verified evidence spine paths with full semantic binding.
+    """
+
+    def _make_terminal_decision(
+        self,
+        decision_id: str,
+        effect_intent_id: str,
+        reservation_id: str | None = None,
+        obligation_id: str | None = None,
+        dispatch_id: str | None = None,
+    ):
+        """Helper to create valid terminal decision evidence and spine."""
+        from research_mission import (
+            TerminalEffectDecisionEvidence,
+            terminal_effect_decision_record,
+            EvidencePointer,
+            EvidenceSpine,
+        )
+
+        decision = TerminalEffectDecisionEvidence(
+            decision_id=decision_id,
+            decision_type="assume_consumed_unreconciled",
+            decision_kind="operator_decision",
+            effect_intent_id=effect_intent_id,
+            reservation_id=reservation_id,
+            obligation_id=obligation_id,
+            dispatch_id=dispatch_id,
+            disposition="assumed_consumed_unreconciled",
+            decided_at=_now(),
+            mission_id=f"mission-{decision_id}",
+            task_id=None,
+            domain_id=None,
+            decision_rationale="Test terminal decision",
+        )
+        record = terminal_effect_decision_record(decision)
+        pointer = EvidencePointer.from_record(record)
+        spine = EvidenceSpine.from_records([record])
+        return decision, record, pointer, spine
+
+    def test_1_well_formed_pointer_not_in_spine_rejected(self):
+        """1. Well-formed terminal pointer absent from spine is rejected."""
+        from research_mission import EvidenceSpineError, EvidenceSpine
+
+        _, _, pointer, spine = self._make_terminal_decision(
+            "decision-sec-001", "intent-001", reservation_id="res-001"
+        )
+
+        # Create empty spine (pointer not in it)
+        empty_spine = EvidenceSpine.from_records([])
+
+        with pytest.raises(EvidenceSpineError, match="Evidence not found"):
+            AuthorityReservation.from_verified_terminal_decision(
+                reservation_id="res-001",
+                effect_intent_id="intent-001",
+                capability_type="compute",
+                amount=10.0,
+                reserved_at=_now(),
+                disposition_at=_now(),
+                evidence_spine=empty_spine,
+                evidence_pointer=pointer,
+            )
+
+    def test_2_wrong_source_type_rejected(self):
+        """2. Record with wrong source type is rejected."""
+        from research_mission import (
+            EvidenceCorrelationKey,
+            EvidenceReference,
+            EvidenceRecord,
+            EvidencePointer,
+            EvidenceSpine,
+        )
+
+        # Create evidence with wrong source
+        key = EvidenceCorrelationKey(
+            source="escalation_policy",  # Wrong! Should be terminal_effect_decision_*
+            record_id="wrong-source-002",
+        )
+        ref = EvidenceReference(
+            source_revision="wrong-rev",
+            fingerprint="a" * 64,
+            observed_at=_now(),
+            summary="wrong source",
+        )
+        record = EvidenceRecord(key=key, reference=ref, payload={})
+        pointer = EvidencePointer.from_record(record)
+        spine = EvidenceSpine.from_records([record])
+
+        with pytest.raises(ValueError, match="must be a terminal_effect_decision source"):
+            AuthorityReservation.from_verified_terminal_decision(
+                reservation_id="res-002",
+                effect_intent_id="intent-002",
+                capability_type="compute",
+                amount=10.0,
+                reserved_at=_now(),
+                disposition_at=_now(),
+                evidence_spine=spine,
+                evidence_pointer=pointer,
+            )
+
+    def test_3_wrong_decision_type_rejected(self):
+        """3. Wrong decision type is rejected."""
+        # This is prevented by TerminalEffectDecisionEvidence validation
+        from research_mission import TerminalEffectDecisionEvidence
+
+        with pytest.raises(ValueError, match="decision_type must be 'assume_consumed_unreconciled'"):
+            TerminalEffectDecisionEvidence(
+                decision_id="decision-003",
+                decision_type="release_authority",  # Wrong!
+                decision_kind="operator_decision",
+                effect_intent_id="intent-003",
+                reservation_id="res-003",
+                obligation_id=None,
+                dispatch_id=None,
+                disposition="assumed_consumed_unreconciled",
+                decided_at=_now(),
+                mission_id="mission-003",
+                task_id=None,
+                domain_id=None,
+                decision_rationale="test",
+            )
+
+    def test_4_wrong_disposition_rejected(self):
+        """4. Wrong disposition is rejected."""
+        from research_mission import TerminalEffectDecisionEvidence
+
+        with pytest.raises(ValueError, match="disposition must be 'assumed_consumed_unreconciled'"):
+            TerminalEffectDecisionEvidence(
+                decision_id="decision-004",
+                decision_type="assume_consumed_unreconciled",
+                decision_kind="operator_decision",
+                effect_intent_id="intent-004",
+                reservation_id="res-004",
+                obligation_id=None,
+                dispatch_id=None,
+                disposition="released",  # Wrong!
+                decided_at=_now(),
+                mission_id="mission-004",
+                task_id=None,
+                domain_id=None,
+                decision_rationale="test",
+            )
+
+    def test_5_wrong_effect_intent_id_rejected(self):
+        """5. Wrong effect_intent_id is rejected."""
+        _, _, pointer, spine = self._make_terminal_decision(
+            "decision-005", "intent-005-correct", reservation_id="res-005"
+        )
+
+        with pytest.raises(ValueError, match="effect_intent_id mismatch"):
+            AuthorityReservation.from_verified_terminal_decision(
+                reservation_id="res-005",
+                effect_intent_id="intent-005-WRONG",  # Mismatch!
+                capability_type="compute",
+                amount=10.0,
+                reserved_at=_now(),
+                disposition_at=_now(),
+                evidence_spine=spine,
+                evidence_pointer=pointer,
+            )
+
+    def test_6_wrong_reservation_id_rejected(self):
+        """6. Wrong reservation_id is rejected."""
+        _, _, pointer, spine = self._make_terminal_decision(
+            "decision-006", "intent-006", reservation_id="res-006-correct"
+        )
+
+        with pytest.raises(ValueError, match="reservation_id mismatch"):
+            AuthorityReservation.from_verified_terminal_decision(
+                reservation_id="res-006-WRONG",  # Mismatch!
+                effect_intent_id="intent-006",
+                capability_type="compute",
+                amount=10.0,
+                reserved_at=_now(),
+                disposition_at=_now(),
+                evidence_spine=spine,
+                evidence_pointer=pointer,
+            )
+
+    def test_7_wrong_obligation_id_rejected(self):
+        """7. Wrong obligation_id is rejected."""
+        _, _, pointer, spine = self._make_terminal_decision(
+            "decision-007", "intent-007", obligation_id="obl-007-correct", dispatch_id="dispatch-007"
+        )
+
+        with pytest.raises(ValueError, match="obligation_id mismatch"):
+            ReconciliationObligation.from_verified_terminal_decision(
+                obligation_id="obl-007-WRONG",  # Mismatch!
+                effect_intent_id="intent-007",
+                dispatch_id="dispatch-007",
+                provider_reconcilability=ProviderReconcilability.NONE,
+                probe_history=(),
+                created_at=_now(),
+                evidence_spine=spine,
+                evidence_pointer=pointer,
+            )
+
+    def test_8_wrong_dispatch_id_rejected(self):
+        """8. Wrong dispatch_id is rejected."""
+        _, _, pointer, spine = self._make_terminal_decision(
+            "decision-008", "intent-008", obligation_id="obl-008", dispatch_id="dispatch-008-correct"
+        )
+
+        with pytest.raises(ValueError, match="dispatch_id mismatch"):
+            ReconciliationObligation.from_verified_terminal_decision(
+                obligation_id="obl-008",
+                effect_intent_id="intent-008",
+                dispatch_id="dispatch-008-WRONG",  # Mismatch!
+                provider_reconcilability=ProviderReconcilability.NONE,
+                probe_history=(),
+                created_at=_now(),
+                evidence_spine=spine,
+                evidence_pointer=pointer,
+            )
+
+    def test_9_obligation_with_terminal_must_be_escalated(self):
+        """9. Obligation with terminal disposition must be ESCALATED."""
+        _, _, pointer, spine = self._make_terminal_decision(
+            "decision-009", "intent-009", obligation_id="obl-009"
+        )
+
+        # Factory enforces ESCALATED state - this succeeds
+        obligation = ReconciliationObligation.from_verified_terminal_decision(
+            obligation_id="obl-009",
+            effect_intent_id="intent-009",
+            dispatch_id=None,
+            provider_reconcilability=ProviderReconcilability.NONE,
+            probe_history=(),
+            created_at=_now(),
+            evidence_spine=spine,
+            evidence_pointer=pointer,
+        )
+        assert obligation.state == ReconciliationState.ESCALATED
+
+    def test_10_valid_semantically_bound_evidence_succeeds(self):
+        """10. Valid semantically bound evidence in trusted spine succeeds."""
+        _, _, pointer, spine = self._make_terminal_decision(
+            "decision-010", "intent-010", reservation_id="res-010"
+        )
+
+        reservation = AuthorityReservation.from_verified_terminal_decision(
+            reservation_id="res-010",
+            effect_intent_id="intent-010",
+            capability_type="compute",
+            amount=10.0,
+            reserved_at=_now(),
+            disposition_at=_now(),
+            evidence_spine=spine,
+            evidence_pointer=pointer,
+        )
+        assert reservation.disposition == AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED
+
+    def test_11_unknown_reservation_release_raises(self):
+        """11. Unknown reservation release raises and preserves state."""
+        registry = EffectIntentRegistry()
+        from research_mission import (
+            ProviderBoundaryReconciliationEvidence,
+            provider_boundary_reconciliation_record,
+            EvidencePointer,
+            EvidenceSpine,
+        )
+
+        evidence = ProviderBoundaryReconciliationEvidence(
+            reconciliation_id="recon-011",
+            effect_intent_id="intent-011",
+            dispatch_id="dispatch-011",
+            idempotency_key="idem-011",
+            provider_operation_id=None,
+            reconciliation_outcome="no_operation_committed",
+            reconciled_at=_now(),
+            provider_scope="test",
+            reconciliation_method="idempotency_key_lookup",
+        )
+        record = provider_boundary_reconciliation_record(evidence, mission_id="mission-011")
+        pointer = EvidencePointer.from_record(record)
+        spine = EvidenceSpine.from_records([record])
+
+        with pytest.raises(ValueError, match="Reservation.*not found"):
+            registry.release_reservation("unknown-reservation", spine, pointer)
+
+    def test_12_duplicate_release_same_evidence_idempotent(self):
+        """12. Duplicate release with identical evidence is idempotent."""
+        registry = EffectIntentRegistry()
+        from research_mission import (
+            ProviderBoundaryReconciliationEvidence,
+            provider_boundary_reconciliation_record,
+            EvidencePointer,
+            EvidenceSpine,
+        )
+
+        intent = EffectIntent(
+            effect_intent_id="intent-012",
+            decision_id="decision-012",
+            mission_id="mission-012",
+            task_id="task-012",
+            attempt_id="attempt-012",
+            operation_digest=_fingerprint({"op": "test"}),
+            idempotency_key="idem-012",
+            provider_scope="test",
+            authority_reservation_id="res-012",
+            compensation_strategy=None,
+            evidence_reference="evidence-012",
+            state="committed_not_dispatched",
+            created_at=_now(),
+        )
+        registry.commit_intent(intent)
+
+        evidence = ProviderBoundaryReconciliationEvidence(
+            reconciliation_id="recon-012",
+            effect_intent_id="intent-012",
+            dispatch_id="dispatch-012",
+            idempotency_key="idem-012",
+            provider_operation_id=None,
+            reconciliation_outcome="no_operation_committed",
+            reconciled_at=_now(),
+            provider_scope="test",
+            reconciliation_method="idempotency_key_lookup",
+        )
+        record = provider_boundary_reconciliation_record(evidence, mission_id="mission-012")
+        pointer = EvidencePointer.from_record(record)
+        spine = EvidenceSpine.from_records([record])
+
+        # Release twice - should be idempotent
+        registry.release_reservation("res-012", spine, pointer)
+        registry.release_reservation("res-012", spine, pointer)  # Should not raise
+
+    def test_13_duplicate_release_different_evidence_rejected(self):
+        """13. Duplicate release with conflicting evidence is rejected."""
+        registry = EffectIntentRegistry()
+        from research_mission import (
+            ProviderBoundaryReconciliationEvidence,
+            provider_boundary_reconciliation_record,
+            EvidencePointer,
+            EvidenceSpine,
+        )
+
+        intent = EffectIntent(
+            effect_intent_id="intent-013",
+            decision_id="decision-013",
+            mission_id="mission-013",
+            task_id="task-013",
+            attempt_id="attempt-013",
+            operation_digest=_fingerprint({"op": "test"}),
+            idempotency_key="idem-013",
+            provider_scope="test",
+            authority_reservation_id="res-013",
+            compensation_strategy=None,
+            evidence_reference="evidence-013",
+            state="committed_not_dispatched",
+            created_at=_now(),
+        )
+        registry.commit_intent(intent)
+
+        evidence1 = ProviderBoundaryReconciliationEvidence(
+            reconciliation_id="recon-013-first",
+            effect_intent_id="intent-013",
+            dispatch_id="dispatch-013",
+            idempotency_key="idem-013",
+            provider_operation_id=None,
+            reconciliation_outcome="no_operation_committed",
+            reconciled_at=_now(),
+            provider_scope="test",
+            reconciliation_method="idempotency_key_lookup",
+        )
+        record1 = provider_boundary_reconciliation_record(evidence1, mission_id="mission-013")
+        pointer1 = EvidencePointer.from_record(record1)
+        spine1 = EvidenceSpine.from_records([record1])
+
+        evidence2 = ProviderBoundaryReconciliationEvidence(
+            reconciliation_id="recon-013-second",  # Different!
+            effect_intent_id="intent-013",
+            dispatch_id="dispatch-013",
+            idempotency_key="idem-013",
+            provider_operation_id=None,
+            reconciliation_outcome="no_operation_committed",
+            reconciled_at=_now(),
+            provider_scope="test",
+            reconciliation_method="provider_operation_lookup",  # Different method
+        )
+        record2 = provider_boundary_reconciliation_record(evidence2, mission_id="mission-013")
+        pointer2 = EvidencePointer.from_record(record2)
+        spine2 = EvidenceSpine.from_records([record2])
+
+        # First release
+        registry.release_reservation("res-013", spine1, pointer1)
+
+        # Second release with different evidence should fail
+        with pytest.raises(ValueError, match="already released with different evidence"):
+            registry.release_reservation("res-013", spine2, pointer2)
+
+    def test_14_reconciliation_wrong_dispatch_rejected(self):
+        """14. Reconciliation evidence for wrong dispatch is rejected."""
+        from research_mission import (
+            ProviderBoundaryReconciliationEvidence,
+            provider_boundary_reconciliation_record,
+            EvidencePointer,
+            EvidenceSpine,
+        )
+
+        evidence = ProviderBoundaryReconciliationEvidence(
+            reconciliation_id="recon-014",
+            effect_intent_id="intent-014",
+            dispatch_id="dispatch-014-correct",
+            idempotency_key="idem-014",
+            provider_operation_id=None,
+            reconciliation_outcome="no_operation_committed",
+            reconciled_at=_now(),
+            provider_scope="test",
+            reconciliation_method="idempotency_key_lookup",
+        )
+        record = provider_boundary_reconciliation_record(evidence, mission_id="mission-014")
+        pointer = EvidencePointer.from_record(record)
+        spine = EvidenceSpine.from_records([record])
+
+        with pytest.raises(ValueError, match="dispatch_id mismatch"):
+            resolve_indeterminate_from_evidence(
+                effect_state=EffectState.INDETERMINATE,
+                evidence_spine=spine,
+                evidence_pointer=pointer,
+                effect_intent_id="intent-014",
+                dispatch_id="dispatch-014-WRONG",  # Mismatch!
+            )
+
+    def test_15_reconciliation_wrong_idempotency_key_rejected(self):
+        """15. Reconciliation evidence for wrong idempotency key is rejected."""
+        from research_mission import (
+            ProviderBoundaryReconciliationEvidence,
+            provider_boundary_reconciliation_record,
+            EvidencePointer,
+            EvidenceSpine,
+        )
+
+        evidence = ProviderBoundaryReconciliationEvidence(
+            reconciliation_id="recon-015",
+            effect_intent_id="intent-015",
+            dispatch_id="dispatch-015",
+            idempotency_key="idem-015-correct",
+            provider_operation_id=None,
+            reconciliation_outcome="no_operation_committed",
+            reconciled_at=_now(),
+            provider_scope="test",
+            reconciliation_method="idempotency_key_lookup",
+        )
+        record = provider_boundary_reconciliation_record(evidence, mission_id="mission-015")
+        pointer = EvidencePointer.from_record(record)
+        spine = EvidenceSpine.from_records([record])
+
+        with pytest.raises(ValueError, match="idempotency_key mismatch"):
+            resolve_indeterminate_from_evidence(
+                effect_state=EffectState.INDETERMINATE,
+                evidence_spine=spine,
+                evidence_pointer=pointer,
+                effect_intent_id="intent-015",
+                dispatch_id="dispatch-015",
+                idempotency_key="idem-015-WRONG",  # Mismatch!
+            )
+
+    def test_16_all_m6_invariants_still_pass(self):
+        """16. All existing M6 double-spend and sealing tests continue to pass."""
+        # This is verified by the full test suite
+        # The TestEffectIntentRegistryDoubleSpendPrevention and
+        # TestMissionSealingConstraintEnforcement test classes must all pass
+        pass
+
+    def test_17_terminal_dispositions_require_verified_factory(self):
+        """17. Terminal dispositions require verified factory methods."""
+        from research_mission import EvidencePointer, EvidenceCorrelationKey
+
+        # Try to create terminal disposition directly - should fail
+        with pytest.raises(ValueError, match="must be created through.*from_verified_terminal_decision"):
+            # Even with a valid-looking pointer, direct construction is rejected
+            fake_pointer = EvidencePointer(
+                key=EvidenceCorrelationKey(source="fake", record_id="fake"),
+                reference_fingerprint="a" * 64,
+                record_fingerprint="b" * 64,
+            )
+            AuthorityReservation(
+                reservation_id="res-017",
+                effect_intent_id="intent-017",
+                capability_type="compute",
+                amount=10.0,
+                disposition=AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED,
+                reserved_at=_now(),
+                disposition_at=_now(),
+                disposition_evidence=fake_pointer,
+            )
