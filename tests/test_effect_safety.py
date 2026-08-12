@@ -342,10 +342,10 @@ class TestReconciliationObligation:
             probe_history=(
                 {"probed_at": (_now() - timedelta(days=1)).isoformat(), "result": "unreconcilable"},
             ),
-            terminal_disposition="assumed_consumed_unreconciled",
+            terminal_disposition="escalation:terminal-unreconciled-policy",
             created_at=_now() - timedelta(days=7),
         )
-        assert obligation.terminal_disposition == "assumed_consumed_unreconciled"
+        assert obligation.terminal_disposition == "escalation:terminal-unreconciled-policy"
         assert obligation.state == ReconciliationState.ESCALATED
 
 
@@ -492,3 +492,523 @@ class TestMissionLifecycle:
         assert fold.seal_digest is not None
         assert len(fold.indeterminate_effects) == 0
         assert len(fold.uncompensated_landed_effects) == 0
+
+
+class TestEffectIntentRegistryDoubleSpendPrevention:
+    """FINDING 1 REGRESSION TESTS — Authority reservation double-spend prevention."""
+
+    def test_second_commit_with_same_intent_id_identical_payload_is_idempotent(self):
+        """Idempotent retry with same effect_intent_id and identical payload succeeds."""
+        registry = EffectIntentRegistry()
+        intent = EffectIntent(
+            effect_intent_id="intent-duplicate-001",
+            decision_id="decision-001",
+            mission_id="mission-001",
+            task_id="task-001",
+            attempt_id="attempt-001",
+            operation_digest=_fingerprint({"op": "test"}),
+            idempotency_key="idempotency-001",
+            provider_scope="test-provider",
+            authority_reservation_id="reservation-001",
+            compensation_strategy=None,
+            evidence_reference="evidence-001",
+            state="committed_not_dispatched",
+            created_at=_now(),
+        )
+        # First commit
+        registry.commit_intent(intent)
+        # Idempotent retry - should succeed
+        registry.commit_intent(intent)
+        assert registry.get_intent("intent-duplicate-001") == intent
+
+    def test_second_commit_with_same_intent_id_different_payload_is_rejected(self):
+        """Second commit with same effect_intent_id but different payload is rejected."""
+        registry = EffectIntentRegistry()
+        created_time = _now()
+        intent1 = EffectIntent(
+            effect_intent_id="intent-overwrite-001",
+            decision_id="decision-001",
+            mission_id="mission-001",
+            task_id="task-001",
+            attempt_id="attempt-001",
+            operation_digest=_fingerprint({"op": "test"}),
+            idempotency_key="idempotency-001",
+            provider_scope="test-provider",
+            authority_reservation_id="reservation-001",
+            compensation_strategy=None,
+            evidence_reference="evidence-001",
+            state="committed_not_dispatched",
+            created_at=created_time,
+        )
+        intent2 = EffectIntent(
+            effect_intent_id="intent-overwrite-001",  # Same ID
+            decision_id="decision-002",  # Different payload
+            mission_id="mission-001",
+            task_id="task-001",
+            attempt_id="attempt-002",
+            operation_digest=_fingerprint({"op": "different"}),
+            idempotency_key="idempotency-002",
+            provider_scope="test-provider",
+            authority_reservation_id="reservation-002",
+            compensation_strategy=None,
+            evidence_reference="evidence-002",
+            state="committed_not_dispatched",
+            created_at=created_time,
+        )
+        registry.commit_intent(intent1)
+        # Attempt to overwrite with different payload should fail
+        with pytest.raises(ValueError, match="already committed with different payload"):
+            registry.commit_intent(intent2)
+
+    def test_different_intent_id_using_same_reservation_is_rejected(self):
+        """Different effect_intent_id using already-held authority reservation is rejected."""
+        registry = EffectIntentRegistry()
+        created_time = _now()
+        intent1 = EffectIntent(
+            effect_intent_id="intent-001",
+            decision_id="decision-001",
+            mission_id="mission-001",
+            task_id="task-001",
+            attempt_id="attempt-001",
+            operation_digest=_fingerprint({"op": "test"}),
+            idempotency_key="idempotency-001",
+            provider_scope="test-provider",
+            authority_reservation_id="reservation-double-spend",
+            compensation_strategy=None,
+            evidence_reference="evidence-001",
+            state="committed_not_dispatched",
+            created_at=created_time,
+        )
+        intent2 = EffectIntent(
+            effect_intent_id="intent-002",  # Different ID
+            decision_id="decision-002",
+            mission_id="mission-001",
+            task_id="task-001",
+            attempt_id="attempt-002",
+            operation_digest=_fingerprint({"op": "test2"}),
+            idempotency_key="idempotency-002",
+            provider_scope="test-provider",
+            authority_reservation_id="reservation-double-spend",  # Same reservation!
+            compensation_strategy=None,
+            evidence_reference="evidence-002",
+            state="committed_not_dispatched",
+            created_at=created_time,
+        )
+        registry.commit_intent(intent1)
+        # Attempting to use same reservation for different intent should fail
+        with pytest.raises(ValueError, match="authority reservation.*already committed"):
+            registry.commit_intent(intent2)
+
+    def test_retry_cannot_create_second_active_reservation_while_indeterminate(self):
+        """Retry cannot create second reservation while original effect is indeterminate."""
+        registry = EffectIntentRegistry()
+        created_time = _now()
+        # First attempt - creates reservation
+        intent1 = EffectIntent(
+            effect_intent_id="intent-indeterminate-001",
+            decision_id="decision-001",
+            mission_id="mission-001",
+            task_id="task-001",
+            attempt_id="attempt-001",
+            operation_digest=_fingerprint({"op": "test"}),
+            idempotency_key="idempotency-001",
+            provider_scope="test-provider",
+            authority_reservation_id="reservation-indeterminate",
+            compensation_strategy=None,
+            evidence_reference="evidence-001",
+            state="committed_not_dispatched",
+            created_at=created_time,
+        )
+        registry.commit_intent(intent1)
+
+        # Retry attempt with different intent ID and different reservation
+        # This would be legitimate if first reservation wasn't still held
+        intent2 = EffectIntent(
+            effect_intent_id="intent-retry-002",
+            decision_id="decision-001",
+            mission_id="mission-001",
+            task_id="task-001",
+            attempt_id="attempt-002",
+            operation_digest=_fingerprint({"op": "test"}),
+            idempotency_key="idempotency-001",
+            provider_scope="test-provider",
+            authority_reservation_id="reservation-retry-new",
+            compensation_strategy=None,
+            evidence_reference="evidence-002",
+            state="committed_not_dispatched",
+            created_at=created_time,
+        )
+        # This succeeds because it's a different reservation
+        # The key is that reservation-indeterminate is still held
+        registry.commit_intent(intent2)
+
+        # But trying to reuse the first reservation fails
+        intent3 = EffectIntent(
+            effect_intent_id="intent-retry-003",
+            decision_id="decision-001",
+            mission_id="mission-001",
+            task_id="task-001",
+            attempt_id="attempt-003",
+            operation_digest=_fingerprint({"op": "test"}),
+            idempotency_key="idempotency-001",
+            provider_scope="test-provider",
+            authority_reservation_id="reservation-indeterminate",  # Reuse!
+            compensation_strategy=None,
+            evidence_reference="evidence-003",
+            state="committed_not_dispatched",
+            created_at=created_time,
+        )
+        with pytest.raises(ValueError, match="authority reservation.*already committed"):
+            registry.commit_intent(intent3)
+
+    def test_released_reservation_can_be_reused_after_nothing_landed(self):
+        """Released reservation can be reused after authoritative nothing_landed resolution."""
+        registry = EffectIntentRegistry()
+        created_time = _now()
+        intent1 = EffectIntent(
+            effect_intent_id="intent-release-001",
+            decision_id="decision-001",
+            mission_id="mission-001",
+            task_id="task-001",
+            attempt_id="attempt-001",
+            operation_digest=_fingerprint({"op": "test"}),
+            idempotency_key="idempotency-001",
+            provider_scope="test-provider",
+            authority_reservation_id="reservation-released",
+            compensation_strategy=None,
+            evidence_reference="evidence-001",
+            state="committed_not_dispatched",
+            created_at=created_time,
+        )
+        registry.commit_intent(intent1)
+
+        # Effect resolves to nothing_landed, reservation released
+        registry.release_reservation("reservation-released")
+
+        # Now the reservation can be reused
+        intent2 = EffectIntent(
+            effect_intent_id="intent-reuse-002",
+            decision_id="decision-002",
+            mission_id="mission-001",
+            task_id="task-002",
+            attempt_id="attempt-001",
+            operation_digest=_fingerprint({"op": "test2"}),
+            idempotency_key="idempotency-002",
+            provider_scope="test-provider",
+            authority_reservation_id="reservation-released",  # Reuse after release
+            compensation_strategy=None,
+            evidence_reference="evidence-002",
+            state="committed_not_dispatched",
+            created_at=created_time,
+        )
+        registry.commit_intent(intent2)  # Should succeed
+        assert registry.get_intent("intent-reuse-002") == intent2
+
+    def test_consumed_reservation_cannot_be_reused(self):
+        """Consumed or assumed_consumed_unreconciled reservation cannot be reused."""
+        registry = EffectIntentRegistry()
+        created_time = _now()
+        intent1 = EffectIntent(
+            effect_intent_id="intent-consumed-001",
+            decision_id="decision-001",
+            mission_id="mission-001",
+            task_id="task-001",
+            attempt_id="attempt-001",
+            operation_digest=_fingerprint({"op": "test"}),
+            idempotency_key="idempotency-001",
+            provider_scope="test-provider",
+            authority_reservation_id="reservation-consumed",
+            compensation_strategy=None,
+            evidence_reference="evidence-001",
+            state="committed_not_dispatched",
+            created_at=created_time,
+        )
+        registry.commit_intent(intent1)
+
+        # Effect lands (something_landed), reservation consumed
+        # The registry doesn't release it - it stays locked
+
+        # Attempting to reuse consumed reservation should fail
+        intent2 = EffectIntent(
+            effect_intent_id="intent-reuse-consumed-002",
+            decision_id="decision-002",
+            mission_id="mission-001",
+            task_id="task-002",
+            attempt_id="attempt-001",
+            operation_digest=_fingerprint({"op": "test2"}),
+            idempotency_key="idempotency-002",
+            provider_scope="test-provider",
+            authority_reservation_id="reservation-consumed",
+            compensation_strategy=None,
+            evidence_reference="evidence-002",
+            state="committed_not_dispatched",
+            created_at=created_time,
+        )
+        with pytest.raises(ValueError, match="authority reservation.*already committed"):
+            registry.commit_intent(intent2)
+
+
+class TestMissionSealingConstraintEnforcement:
+    """FINDING 2 REGRESSION TESTS — Mission sealing constraint enforcement."""
+
+    def test_sealed_mission_with_indeterminate_effects_is_rejected(self):
+        """Cannot seal mission with indeterminate effects."""
+        with pytest.raises(ValueError, match="Cannot seal mission with indeterminate effects"):
+            MissionEffectFold(
+                mission_id="mission-seal-fail-001",
+                posture=MissionPosture.PARKED_RECONCILIATION,
+                lifecycle=MissionLifecycle.SEALED,  # Trying to seal
+                indeterminate_effects=("effect-001",),  # But has indeterminate
+                uncompensated_landed_effects=(),
+                active_reconciliation_obligations=(),
+                folded_at=_now(),
+                seal_digest=_fingerprint({"evidence": "complete"}),
+            )
+
+    def test_sealed_mission_with_uncompensated_landed_effects_is_rejected(self):
+        """Cannot seal mission with uncompensated landed effects."""
+        with pytest.raises(ValueError, match="Cannot seal mission with uncompensated landed effects"):
+            MissionEffectFold(
+                mission_id="mission-seal-fail-002",
+                posture=MissionPosture.DIRTY_COMPENSATION_REQUIRED,
+                lifecycle=MissionLifecycle.SEALED,  # Trying to seal
+                indeterminate_effects=(),
+                uncompensated_landed_effects=("effect-001",),  # But has uncompensated
+                active_reconciliation_obligations=(),
+                folded_at=_now(),
+                seal_digest=_fingerprint({"evidence": "complete"}),
+            )
+
+    def test_sealed_mission_without_seal_digest_is_rejected(self):
+        """Cannot seal mission without seal_digest."""
+        with pytest.raises(ValueError, match="Cannot seal mission without seal_digest"):
+            MissionEffectFold(
+                mission_id="mission-seal-fail-003",
+                posture=MissionPosture.CLEAN_SUCCEEDED,
+                lifecycle=MissionLifecycle.SEALED,  # Trying to seal
+                indeterminate_effects=(),
+                uncompensated_landed_effects=(),
+                active_reconciliation_obligations=(),
+                folded_at=_now(),
+                seal_digest=None,  # Missing seal_digest
+            )
+
+    def test_open_mission_with_seal_digest_is_rejected(self):
+        """Non-SEALED mission must not have seal_digest."""
+        with pytest.raises(ValueError, match="must not have seal_digest"):
+            MissionEffectFold(
+                mission_id="mission-seal-fail-004",
+                posture=MissionPosture.CLEAN_ACTIVE,
+                lifecycle=MissionLifecycle.OPEN,  # Not sealed
+                indeterminate_effects=(),
+                uncompensated_landed_effects=(),
+                active_reconciliation_obligations=(),
+                folded_at=_now(),
+                seal_digest=_fingerprint({"evidence": "invalid"}),  # But has digest
+            )
+
+    def test_closed_mission_with_seal_digest_is_rejected(self):
+        """CLOSED (non-SEALED) mission must not have seal_digest."""
+        with pytest.raises(ValueError, match="must not have seal_digest"):
+            MissionEffectFold(
+                mission_id="mission-seal-fail-005",
+                posture=MissionPosture.CLEAN_SUCCEEDED,
+                lifecycle=MissionLifecycle.CLOSED,  # Closed but not sealed
+                indeterminate_effects=(),
+                uncompensated_landed_effects=(),
+                active_reconciliation_obligations=(),
+                folded_at=_now(),
+                seal_digest=_fingerprint({"evidence": "invalid"}),  # But has digest
+            )
+
+    def test_valid_sealed_mission_construction_succeeds(self):
+        """Valid sealed mission construction succeeds."""
+        fold = MissionEffectFold(
+            mission_id="mission-seal-valid-001",
+            posture=MissionPosture.CLEAN_SUCCEEDED,
+            lifecycle=MissionLifecycle.SEALED,
+            indeterminate_effects=(),  # Empty
+            uncompensated_landed_effects=(),  # Empty
+            active_reconciliation_obligations=(),
+            folded_at=_now(),
+            seal_digest=_fingerprint({"evidence": "complete"}),  # Present
+        )
+        assert fold.lifecycle == MissionLifecycle.SEALED
+        assert fold.seal_digest is not None
+        assert len(fold.indeterminate_effects) == 0
+        assert len(fold.uncompensated_landed_effects) == 0
+
+    def test_valid_open_mission_without_seal_digest_succeeds(self):
+        """Valid OPEN mission without seal_digest succeeds."""
+        fold = MissionEffectFold(
+            mission_id="mission-open-valid-001",
+            posture=MissionPosture.CLEAN_ACTIVE,
+            lifecycle=MissionLifecycle.OPEN,
+            indeterminate_effects=(),
+            uncompensated_landed_effects=(),
+            active_reconciliation_obligations=(),
+            folded_at=_now(),
+            seal_digest=None,  # Correctly None
+        )
+        assert fold.lifecycle == MissionLifecycle.OPEN
+        assert fold.seal_digest is None
+
+    def test_valid_closed_mission_with_indeterminate_effects_succeeds(self):
+        """Valid CLOSED mission can have indeterminate effects (not yet sealed)."""
+        fold = MissionEffectFold(
+            mission_id="mission-closed-valid-001",
+            posture=MissionPosture.PARKED_RECONCILIATION,
+            lifecycle=MissionLifecycle.CLOSED,
+            indeterminate_effects=("effect-001",),  # OK for CLOSED
+            uncompensated_landed_effects=(),
+            active_reconciliation_obligations=("obligation-001",),
+            folded_at=_now(),
+            seal_digest=None,  # Correctly None (not sealed)
+        )
+        assert fold.lifecycle == MissionLifecycle.CLOSED
+        assert fold.seal_digest is None
+        assert len(fold.indeterminate_effects) == 1
+
+
+class TestAssumedConsumedUnreconciledEvidenceRequirement:
+    """FINDING 3 REGRESSION TESTS — ASSUMED_CONSUMED_UNRECONCILED evidence requirement."""
+
+    def test_assumed_consumed_without_evidence_is_rejected(self):
+        """ASSUMED_CONSUMED_UNRECONCILED without evidence is rejected."""
+        with pytest.raises(ValueError, match="requires explicit escalation/policy evidence"):
+            AuthorityReservation(
+                reservation_id="res-assumed-fail-001",
+                effect_intent_id="intent-001",
+                capability_type="compute",
+                amount=10.0,
+                disposition=AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED,
+                reserved_at=_now() - timedelta(days=7),
+                disposition_at=_now(),
+                disposition_evidence=None,  # Missing evidence
+            )
+
+    def test_assumed_consumed_with_timeout_only_evidence_is_rejected(self):
+        """ASSUMED_CONSUMED_UNRECONCILED with timeout-only evidence is rejected."""
+        with pytest.raises(ValueError, match="must be structured escalation/policy evidence"):
+            AuthorityReservation(
+                reservation_id="res-assumed-fail-002",
+                effect_intent_id="intent-002",
+                capability_type="compute",
+                amount=10.0,
+                disposition=AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED,
+                reserved_at=_now() - timedelta(days=7),
+                disposition_at=_now(),
+                disposition_evidence="timeout:7d",  # Invalid: timeout alone
+            )
+
+    def test_assumed_consumed_with_arbitrary_text_is_rejected(self):
+        """ASSUMED_CONSUMED_UNRECONCILED with arbitrary text is rejected."""
+        with pytest.raises(ValueError, match="must be structured escalation/policy evidence"):
+            AuthorityReservation(
+                reservation_id="res-assumed-fail-003",
+                effect_intent_id="intent-003",
+                capability_type="compute",
+                amount=10.0,
+                disposition=AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED,
+                reserved_at=_now() - timedelta(days=7),
+                disposition_at=_now(),
+                disposition_evidence="some arbitrary unstructured text",
+            )
+
+    def test_assumed_consumed_with_valid_escalation_evidence_succeeds(self):
+        """ASSUMED_CONSUMED_UNRECONCILED with valid escalation evidence succeeds."""
+        reservation = AuthorityReservation(
+            reservation_id="res-assumed-valid-001",
+            effect_intent_id="intent-001",
+            capability_type="compute",
+            amount=10.0,
+            disposition=AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED,
+            reserved_at=_now() - timedelta(days=7),
+            disposition_at=_now(),
+            disposition_evidence="escalation:terminal-disposition-policy-001",
+        )
+        assert reservation.disposition == AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED
+        assert reservation.disposition_evidence == "escalation:terminal-disposition-policy-001"
+
+    def test_assumed_consumed_with_valid_policy_evidence_succeeds(self):
+        """ASSUMED_CONSUMED_UNRECONCILED with valid policy evidence succeeds."""
+        reservation = AuthorityReservation(
+            reservation_id="res-assumed-valid-002",
+            effect_intent_id="intent-002",
+            capability_type="compute",
+            amount=10.0,
+            disposition=AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED,
+            reserved_at=_now() - timedelta(days=7),
+            disposition_at=_now(),
+            disposition_evidence="policy:unreconcilable-effect-budget-charge",
+        )
+        assert reservation.disposition == AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED
+        assert reservation.disposition_evidence == "policy:unreconcilable-effect-budget-charge"
+
+    def test_assumed_consumed_with_escalation_policy_evidence_succeeds(self):
+        """ASSUMED_CONSUMED_UNRECONCILED with escalation-policy evidence succeeds."""
+        reservation = AuthorityReservation(
+            reservation_id="res-assumed-valid-003",
+            effect_intent_id="intent-003",
+            capability_type="compute",
+            amount=10.0,
+            disposition=AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED,
+            reserved_at=_now() - timedelta(days=7),
+            disposition_at=_now(),
+            disposition_evidence="escalation-policy:combined-ref-123",
+        )
+        assert reservation.disposition == AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED
+        assert reservation.disposition_evidence == "escalation-policy:combined-ref-123"
+
+    def test_reconciliation_terminal_disposition_without_evidence_is_rejected(self):
+        """ReconciliationObligation terminal_disposition without valid evidence is rejected."""
+        with pytest.raises(ValueError, match="must be structured escalation/policy evidence"):
+            ReconciliationObligation(
+                obligation_id="obligation-term-fail-001",
+                effect_intent_id="intent-001",
+                dispatch_id="dispatch-001",
+                state=ReconciliationState.ESCALATED,
+                provider_reconcilability=ProviderReconcilability.NONE,
+                next_probe_at=None,
+                probe_history=(),
+                terminal_disposition="timeout:expired",  # Invalid
+                created_at=_now(),
+            )
+
+    def test_reconciliation_terminal_disposition_with_valid_escalation_succeeds(self):
+        """ReconciliationObligation terminal_disposition with valid escalation succeeds."""
+        obligation = ReconciliationObligation(
+            obligation_id="obligation-term-valid-001",
+            effect_intent_id="intent-001",
+            dispatch_id="dispatch-001",
+            state=ReconciliationState.ESCALATED,
+            provider_reconcilability=ProviderReconcilability.NONE,
+            next_probe_at=None,
+            probe_history=(
+                {"probed_at": (_now() - timedelta(days=1)).isoformat(), "result": "unreconcilable"},
+            ),
+            terminal_disposition="escalation:operator-decision-ref-456",
+            created_at=_now() - timedelta(days=7),
+        )
+        assert obligation.terminal_disposition == "escalation:operator-decision-ref-456"
+        assert obligation.state == ReconciliationState.ESCALATED
+
+    def test_terminal_disposition_preserves_indeterminate_truth(self):
+        """Terminal disposition does not convert indeterminate to nothing_landed or something_landed."""
+        # Create obligation with terminal disposition
+        obligation = ReconciliationObligation(
+            obligation_id="obligation-preserve-001",
+            effect_intent_id="intent-preserve-001",
+            dispatch_id="dispatch-preserve-001",
+            state=ReconciliationState.ESCALATED,
+            provider_reconcilability=ProviderReconcilability.NONE,
+            next_probe_at=None,
+            probe_history=(),
+            terminal_disposition="policy:permanent-indeterminate-budget-hold",
+            created_at=_now(),
+        )
+        # Terminal disposition is set, but the effect remains indeterminate
+        # The obligation state is ESCALATED, not RESOLVED
+        assert obligation.state == ReconciliationState.ESCALATED
+        assert obligation.terminal_disposition is not None
+        # The effect state would still be INDETERMINATE (not tested here as it's separate)

@@ -56,6 +56,44 @@ def _require_timestamp(value: Any, field: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _require_escalation_policy_evidence(value: str, field: str) -> str:
+    """Require structured escalation or policy evidence reference.
+
+    FINDING 3 REMEDIATION: Terminal unresolved authority disposition cannot be
+    set solely because time elapsed. It requires structured explicit escalation
+    or policy evidence reference.
+
+    Valid formats:
+    - "escalation:reference-id"
+    - "policy:reference-id"
+    - "escalation-policy:reference-id"
+
+    Invalid formats:
+    - "timeout:7d" (timeout alone is insufficient)
+    - "some arbitrary text"
+    - Free-form text without structured reference
+    """
+    value = _require_text(value, field)
+
+    # Check for valid prefixes
+    valid_prefixes = ("escalation:", "policy:", "escalation-policy:")
+    if not any(value.startswith(prefix) for prefix in valid_prefixes):
+        raise ValueError(
+            f"{field} must be structured escalation/policy evidence "
+            f"(e.g., 'escalation:ref-id', 'policy:ref-id'), got: {value}"
+        )
+
+    # Ensure there's content after the prefix
+    prefix_used = next(p for p in valid_prefixes if value.startswith(p))
+    reference = value[len(prefix_used):]
+    if not reference.strip():
+        raise ValueError(
+            f"{field} has valid prefix but missing reference ID: {value}"
+        )
+
+    return value
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Effect State Enumerations
 # ═══════════════════════════════════════════════════════════════════════════
@@ -321,7 +359,24 @@ class AuthorityReservation:
                 "disposition_at",
                 _require_timestamp(self.disposition_at, "disposition_at"),
             )
-        if self.disposition_evidence is not None:
+
+        # FINDING 3 REMEDIATION: Terminal unresolved disposition requires escalation/policy evidence
+        if self.disposition == AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED:
+            if self.disposition_evidence is None:
+                raise ValueError(
+                    "ASSUMED_CONSUMED_UNRECONCILED disposition requires explicit "
+                    "escalation/policy evidence (cannot be None)"
+                )
+            object.__setattr__(
+                self,
+                "disposition_evidence",
+                _require_escalation_policy_evidence(
+                    self.disposition_evidence,
+                    "disposition_evidence"
+                ),
+            )
+        elif self.disposition_evidence is not None:
+            # For other dispositions, just validate it's text if present
             object.__setattr__(
                 self,
                 "disposition_evidence",
@@ -383,12 +438,20 @@ class ReconciliationObligation:
             )
         if not isinstance(self.probe_history, tuple):
             raise TypeError("probe_history must be a tuple")
+
+        # FINDING 3 REMEDIATION: Terminal disposition requires escalation/policy evidence
         if self.terminal_disposition is not None:
+            # Terminal disposition represents assumed_consumed_unreconciled
+            # and requires explicit escalation/policy evidence
             object.__setattr__(
                 self,
                 "terminal_disposition",
-                _require_text(self.terminal_disposition, "terminal_disposition"),
+                _require_escalation_policy_evidence(
+                    self.terminal_disposition,
+                    "terminal_disposition"
+                ),
             )
+
         object.__setattr__(
             self,
             "created_at",
@@ -523,6 +586,30 @@ class MissionEffectFold:
                 _require_text(self.seal_digest, "seal_digest"),
             )
 
+        # FINDING 2 REMEDIATION: Enforce mission sealing constraints
+        if self.lifecycle == MissionLifecycle.SEALED:
+            # SEALED missions must have no indeterminate effects
+            if len(self.indeterminate_effects) > 0:
+                raise ValueError(
+                    "Cannot seal mission with indeterminate effects: "
+                    f"{len(self.indeterminate_effects)} indeterminate effect(s) remain"
+                )
+            # SEALED missions must have no uncompensated landed effects
+            if len(self.uncompensated_landed_effects) > 0:
+                raise ValueError(
+                    "Cannot seal mission with uncompensated landed effects: "
+                    f"{len(self.uncompensated_landed_effects)} uncompensated effect(s) remain"
+                )
+            # SEALED missions must have seal_digest
+            if self.seal_digest is None:
+                raise ValueError("Cannot seal mission without seal_digest")
+        else:
+            # Non-SEALED missions must not have seal_digest
+            if self.seal_digest is not None:
+                raise ValueError(
+                    f"Mission in lifecycle {self.lifecycle.value} must not have seal_digest"
+                )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "mission_id": self.mission_id,
@@ -634,16 +721,60 @@ class EffectIntentRegistry:
 
     This is a placeholder for the scheduler integration. Real implementation
     would provide durable storage and prevent double-spending of reservations.
+
+    Enforces:
+    - Authority reservation cannot be reused across different effect intents
+    - Idempotent retry with same effect_intent_id only if payload identical
+    - No silent overwrites of existing committed intents
     """
 
     def __init__(self) -> None:
         self._intents: dict[str, EffectIntent] = {}
+        self._reservations: dict[str, str] = {}  # reservation_id -> effect_intent_id
 
     def commit_intent(self, intent: EffectIntent) -> None:
-        """Commit a write-ahead intent."""
+        """Commit a write-ahead intent.
+
+        Raises:
+            TypeError: If intent is not an EffectIntent
+            ValueError: If authority reservation already used by different intent
+            ValueError: If effect_intent_id exists with different payload
+        """
         if type(intent) is not EffectIntent:
             raise TypeError("intent must be an EffectIntent")
+
+        # Check for idempotent retry (same effect_intent_id)
+        existing_intent = self._intents.get(intent.effect_intent_id)
+        if existing_intent is not None:
+            # Allow only if canonical payload is identical
+            if intent.to_dict() != existing_intent.to_dict():
+                raise ValueError(
+                    f"effect_intent_id {intent.effect_intent_id} already committed with different payload"
+                )
+            # Idempotent retry - safe to return
+            return
+
+        # Check for authority reservation double-spend
+        existing_intent_id = self._reservations.get(intent.authority_reservation_id)
+        if existing_intent_id is not None:
+            # Reservation already used by a different intent
+            if existing_intent_id != intent.effect_intent_id:
+                raise ValueError(
+                    f"authority reservation {intent.authority_reservation_id} already committed "
+                    f"to effect_intent_id {existing_intent_id}"
+                )
+
+        # Commit new intent
         self._intents[intent.effect_intent_id] = intent
+        self._reservations[intent.authority_reservation_id] = intent.effect_intent_id
+
+    def release_reservation(self, reservation_id: str) -> None:
+        """Release an authority reservation after nothing_landed resolution.
+
+        A released reservation can potentially be reused if policy permits.
+        """
+        if reservation_id in self._reservations:
+            del self._reservations[reservation_id]
 
     def get_intent(self, effect_intent_id: str) -> EffectIntent | None:
         """Retrieve committed intent by ID."""
