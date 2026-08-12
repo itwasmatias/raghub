@@ -182,6 +182,48 @@ class EvidenceReference:
 
 
 @dataclass(frozen=True, slots=True)
+class EvidencePointer:
+    """Verifiable evidence record locator binding key, reference, and fingerprint.
+
+    An EvidencePointer uniquely identifies a specific EvidenceRecord and cannot be
+    satisfied by a fabricated or mismatched record. The triple of correlation key,
+    reference fingerprint, and record fingerprint ensures exact matching against
+    an authoritative EvidenceSpine.
+    """
+    key: EvidenceCorrelationKey
+    reference_fingerprint: str
+    record_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if type(self.key) is not EvidenceCorrelationKey:
+            raise TypeError("key must be an EvidenceCorrelationKey")
+        object.__setattr__(self, "reference_fingerprint", _require_text(self.reference_fingerprint, "reference_fingerprint"))
+        object.__setattr__(self, "record_fingerprint", _require_text(self.record_fingerprint, "record_fingerprint"))
+        if len(self.reference_fingerprint) != 64 or any(char not in "0123456789abcdef" for char in self.reference_fingerprint):
+            raise ValueError("reference_fingerprint must be lowercase SHA-256 hex")
+        if len(self.record_fingerprint) != 64 or any(char not in "0123456789abcdef" for char in self.record_fingerprint):
+            raise ValueError("record_fingerprint must be lowercase SHA-256 hex")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "key": self.key.to_dict(),
+            "reference_fingerprint": self.reference_fingerprint,
+            "record_fingerprint": self.record_fingerprint,
+        }
+
+    @classmethod
+    def from_record(cls, record: EvidenceRecord) -> "EvidencePointer":
+        """Create pointer from existing verified EvidenceRecord."""
+        if type(record) is not EvidenceRecord:
+            raise TypeError("record must be an EvidenceRecord")
+        return cls(
+            key=record.key,
+            reference_fingerprint=record.reference.fingerprint,
+            record_fingerprint=record.record_fingerprint,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class EvidenceRecord:
     key: EvidenceCorrelationKey
     reference: EvidenceReference
@@ -268,6 +310,17 @@ class EvidenceSpine:
             normalized,
             _fingerprint([record.to_dict() for record in normalized]),
         )
+        # Build lookup index for verification
+        self._index: dict[tuple[str, str, str | None, str | None, str | None], EvidenceRecord] = {}
+        for record in normalized:
+            key_tuple = (
+                record.key.source,
+                record.key.record_id,
+                record.key.domain_id,
+                record.key.mission_id,
+                record.key.task_id,
+            )
+            self._index[key_tuple] = record
 
     @classmethod
     def from_records(cls, records: Iterable[EvidenceRecord]) -> "EvidenceSpine":
@@ -318,6 +371,64 @@ class EvidenceSpine:
     def records_for_source(self, source: str) -> tuple[EvidenceRecord, ...]:
         source = _require_text(source, "source")
         return tuple(record for record in self._records if record.key.source == source)
+
+    def verify_evidence(self, pointer: EvidencePointer) -> EvidenceRecord:
+        """Verify evidence pointer resolves to exact record in spine.
+
+        Verifies:
+        - Correlation key exists in spine
+        - Reference fingerprint matches exactly
+        - Record fingerprint matches exactly
+
+        Fails closed:
+        - If key not found in spine
+        - If fingerprints mismatch
+        - If pointer is not an EvidencePointer
+
+        Returns:
+            The verified EvidenceRecord
+
+        Raises:
+            TypeError: If pointer is not an EvidencePointer
+            EvidenceSpineError: If verification fails
+        """
+        if type(pointer) is not EvidencePointer:
+            raise TypeError("pointer must be an EvidencePointer")
+
+        # Lookup by correlation key
+        key_tuple = (
+            pointer.key.source,
+            pointer.key.record_id,
+            pointer.key.domain_id,
+            pointer.key.mission_id,
+            pointer.key.task_id,
+        )
+        record = self._index.get(key_tuple)
+
+        # Fail closed if not found
+        if record is None:
+            raise EvidenceSpineError(
+                f"Evidence not found: source={pointer.key.source!r} "
+                f"record_id={pointer.key.record_id!r}"
+            )
+
+        # Verify reference fingerprint matches
+        if record.reference.fingerprint != pointer.reference_fingerprint:
+            raise EvidenceSpineError(
+                f"Reference fingerprint mismatch for {pointer.key.source!r} "
+                f"{pointer.key.record_id!r}: expected {pointer.reference_fingerprint}, "
+                f"found {record.reference.fingerprint}"
+            )
+
+        # Verify record fingerprint matches
+        if record.record_fingerprint != pointer.record_fingerprint:
+            raise EvidenceSpineError(
+                f"Record fingerprint mismatch for {pointer.key.source!r} "
+                f"{pointer.key.record_id!r}: expected {pointer.record_fingerprint}, "
+                f"found {record.record_fingerprint}"
+            )
+
+        return record
 
     def export(self, *, generated_at: datetime | None = None) -> EvidenceExport:
         generated_at = datetime.now(timezone.utc) if generated_at is None else generated_at
@@ -617,6 +728,91 @@ def approval_records(
     return tuple(records)
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderBoundaryReconciliationEvidence:
+    """Provider boundary reconciliation evidence for effect resolution.
+
+    Records authoritative provider-boundary reconciliation outcomes that can
+    resolve indeterminate effect states. Only evidence from this source can
+    convert INDETERMINATE to NOTHING_LANDED or SOMETHING_LANDED.
+    """
+    reconciliation_id: str
+    effect_intent_id: str
+    dispatch_id: str | None
+    idempotency_key: str
+    provider_operation_id: str | None
+    reconciliation_outcome: str  # "no_operation_committed" or "operation_committed"
+    reconciled_at: datetime
+    provider_scope: str
+    reconciliation_method: str  # e.g., "idempotency_key_lookup", "provider_operation_lookup"
+
+    def __post_init__(self) -> None:
+        for field_name in ("reconciliation_id", "effect_intent_id", "idempotency_key", "provider_scope", "reconciliation_method"):
+            object.__setattr__(self, field_name, _require_text(getattr(self, field_name), field_name))
+        if self.dispatch_id is not None:
+            object.__setattr__(self, "dispatch_id", _require_text(self.dispatch_id, "dispatch_id"))
+        if self.provider_operation_id is not None:
+            object.__setattr__(self, "provider_operation_id", _require_text(self.provider_operation_id, "provider_operation_id"))
+        object.__setattr__(self, "reconciliation_outcome", _require_text(self.reconciliation_outcome, "reconciliation_outcome"))
+        if self.reconciliation_outcome not in ("no_operation_committed", "operation_committed"):
+            raise ValueError(f"reconciliation_outcome must be 'no_operation_committed' or 'operation_committed', got {self.reconciliation_outcome!r}")
+        object.__setattr__(self, "reconciled_at", _require_timestamp(self.reconciled_at, "reconciled_at"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "reconciliation_id": self.reconciliation_id,
+            "effect_intent_id": self.effect_intent_id,
+            "dispatch_id": self.dispatch_id,
+            "idempotency_key": self.idempotency_key,
+            "provider_operation_id": self.provider_operation_id,
+            "reconciliation_outcome": self.reconciliation_outcome,
+            "reconciled_at": self.reconciled_at.isoformat(),
+            "provider_scope": self.provider_scope,
+            "reconciliation_method": self.reconciliation_method,
+        }
+
+
+def provider_boundary_reconciliation_record(
+    evidence: ProviderBoundaryReconciliationEvidence,
+    *,
+    source_revision: str | None = None,
+    domain_id: str | None = None,
+    mission_id: str | None = None,
+    task_id: str | None = None,
+) -> EvidenceRecord:
+    """Convert provider boundary reconciliation evidence to spine record."""
+    if type(evidence) is not ProviderBoundaryReconciliationEvidence:
+        raise TypeError("evidence must be a ProviderBoundaryReconciliationEvidence")
+    source_revision = source_revision or evidence.reconciliation_id
+    payload = evidence.to_dict()
+    payload["source_revision"] = source_revision
+    normalized_payload = _normalize_json(payload)
+    reference = EvidenceReference(
+        source_revision=source_revision,
+        fingerprint=_fingerprint(normalized_payload),
+        observed_at=evidence.reconciled_at,
+        summary=f"provider boundary reconciliation {evidence.reconciliation_outcome}",
+        reference=evidence.reconciliation_id,
+    )
+    return EvidenceRecord(
+        key=EvidenceCorrelationKey(
+            source="provider_boundary_reconciliation",
+            record_id=evidence.reconciliation_id,
+            mission_id=mission_id,
+            task_id=task_id,
+            domain_id=domain_id,
+        ),
+        reference=reference,
+        payload=payload,
+        metadata={
+            "effect_intent_id": evidence.effect_intent_id,
+            "dispatch_id": evidence.dispatch_id,
+            "reconciliation_outcome": evidence.reconciliation_outcome,
+            "provider_scope": evidence.provider_scope,
+        },
+    )
+
+
 def worker_attempt_record(
     attempt: WorkerExecutionAttempt,
     *,
@@ -673,14 +869,18 @@ __all__ = [
     "EvidenceChain",
     "EvidenceCorrelationKey",
     "EvidenceExport",
+    "EvidencePointer",
     "EvidenceRecord",
     "EvidenceReference",
     "EvidenceSpine",
     "EvidenceSpineConflictError",
     "EvidenceSpineCorruptionError",
+    "EvidenceSpineError",
+    "ProviderBoundaryReconciliationEvidence",
     "approval_records",
     "checkpoint_record",
     "event_records",
+    "provider_boundary_reconciliation_record",
     "recovery_record",
     "research_evidence_record",
     "worker_attempt_record",
