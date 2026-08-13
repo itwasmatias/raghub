@@ -78,8 +78,17 @@ class ExecutionPromptCompiler:
         milestone: MilestoneSpec,
         dev_status: DevStatusHandoff,
         policy: PolicyProfile,
+        *,
+        reference_time: datetime | None = None,
     ) -> ExecutionPrompt:
-        """Compile a new_milestone_implementation prompt."""
+        """Compile a new_milestone_implementation prompt.
+
+        Args:
+            milestone: Milestone specification
+            dev_status: Development status handoff
+            policy: Policy profile
+            reference_time: Optional reference time for dev-status staleness check
+        """
         # Validate inputs
         if milestone is None or dev_status is None or policy is None:
             raise PromptCompilationError(
@@ -88,7 +97,7 @@ class ExecutionPromptCompiler:
             )
 
         validate_milestone_spec(milestone.to_dict())
-        validate_dev_status(dev_status.to_dict())
+        validate_dev_status(dev_status.to_dict(), reference_time=reference_time)
 
         # Build canonical input for fingerprinting
         canonical_input = {
@@ -323,16 +332,25 @@ def compile_new_milestone_implementation_prompt(
     milestone: MilestoneSpec,
     dev_status: DevStatusHandoff,
     policy: PolicyProfile,
+    *,
+    reference_time: datetime | None = None,
 ) -> ExecutionPrompt:
     """Compile a new_milestone_implementation prompt.
 
     This is the public API for prompt compilation.
+
+    Args:
+        milestone: Milestone specification
+        dev_status: Development status handoff
+        policy: Policy profile
+        reference_time: Optional reference time for dev-status staleness check (for testing)
     """
     compiler = ExecutionPromptCompiler()
     return compiler.compile_new_milestone_implementation(
         milestone,
         dev_status,
         policy,
+        reference_time=reference_time,
     )
 
 

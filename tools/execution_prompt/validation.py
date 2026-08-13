@@ -48,7 +48,7 @@ def _check_env_file_reference(text: str) -> bool:
     return bool(re.search(r"\.env\b", text))
 
 
-def validate_dev_status(data: Any) -> dict[str, Any]:
+def validate_dev_status(data: Any, *, reference_time: datetime | None = None) -> dict[str, Any]:
     """Validate dev-status handoff.
 
     Checks:
@@ -57,6 +57,10 @@ def validate_dev_status(data: Any) -> dict[str, Any]:
     - Not contradictory (clean status with dirty diff)
     - No secrets
     - No .env file references
+
+    Args:
+        data: Dev-status data to validate
+        reference_time: Optional reference time for staleness check (defaults to now)
     """
     if data is None:
         raise DevStatusValidationError("dev-status is required")
@@ -79,7 +83,7 @@ def validate_dev_status(data: Any) -> dict[str, Any]:
     else:
         raise DevStatusValidationError("timestamp must be ISO-8601 string or datetime")
 
-    now = datetime.now(timezone.utc)
+    now = reference_time.astimezone(timezone.utc) if reference_time is not None else datetime.now(timezone.utc)
     age = now - timestamp.astimezone(timezone.utc)
     if age > timedelta(hours=24):
         raise DevStatusValidationError(f"dev-status is stale (>{age.total_seconds()/3600:.1f} hours old, max 24 hours)")

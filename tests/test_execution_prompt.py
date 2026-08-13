@@ -53,6 +53,9 @@ class TestDeterministicCompilation:
 
     def test_identical_inputs_produce_identical_fingerprints(self):
         """Identical canonical inputs must produce identical prompt fingerprints."""
+        # Use fixed reference time to make hardcoded timestamp valid
+        reference_time = datetime(2026, 8, 12, 12, 0, 0, tzinfo=timezone.utc)
+
         milestone = MilestoneSpec(
             milestone_id="M6",
             title="Test Milestone",
@@ -77,11 +80,13 @@ class TestDeterministicCompilation:
             milestone=milestone,
             dev_status=dev_status,
             policy=policy,
+            reference_time=reference_time,
         )
         prompt2 = compile_new_milestone_implementation_prompt(
             milestone=milestone,
             dev_status=dev_status,
             policy=policy,
+            reference_time=reference_time,
         )
 
         assert prompt1.prompt_fingerprint == prompt2.prompt_fingerprint
@@ -431,6 +436,9 @@ class TestCanonicalSerialization:
 
     def test_prompt_serialization_round_trips(self):
         """Prompt serialization must round-trip correctly."""
+        # Use fixed reference time to make hardcoded timestamp valid
+        reference_time = datetime(2026, 8, 12, 12, 0, 0, tzinfo=timezone.utc)
+
         milestone = MilestoneSpec(
             milestone_id="M6",
             title="Test Milestone",
@@ -447,7 +455,7 @@ class TestCanonicalSerialization:
         )
         policy = PolicyProfile(version="v0.1", paid_budget=0.0, allowed_effects=[])
 
-        prompt = compile_new_milestone_implementation_prompt(milestone, dev_status, policy)
+        prompt = compile_new_milestone_implementation_prompt(milestone, dev_status, policy, reference_time=reference_time)
 
         # Serialize
         serialized = prompt.to_dict()
@@ -460,6 +468,9 @@ class TestCanonicalSerialization:
 
     def test_serialization_is_stable(self):
         """Serialization must produce stable output (no unstable map ordering)."""
+        # Use fixed reference time to make hardcoded timestamp valid
+        reference_time = datetime(2026, 8, 12, 12, 0, 0, tzinfo=timezone.utc)
+
         milestone = MilestoneSpec(
             milestone_id="M6",
             title="Test Milestone",
@@ -476,7 +487,7 @@ class TestCanonicalSerialization:
         )
         policy = PolicyProfile(version="v0.1", paid_budget=0.0, allowed_effects=[])
 
-        prompt = compile_new_milestone_implementation_prompt(milestone, dev_status, policy)
+        prompt = compile_new_milestone_implementation_prompt(milestone, dev_status, policy, reference_time=reference_time)
 
         # Serialize multiple times
         serialized1 = json.dumps(prompt.to_dict(), sort_keys=True, separators=(",", ":"))
