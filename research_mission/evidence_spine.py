@@ -959,7 +959,7 @@ def terminal_effect_decision_record(
 
     return EvidenceRecord(
         key=EvidenceCorrelationKey(
-            source=f"terminal_effect_decision_{evidence.decision_kind}",
+            source="terminal_effect_decision",
             record_id=evidence.decision_id,
             mission_id=evidence.mission_id,
             task_id=evidence.task_id,

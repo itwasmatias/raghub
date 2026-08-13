@@ -1010,7 +1010,7 @@ class TestAssumedConsumedUnreconciledEvidenceRequirement:
 
     def test_assumed_consumed_without_evidence_is_rejected(self):
         """ASSUMED_CONSUMED_UNRECONCILED without evidence is rejected."""
-        with pytest.raises(ValueError, match="must be created through.*from_verified_terminal_decision"):
+        with pytest.raises(ValueError, match="requires an authoritative EvidenceSpine"):
             AuthorityReservation(
                 reservation_id="res-assumed-fail-001",
                 effect_intent_id="intent-001",
@@ -1024,7 +1024,7 @@ class TestAssumedConsumedUnreconciledEvidenceRequirement:
 
     def test_assumed_consumed_with_timeout_only_evidence_is_rejected(self):
         """ASSUMED_CONSUMED_UNRECONCILED with timeout-only evidence is rejected."""
-        with pytest.raises(ValueError, match="must be created through.*from_verified_terminal_decision"):
+        with pytest.raises(ValueError, match="requires an authoritative EvidenceSpine"):
             AuthorityReservation(
                 reservation_id="res-assumed-fail-002",
                 effect_intent_id="intent-002",
@@ -1038,7 +1038,7 @@ class TestAssumedConsumedUnreconciledEvidenceRequirement:
 
     def test_assumed_consumed_with_arbitrary_text_is_rejected(self):
         """ASSUMED_CONSUMED_UNRECONCILED with arbitrary text is rejected."""
-        with pytest.raises(ValueError, match="must be created through.*from_verified_terminal_decision"):
+        with pytest.raises(ValueError, match="requires an authoritative EvidenceSpine"):
             AuthorityReservation(
                 reservation_id="res-assumed-fail-003",
                 effect_intent_id="intent-003",
@@ -2051,11 +2051,11 @@ class TestTerminalDispositionSecurityBoundary:
         pass
 
     def test_17_terminal_dispositions_require_verified_factory(self):
-        """17. Terminal dispositions require verified factory methods."""
+        """17. Terminal dispositions require verified evidence-spine membership."""
         from research_mission import EvidencePointer, EvidenceCorrelationKey
 
         # Try to create terminal disposition directly - should fail
-        with pytest.raises(ValueError, match="must be created through.*from_verified_terminal_decision"):
+        with pytest.raises(ValueError, match="requires an authoritative EvidenceSpine"):
             # Even with a valid-looking pointer, direct construction is rejected
             fake_pointer = EvidencePointer(
                 key=EvidenceCorrelationKey(source="fake", record_id="fake"),
@@ -2072,3 +2072,81 @@ class TestTerminalDispositionSecurityBoundary:
                 disposition_at=_now(),
                 disposition_evidence=fake_pointer,
             )
+
+    def test_18_legacy_allow_terminal_flag_cannot_bypass_verification(self):
+        """The former caller-controlled constructor flag is no longer accepted."""
+        from research_mission import EvidencePointer, EvidenceCorrelationKey
+
+        fake_pointer = EvidencePointer(
+            key=EvidenceCorrelationKey(source="terminal_effect_decision", record_id="fake"),
+            reference_fingerprint="a" * 64,
+            record_fingerprint="b" * 64,
+        )
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            AuthorityReservation(
+                reservation_id="res-018-forged",
+                effect_intent_id="intent-018-forged",
+                capability_type="compute",
+                amount=10.0,
+                disposition=AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED,
+                reserved_at=_now(),
+                disposition_at=_now(),
+                disposition_evidence=fake_pointer,
+                _allow_terminal=True,
+            )
+
+    def test_19_duplicate_release_reverifies_pointer_membership(self):
+        """A matching fingerprint alone cannot authenticate a duplicate release."""
+        from research_mission import (
+            EvidenceCorrelationKey,
+            EvidencePointer,
+            EvidenceSpine,
+            EvidenceSpineError,
+            ProviderBoundaryReconciliationEvidence,
+            provider_boundary_reconciliation_record,
+        )
+
+        registry = EffectIntentRegistry()
+        intent = EffectIntent(
+            effect_intent_id="intent-019",
+            decision_id="decision-019",
+            mission_id="mission-019",
+            task_id="task-019",
+            attempt_id="attempt-019",
+            operation_digest=_fingerprint({"op": "test"}),
+            idempotency_key="idem-019",
+            provider_scope="test",
+            authority_reservation_id="res-019",
+            compensation_strategy=None,
+            evidence_reference="evidence-019",
+            state="committed_not_dispatched",
+            created_at=_now(),
+        )
+        registry.commit_intent(intent)
+        evidence = ProviderBoundaryReconciliationEvidence(
+            reconciliation_id="recon-019",
+            effect_intent_id="intent-019",
+            dispatch_id="dispatch-019",
+            idempotency_key="idem-019",
+            provider_operation_id=None,
+            reconciliation_outcome="no_operation_committed",
+            reconciled_at=_now(),
+            provider_scope="test",
+            reconciliation_method="idempotency_key_lookup",
+        )
+        record = provider_boundary_reconciliation_record(evidence, mission_id="mission-019")
+        pointer = EvidencePointer.from_record(record)
+        spine = EvidenceSpine.from_records([record])
+        registry.release_reservation("res-019", spine, pointer)
+
+        forged_pointer = EvidencePointer(
+            key=EvidenceCorrelationKey(
+                source="provider_boundary_reconciliation",
+                record_id="absent-recon-019",
+                mission_id="mission-019",
+            ),
+            reference_fingerprint=pointer.reference_fingerprint,
+            record_fingerprint=pointer.record_fingerprint,
+        )
+        with pytest.raises(EvidenceSpineError, match="Evidence not found"):
+            registry.release_reservation("res-019", spine, forged_pointer)

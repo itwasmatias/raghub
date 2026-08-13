@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, TYPE_CHECKING
@@ -95,7 +95,7 @@ def _verify_terminal_decision_evidence(
     record = evidence_spine.verify_evidence(evidence_pointer)
 
     # Verify evidence source is a terminal effect decision
-    if not record.key.source.startswith("terminal_effect_decision_"):
+    if record.key.source != "terminal_effect_decision":
         raise ValueError(
             f"Evidence must be a terminal_effect_decision source, got {record.key.source!r}"
         )
@@ -402,10 +402,10 @@ class AuthorityReservation:
     reserved_at: datetime
     disposition_at: datetime | None
     disposition_evidence: "EvidencePointer | None"
-    _allow_terminal: bool = False  # Internal flag for verified factory
+    _terminal_evidence_spine: InitVar["EvidenceSpine | None"] = None
 
-    def __post_init__(self) -> None:
-        from research_mission.evidence_spine import EvidencePointer
+    def __post_init__(self, _terminal_evidence_spine: "EvidenceSpine | None") -> None:
+        from research_mission.evidence_spine import EvidencePointer, EvidenceSpine
 
         for field_name in ("reservation_id", "effect_intent_id", "capability_type"):
             object.__setattr__(
@@ -431,11 +431,10 @@ class AuthorityReservation:
 
         # Terminal disposition must be created through verified factory
         if self.disposition == AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED:
-            if not self._allow_terminal:
+            if type(_terminal_evidence_spine) is not EvidenceSpine:
                 raise ValueError(
-                    "ASSUMED_CONSUMED_UNRECONCILED disposition must be created through "
-                    "AuthorityReservation.from_verified_terminal_decision() "
-                    "to ensure verified evidence spine and semantic binding"
+                    "ASSUMED_CONSUMED_UNRECONCILED disposition requires an authoritative "
+                    "EvidenceSpine and semantically bound terminal decision evidence"
                 )
             if self.disposition_evidence is None:
                 raise ValueError(
@@ -444,13 +443,16 @@ class AuthorityReservation:
                 )
             if type(self.disposition_evidence) is not EvidencePointer:
                 raise TypeError("disposition_evidence must be an EvidencePointer")
+            _verify_terminal_decision_evidence(
+                evidence_spine=_terminal_evidence_spine,
+                evidence_pointer=self.disposition_evidence,
+                expected_effect_intent_id=self.effect_intent_id,
+                expected_reservation_id=self.reservation_id,
+            )
         elif self.disposition_evidence is not None:
             # For other dispositions, validate it's an EvidencePointer if present
             if type(self.disposition_evidence) is not EvidencePointer:
                 raise TypeError("disposition_evidence must be an EvidencePointer or None")
-
-        # Remove internal flag from instance
-        object.__delattr__(self, "_allow_terminal")
 
     @classmethod
     def from_verified_terminal_decision(
@@ -505,7 +507,7 @@ class AuthorityReservation:
             reserved_at=reserved_at,
             disposition_at=disposition_at,
             disposition_evidence=evidence_pointer,
-            _allow_terminal=True,
+            _terminal_evidence_spine=evidence_spine,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -544,10 +546,10 @@ class ReconciliationObligation:
     probe_history: tuple[dict[str, Any], ...]
     terminal_disposition: "EvidencePointer | None"
     created_at: datetime
-    _allow_terminal: bool = False  # Internal flag for verified factory
+    _terminal_evidence_spine: InitVar["EvidenceSpine | None"] = None
 
-    def __post_init__(self) -> None:
-        from research_mission.evidence_spine import EvidencePointer
+    def __post_init__(self, _terminal_evidence_spine: "EvidenceSpine | None") -> None:
+        from research_mission.evidence_spine import EvidencePointer, EvidenceSpine
 
         for field_name in ("obligation_id", "effect_intent_id"):
             object.__setattr__(
@@ -576,11 +578,10 @@ class ReconciliationObligation:
 
         # Terminal disposition must be created through verified factory
         if self.terminal_disposition is not None:
-            if not self._allow_terminal:
+            if type(_terminal_evidence_spine) is not EvidenceSpine:
                 raise ValueError(
-                    "terminal_disposition must be created through "
-                    "ReconciliationObligation.from_verified_terminal_decision() "
-                    "to ensure verified evidence spine and semantic binding"
+                    "terminal_disposition requires an authoritative EvidenceSpine and "
+                    "semantically bound terminal decision evidence"
                 )
             if type(self.terminal_disposition) is not EvidencePointer:
                 raise TypeError("terminal_disposition must be an EvidencePointer")
@@ -590,9 +591,13 @@ class ReconciliationObligation:
                     f"ReconciliationObligation with terminal_disposition must be ESCALATED, "
                     f"got {self.state.value}"
                 )
-
-        # Remove internal flag from instance
-        object.__delattr__(self, "_allow_terminal")
+            _verify_terminal_decision_evidence(
+                evidence_spine=_terminal_evidence_spine,
+                evidence_pointer=self.terminal_disposition,
+                expected_effect_intent_id=self.effect_intent_id,
+                expected_obligation_id=self.obligation_id,
+                expected_dispatch_id=self.dispatch_id,
+            )
 
         object.__setattr__(
             self,
@@ -656,7 +661,7 @@ class ReconciliationObligation:
             probe_history=probe_history,
             terminal_disposition=evidence_pointer,
             created_at=created_at,
-            _allow_terminal=True,
+            _terminal_evidence_spine=evidence_spine,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1099,6 +1104,22 @@ class EffectIntentRegistry:
         existing_release = self._releases.get(reservation_id)
         if existing_release is not None:
             existing_effect_intent_id, existing_evidence_fingerprint = existing_release
+            # Idempotence is evidence-backed: re-verify the supplied pointer before
+            # comparing it with the recorded successful release.
+            record = evidence_spine.verify_evidence(evidence_pointer)
+            if record.key.source != "provider_boundary_reconciliation":
+                raise ValueError(
+                    f"Evidence must be provider_boundary_reconciliation, "
+                    f"got {record.key.source!r}"
+                )
+            recorded_effect_intent_id = record.metadata.get("effect_intent_id")
+            if recorded_effect_intent_id != existing_effect_intent_id:
+                raise ValueError(
+                    f"Evidence effect_intent_id mismatch: expected {existing_effect_intent_id!r}, "
+                    f"found {recorded_effect_intent_id!r}"
+                )
+            if record.payload.get("reconciliation_outcome") != "no_operation_committed":
+                raise ValueError("Duplicate release evidence must prove no_operation_committed")
             # Idempotent if same evidence
             if evidence_pointer.record_fingerprint == existing_evidence_fingerprint:
                 return  # Idempotent success
