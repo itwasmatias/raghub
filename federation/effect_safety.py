@@ -272,6 +272,7 @@ class EffectIntent:
     evidence_reference: str
     state: str  # Initially "committed_not_dispatched"
     created_at: datetime
+    control_domain: str  # Mandatory domain binding for isolation
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -285,6 +286,7 @@ class EffectIntent:
             "authority_reservation_id",
             "evidence_reference",
             "state",
+            "control_domain",
         ):
             object.__setattr__(
                 self,
@@ -316,6 +318,7 @@ class EffectIntent:
             "evidence_reference": self.evidence_reference,
             "state": self.state,
             "created_at": self.created_at.isoformat(),
+            "control_domain": self.control_domain,
         }
 
 
@@ -337,6 +340,7 @@ class EffectDispatch:
     provider_operation_id: str | None
     evidence_reference: str
     dispatched_at: datetime
+    control_domain: str  # Mandatory domain binding for isolation
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -349,6 +353,7 @@ class EffectDispatch:
             "transport_digest",
             "posture",
             "evidence_reference",
+            "control_domain",
         ):
             object.__setattr__(
                 self,
@@ -380,6 +385,7 @@ class EffectDispatch:
             "provider_operation_id": self.provider_operation_id,
             "evidence_reference": self.evidence_reference,
             "dispatched_at": self.dispatched_at.isoformat(),
+            "control_domain": self.control_domain,
         }
 
 
@@ -402,12 +408,13 @@ class AuthorityReservation:
     reserved_at: datetime
     disposition_at: datetime | None
     disposition_evidence: "EvidencePointer | None"
+    control_domain: str  # Mandatory domain binding for isolation
     _terminal_evidence_spine: InitVar["EvidenceSpine | None"] = None
 
     def __post_init__(self, _terminal_evidence_spine: "EvidenceSpine | None") -> None:
         from research_mission.evidence_spine import EvidencePointer, EvidenceSpine
 
-        for field_name in ("reservation_id", "effect_intent_id", "capability_type"):
+        for field_name in ("reservation_id", "effect_intent_id", "capability_type", "control_domain"):
             object.__setattr__(
                 self,
                 field_name,
@@ -465,6 +472,7 @@ class AuthorityReservation:
         disposition_at: datetime,
         evidence_spine: "EvidenceSpine",
         evidence_pointer: "EvidencePointer",
+        control_domain: str,
     ) -> "AuthorityReservation":
         """Create ASSUMED_CONSUMED_UNRECONCILED reservation from verified evidence.
 
@@ -507,6 +515,7 @@ class AuthorityReservation:
             reserved_at=reserved_at,
             disposition_at=disposition_at,
             disposition_evidence=evidence_pointer,
+            control_domain=control_domain,
             _terminal_evidence_spine=evidence_spine,
         )
 
@@ -523,6 +532,7 @@ class AuthorityReservation:
                 None if self.disposition_evidence is None
                 else self.disposition_evidence.to_dict()
             ),
+            "control_domain": self.control_domain,
         }
 
 
@@ -546,12 +556,13 @@ class ReconciliationObligation:
     probe_history: tuple[dict[str, Any], ...]
     terminal_disposition: "EvidencePointer | None"
     created_at: datetime
+    control_domain: str  # Mandatory domain binding for isolation
     _terminal_evidence_spine: InitVar["EvidenceSpine | None"] = None
 
     def __post_init__(self, _terminal_evidence_spine: "EvidenceSpine | None") -> None:
         from research_mission.evidence_spine import EvidencePointer, EvidenceSpine
 
-        for field_name in ("obligation_id", "effect_intent_id"):
+        for field_name in ("obligation_id", "effect_intent_id", "control_domain"):
             object.__setattr__(
                 self,
                 field_name,
@@ -616,6 +627,7 @@ class ReconciliationObligation:
         created_at: datetime,
         evidence_spine: "EvidenceSpine",
         evidence_pointer: "EvidencePointer",
+        control_domain: str,
     ) -> "ReconciliationObligation":
         """Create ESCALATED obligation with terminal disposition from verified evidence.
 
@@ -661,6 +673,7 @@ class ReconciliationObligation:
             probe_history=probe_history,
             terminal_disposition=evidence_pointer,
             created_at=created_at,
+            control_domain=control_domain,
             _terminal_evidence_spine=evidence_spine,
         )
 
@@ -678,6 +691,7 @@ class ReconciliationObligation:
                 else self.terminal_disposition.to_dict()
             ),
             "created_at": self.created_at.isoformat(),
+            "control_domain": self.control_domain,
         }
 
 
@@ -999,7 +1013,8 @@ class EffectIntentRegistry:
     would provide durable storage and prevent double-spending of reservations.
 
     Enforces:
-    - Authority reservation cannot be reused across different effect intents
+    - Control domain isolation: cross-domain objects cannot interact
+    - Authority reservation cannot be reused across different effect intents (within a domain)
     - Idempotent retry with same effect_intent_id only if payload identical
     - No silent overwrites of existing committed intents
     - Tracks successful releases with verified evidence
@@ -1009,25 +1024,33 @@ class EffectIntentRegistry:
     """
 
     def __init__(self) -> None:
-        self._intents: dict[str, EffectIntent] = {}
-        self._dispatches: dict[str, EffectDispatch] = {}
-        self._reservations: dict[str, str] = {}  # reservation_id -> effect_intent_id
-        # Track successful releases: reservation_id -> (effect_intent_id, evidence_fingerprint)
-        self._releases: dict[str, tuple[str, str]] = {}
+        # Domain-scoped storage: (domain, id) -> object
+        self._intents: dict[tuple[str, str], EffectIntent] = {}  # (domain, intent_id) -> intent
+        self._dispatches: dict[tuple[str, str], EffectDispatch] = {}  # (domain, dispatch_id) -> dispatch
+        # Domain-scoped reservation tracking: (domain, reservation_id) -> effect_intent_id
+        self._reservations: dict[tuple[str, str], str] = {}
+        # Domain-scoped releases: (domain, reservation_id) -> (effect_intent_id, evidence_fingerprint)
+        self._releases: dict[tuple[str, str], tuple[str, str]] = {}
 
     def commit_intent(self, intent: EffectIntent) -> None:
         """Commit a write-ahead intent.
 
+        Domain-scoped: intents and reservations are isolated per control_domain.
+
         Raises:
             TypeError: If intent is not an EffectIntent
-            ValueError: If authority reservation already used by different intent
-            ValueError: If effect_intent_id exists with different payload
+            ValueError: If authority reservation already used by different intent (in same domain)
+            ValueError: If effect_intent_id exists with different payload (in same domain)
         """
         if type(intent) is not EffectIntent:
             raise TypeError("intent must be an EffectIntent")
 
-        # Check for idempotent retry (same effect_intent_id)
-        existing_intent = self._intents.get(intent.effect_intent_id)
+        domain = intent.control_domain
+        intent_key = (domain, intent.effect_intent_id)
+        reservation_key = (domain, intent.authority_reservation_id)
+
+        # Check for idempotent retry (same effect_intent_id within domain)
+        existing_intent = self._intents.get(intent_key)
         if existing_intent is not None:
             # Allow only if canonical payload is identical
             if intent.to_dict() != existing_intent.to_dict():
@@ -1037,31 +1060,47 @@ class EffectIntentRegistry:
             # Idempotent retry - safe to return
             return
 
-        # Check for authority reservation double-spend
-        existing_intent_id = self._reservations.get(intent.authority_reservation_id)
+        # Check for authority reservation double-spend (within domain)
+        existing_intent_id = self._reservations.get(reservation_key)
         if existing_intent_id is not None:
-            # Reservation already used by a different intent
+            # Reservation already used by a different intent in this domain
             if existing_intent_id != intent.effect_intent_id:
                 raise ValueError(
                     f"authority reservation {intent.authority_reservation_id} already committed "
                     f"to effect_intent_id {existing_intent_id}"
                 )
 
-        # Commit new intent
-        self._intents[intent.effect_intent_id] = intent
-        self._reservations[intent.authority_reservation_id] = intent.effect_intent_id
+        # Commit new intent (domain-scoped)
+        self._intents[intent_key] = intent
+        self._reservations[reservation_key] = intent.effect_intent_id
 
     def commit_dispatch(self, dispatch: EffectDispatch) -> None:
-        """Register an authoritative dispatch against its committed intent."""
+        """Register an authoritative dispatch against its committed intent.
+
+        Domain-scoped: dispatch must match intent's domain. Cross-domain dispatches are rejected.
+        """
         if type(dispatch) is not EffectDispatch:
             raise TypeError("dispatch must be an EffectDispatch")
 
-        intent = self._intents.get(dispatch.effect_intent_id)
+        domain = dispatch.control_domain
+        intent_key = (domain, dispatch.effect_intent_id)
+        dispatch_key = (domain, dispatch.dispatch_id)
+
+        # Look up intent in the same domain
+        intent = self._intents.get(intent_key)
         if intent is None:
             raise ValueError(
                 f"Cannot register dispatch {dispatch.dispatch_id}: committed effect intent "
                 f"{dispatch.effect_intent_id!r} not found"
             )
+
+        # Verify domain consistency
+        if dispatch.control_domain != intent.control_domain:
+            raise ValueError(
+                f"Domain mismatch: dispatch domain {dispatch.control_domain!r} != "
+                f"intent domain {intent.control_domain!r}"
+            )
+
         if dispatch.attempt_id != intent.attempt_id:
             raise ValueError(
                 f"Dispatch attempt_id mismatch: expected {intent.attempt_id!r}, "
@@ -1073,7 +1112,7 @@ class EffectIntentRegistry:
                 f"found {dispatch.idempotency_key!r}"
             )
 
-        existing = self._dispatches.get(dispatch.dispatch_id)
+        existing = self._dispatches.get(dispatch_key)
         if existing is not None:
             if existing.to_dict() != dispatch.to_dict():
                 raise ValueError(
@@ -1081,24 +1120,27 @@ class EffectIntentRegistry:
                 )
             return
 
-        self._dispatches[dispatch.dispatch_id] = dispatch
+        self._dispatches[dispatch_key] = dispatch
 
     def release_reservation(
         self,
         reservation_id: str,
         evidence_spine: "EvidenceSpine",
         evidence_pointer: "EvidencePointer",
+        control_domain: str,
         dispatch_id: str | None = None,
         idempotency_key: str | None = None,
     ) -> None:
         """Release an authority reservation after verified nothing_landed resolution.
+
+        Domain-scoped: reservation must exist in the specified domain.
 
         Requires verified provider boundary reconciliation evidence proving
         NOTHING_LANDED for the exact effect intent bound to this reservation.
         Cannot release on fabricated evidence, INDETERMINATE, or SOMETHING_LANDED.
 
         Tracks successful releases and enforces:
-        - Error if reservation never existed
+        - Error if reservation never existed (in this domain)
         - Idempotent if same evidence
         - Reject if conflicting evidence
         - Preserve state on rejection
@@ -1109,6 +1151,7 @@ class EffectIntentRegistry:
             reservation_id: Reservation to release
             evidence_spine: Authoritative evidence spine
             evidence_pointer: Verified evidence proving NOTHING_LANDED
+            control_domain: Control domain for isolation
             dispatch_id: Dispatch ID to bind evidence to (if dispatch occurred)
             idempotency_key: Idempotency key to validate (if available)
 
@@ -1128,13 +1171,16 @@ class EffectIntentRegistry:
             raise TypeError("evidence_pointer must be an EvidencePointer")
 
         reservation_id = _require_text(reservation_id, "reservation_id")
+        control_domain = _require_text(control_domain, "control_domain")
         if dispatch_id is not None:
             dispatch_id = _require_text(dispatch_id, "dispatch_id")
         if idempotency_key is not None:
             idempotency_key = _require_text(idempotency_key, "idempotency_key")
 
-        # Check if already released
-        existing_release = self._releases.get(reservation_id)
+        reservation_key = (control_domain, reservation_id)
+
+        # Check if already released (in this domain)
+        existing_release = self._releases.get(reservation_key)
         if existing_release is not None:
             existing_effect_intent_id, existing_evidence_fingerprint = existing_release
             # Idempotence is evidence-backed: re-verify the supplied pointer before
@@ -1163,10 +1209,10 @@ class EffectIntentRegistry:
                 f"new fingerprint {evidence_pointer.record_fingerprint}"
             )
 
-        # Check if reservation exists
-        effect_intent_id = self._reservations.get(reservation_id)
+        # Check if reservation exists (in this domain)
+        effect_intent_id = self._reservations.get(reservation_key)
         if effect_intent_id is None:
-            # Not in active reservations and not in releases - never existed
+            # Not in active reservations and not in releases - never existed in this domain
             raise ValueError(
                 f"Reservation {reservation_id} not found: reservation never existed or "
                 f"was already released with different evidence"
@@ -1217,18 +1263,21 @@ class EffectIntentRegistry:
             )
 
         # Verified NOTHING_LANDED - safe to release
-        del self._reservations[reservation_id]
+        del self._reservations[reservation_key]
         # Track release with evidence fingerprint for idempotency
-        self._releases[reservation_id] = (effect_intent_id, evidence_pointer.record_fingerprint)
+        self._releases[reservation_key] = (effect_intent_id, evidence_pointer.record_fingerprint)
 
-    def get_intent(self, effect_intent_id: str) -> EffectIntent | None:
-        """Retrieve committed intent by ID."""
-        return self._intents.get(effect_intent_id)
+    def get_intent(self, effect_intent_id: str, control_domain: str) -> EffectIntent | None:
+        """Retrieve committed intent by ID within specified domain."""
+        effect_intent_id = _require_text(effect_intent_id, "effect_intent_id")
+        control_domain = _require_text(control_domain, "control_domain")
+        return self._intents.get((control_domain, effect_intent_id))
 
-    def get_dispatch(self, dispatch_id: str) -> EffectDispatch | None:
-        """Retrieve an authoritative registered dispatch by ID."""
+    def get_dispatch(self, dispatch_id: str, control_domain: str) -> EffectDispatch | None:
+        """Retrieve an authoritative registered dispatch by ID within specified domain."""
         dispatch_id = _require_text(dispatch_id, "dispatch_id")
-        return self._dispatches.get(dispatch_id)
+        control_domain = _require_text(control_domain, "control_domain")
+        return self._dispatches.get((control_domain, dispatch_id))
 
 
 __all__ = [

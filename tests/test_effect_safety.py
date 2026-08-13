@@ -69,6 +69,7 @@ class TestEffectIntent:
             evidence_reference="evidence-001",
             state="committed_not_dispatched",
             created_at=_now(),
+            control_domain="test-domain",
         )
         assert intent.decision_id == "decision-001"
         assert intent.state == "committed_not_dispatched"
@@ -89,6 +90,7 @@ class TestEffectIntent:
             evidence_reference="evidence-002",
             state="committed_not_dispatched",
             created_at=_now(),
+            control_domain="test-domain",
         )
         # No dispatch exists, so no reconciliation obligation
         assert intent.state == "committed_not_dispatched"
@@ -111,6 +113,7 @@ class TestEffectDispatch:
             provider_operation_id=None,
             evidence_reference="dispatch-evidence-001",
             dispatched_at=_now(),
+            control_domain="test-domain",
         )
         assert dispatch.posture == "attempting"
         assert dispatch.provider_operation_id is None
@@ -129,6 +132,7 @@ class TestEffectDispatch:
             provider_operation_id=None,
             evidence_reference="dispatch-evidence-002",
             dispatched_at=_now(),
+            control_domain="test-domain",
         )
         assert dispatch.posture == "transport_outcome_unknown"
 
@@ -223,6 +227,7 @@ class TestAuthorityReservation:
             reserved_at=_now(),
             disposition_at=None,
             disposition_evidence=None,
+            control_domain="test-domain",
         )
         assert reservation.disposition == AuthorityDisposition.RESERVED
 
@@ -262,6 +267,7 @@ class TestAuthorityReservation:
             reserved_at=_now() - timedelta(minutes=5),
             disposition_at=_now(),
             disposition_evidence=evidence_pointer,
+            control_domain="test-domain",
         )
         assert reservation.disposition == AuthorityDisposition.CONSUMED
 
@@ -301,6 +307,7 @@ class TestAuthorityReservation:
             reserved_at=_now() - timedelta(minutes=5),
             disposition_at=_now(),
             disposition_evidence=evidence_pointer,
+            control_domain="test-domain",
         )
         assert reservation.disposition == AuthorityDisposition.RELEASED
 
@@ -315,6 +322,7 @@ class TestAuthorityReservation:
             reserved_at=_now() - timedelta(hours=1),
             disposition_at=None,
             disposition_evidence=None,
+            control_domain="test-domain",
         )
         assert reservation.disposition == AuthorityDisposition.RESERVED
         # Verify indeterminate does not automatically free reservation
@@ -330,6 +338,7 @@ class TestAuthorityReservation:
             reserved_at=_now() - timedelta(hours=1),
             disposition_at=None,
             disposition_evidence=None,
+            control_domain="test-domain",
         )
         # Attempting to create a new reservation for retry should fail
         # This would be enforced by EffectIntentRegistry
@@ -374,6 +383,7 @@ class TestAuthorityReservation:
             disposition_at=_now(),
             evidence_spine=spine,
             evidence_pointer=pointer,
+            control_domain="test-domain",
         )
         assert reservation.disposition == AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED
         assert reservation.disposition_evidence == pointer
@@ -394,6 +404,7 @@ class TestReconciliationObligation:
             probe_history=(),
             terminal_disposition=None,
             created_at=_now(),
+            control_domain="test-domain",
         )
         assert obligation.state == ReconciliationState.PENDING
 
@@ -411,6 +422,7 @@ class TestReconciliationObligation:
             ),
             terminal_disposition=None,
             created_at=_now() - timedelta(hours=1),
+            control_domain="test-domain",
         )
         assert len(obligation.probe_history) == 1
         assert obligation.state == ReconciliationState.IN_PROGRESS
@@ -456,6 +468,7 @@ class TestReconciliationObligation:
             created_at=_now() - timedelta(days=7),
             evidence_spine=spine,
             evidence_pointer=pointer,
+            control_domain="test-domain",
         )
         assert obligation.terminal_disposition == pointer
         assert obligation.state == ReconciliationState.ESCALATED
@@ -626,12 +639,13 @@ class TestEffectIntentRegistryDoubleSpendPrevention:
             evidence_reference="evidence-001",
             state="committed_not_dispatched",
             created_at=_now(),
+            control_domain="test-domain",
         )
         # First commit
         registry.commit_intent(intent)
         # Idempotent retry - should succeed
         registry.commit_intent(intent)
-        assert registry.get_intent("intent-duplicate-001") == intent
+        assert registry.get_intent("intent-duplicate-001", "test-domain") == intent
 
     def test_second_commit_with_same_intent_id_different_payload_is_rejected(self):
         """Second commit with same effect_intent_id but different payload is rejected."""
@@ -651,6 +665,7 @@ class TestEffectIntentRegistryDoubleSpendPrevention:
             evidence_reference="evidence-001",
             state="committed_not_dispatched",
             created_at=created_time,
+            control_domain="test-domain",
         )
         intent2 = EffectIntent(
             effect_intent_id="intent-overwrite-001",  # Same ID
@@ -666,6 +681,7 @@ class TestEffectIntentRegistryDoubleSpendPrevention:
             evidence_reference="evidence-002",
             state="committed_not_dispatched",
             created_at=created_time,
+            control_domain="test-domain",
         )
         registry.commit_intent(intent1)
         # Attempt to overwrite with different payload should fail
@@ -690,6 +706,7 @@ class TestEffectIntentRegistryDoubleSpendPrevention:
             evidence_reference="evidence-001",
             state="committed_not_dispatched",
             created_at=created_time,
+            control_domain="test-domain",
         )
         intent2 = EffectIntent(
             effect_intent_id="intent-002",  # Different ID
@@ -705,6 +722,7 @@ class TestEffectIntentRegistryDoubleSpendPrevention:
             evidence_reference="evidence-002",
             state="committed_not_dispatched",
             created_at=created_time,
+            control_domain="test-domain",
         )
         registry.commit_intent(intent1)
         # Attempting to use same reservation for different intent should fail
@@ -730,6 +748,7 @@ class TestEffectIntentRegistryDoubleSpendPrevention:
             evidence_reference="evidence-001",
             state="committed_not_dispatched",
             created_at=created_time,
+            control_domain="test-domain",
         )
         registry.commit_intent(intent1)
 
@@ -749,6 +768,7 @@ class TestEffectIntentRegistryDoubleSpendPrevention:
             evidence_reference="evidence-002",
             state="committed_not_dispatched",
             created_at=created_time,
+            control_domain="test-domain",
         )
         # This succeeds because it's a different reservation
         # The key is that reservation-indeterminate is still held
@@ -769,6 +789,7 @@ class TestEffectIntentRegistryDoubleSpendPrevention:
             evidence_reference="evidence-003",
             state="committed_not_dispatched",
             created_at=created_time,
+            control_domain="test-domain",
         )
         with pytest.raises(ValueError, match="authority reservation.*already committed"):
             registry.commit_intent(intent3)
@@ -798,6 +819,7 @@ class TestEffectIntentRegistryDoubleSpendPrevention:
             evidence_reference="evidence-001",
             state="committed_not_dispatched",
             created_at=created_time,
+            control_domain="test-domain",
         )
         registry.commit_intent(intent1)
 
@@ -818,7 +840,7 @@ class TestEffectIntentRegistryDoubleSpendPrevention:
         spine = EvidenceSpine.from_records([record])
 
         # Effect resolves to nothing_landed, reservation released
-        registry.release_reservation("reservation-released", spine, pointer)
+        registry.release_reservation("reservation-released", spine, pointer, "test-domain")
 
         # Now the reservation can be reused
         intent2 = EffectIntent(
@@ -835,9 +857,10 @@ class TestEffectIntentRegistryDoubleSpendPrevention:
             evidence_reference="evidence-002",
             state="committed_not_dispatched",
             created_at=created_time,
+            control_domain="test-domain",
         )
         registry.commit_intent(intent2)  # Should succeed
-        assert registry.get_intent("intent-reuse-002") == intent2
+        assert registry.get_intent("intent-reuse-002", "test-domain") == intent2
 
     def test_consumed_reservation_cannot_be_reused(self):
         """Consumed or assumed_consumed_unreconciled reservation cannot be reused."""
@@ -857,6 +880,7 @@ class TestEffectIntentRegistryDoubleSpendPrevention:
             evidence_reference="evidence-001",
             state="committed_not_dispatched",
             created_at=created_time,
+            control_domain="test-domain",
         )
         registry.commit_intent(intent1)
 
@@ -878,6 +902,7 @@ class TestEffectIntentRegistryDoubleSpendPrevention:
             evidence_reference="evidence-002",
             state="committed_not_dispatched",
             created_at=created_time,
+            control_domain="test-domain",
         )
         with pytest.raises(ValueError, match="authority reservation.*already committed"):
             registry.commit_intent(intent2)
@@ -1020,6 +1045,7 @@ class TestAssumedConsumedUnreconciledEvidenceRequirement:
                 reserved_at=_now() - timedelta(days=7),
                 disposition_at=_now(),
                 disposition_evidence=None,  # Missing evidence
+                control_domain="test-domain",
             )
 
     def test_assumed_consumed_with_timeout_only_evidence_is_rejected(self):
@@ -1034,6 +1060,7 @@ class TestAssumedConsumedUnreconciledEvidenceRequirement:
                 reserved_at=_now() - timedelta(days=7),
                 disposition_at=_now(),
                 disposition_evidence="timeout:7d",  # Invalid: string not EvidencePointer
+                control_domain="test-domain",
             )
 
     def test_assumed_consumed_with_arbitrary_text_is_rejected(self):
@@ -1048,6 +1075,7 @@ class TestAssumedConsumedUnreconciledEvidenceRequirement:
                 reserved_at=_now() - timedelta(days=7),
                 disposition_at=_now(),
                 disposition_evidence="some arbitrary unstructured text",
+                control_domain="test-domain",
             )
 
     def test_assumed_consumed_with_valid_escalation_evidence_succeeds(self):
@@ -1088,6 +1116,7 @@ class TestAssumedConsumedUnreconciledEvidenceRequirement:
             disposition_at=_now(),
             evidence_spine=spine,
             evidence_pointer=pointer,
+            control_domain="test-domain",
         )
         assert reservation.disposition == AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED
         assert reservation.disposition_evidence == pointer
@@ -1309,6 +1338,7 @@ class TestEvidenceAuthenticityEnforcement:
             evidence_reference="evidence-008-a",
             state="committed_not_dispatched",
             created_at=created_time,
+            control_domain="test-domain",
         )
         intent2 = EffectIntent(
             effect_intent_id="intent-008-b",
@@ -1324,6 +1354,7 @@ class TestEvidenceAuthenticityEnforcement:
             evidence_reference="evidence-008-b",
             state="committed_not_dispatched",
             created_at=created_time,
+            control_domain="test-domain",
         )
         registry.commit_intent(intent1)
         registry.commit_intent(intent2)
@@ -1335,7 +1366,7 @@ class TestEvidenceAuthenticityEnforcement:
 
         # Try to release reservation-008-b with evidence for intent-008-a
         with pytest.raises(ValueError, match="effect_intent_id mismatch"):
-            registry.release_reservation("reservation-008-b", spine_a, pointer_a)
+            registry.release_reservation("reservation-008-b", spine_a, pointer_a, "test-domain")
 
     def test_9_timeout_only_evidence_cannot_resolve(self):
         """9. Timeout-only evidence cannot resolve an effect."""
@@ -1429,15 +1460,16 @@ class TestEvidenceAuthenticityEnforcement:
             evidence_reference="evidence-011",
             state="committed_not_dispatched",
             created_at=created_time,
+            control_domain="test-domain",
         )
         registry.commit_intent(intent)
 
         # Try to release without evidence
         with pytest.raises(TypeError, match="evidence_spine must be an EvidenceSpine"):
-            registry.release_reservation("reservation-011", None, None)
+            registry.release_reservation("reservation-011", None, None, "test-domain")
 
         # Reservation should still be bound
-        assert "reservation-011" in registry._reservations
+        assert ("test-domain", "reservation-011") in registry._reservations
 
     def test_12_something_landed_evidence_cannot_release_authority(self):
         """12. SOMETHING_LANDED evidence cannot release authority."""
@@ -1458,6 +1490,7 @@ class TestEvidenceAuthenticityEnforcement:
             evidence_reference="evidence-012",
             state="committed_not_dispatched",
             created_at=created_time,
+            control_domain="test-domain",
         )
         registry.commit_intent(intent)
 
@@ -1468,10 +1501,10 @@ class TestEvidenceAuthenticityEnforcement:
 
         # Try to release with SOMETHING_LANDED evidence
         with pytest.raises(ValueError, match="not 'no_operation_committed'"):
-            registry.release_reservation("reservation-012", spine, pointer)
+            registry.release_reservation("reservation-012", spine, pointer, "test-domain")
 
         # Reservation should still be bound
-        assert "reservation-012" in registry._reservations
+        assert ("test-domain", "reservation-012") in registry._reservations
 
     def test_13_indeterminate_evidence_cannot_release_authority(self):
         """13. INDETERMINATE evidence cannot release authority."""
@@ -1511,6 +1544,7 @@ class TestEvidenceAuthenticityEnforcement:
             evidence_reference="evidence-014",
             state="committed_not_dispatched",
             created_at=created_time,
+            control_domain="test-domain",
         )
         registry.commit_intent(intent)
 
@@ -1520,7 +1554,7 @@ class TestEvidenceAuthenticityEnforcement:
         )
 
         # Release should succeed
-        registry.release_reservation("reservation-014", spine, pointer)
+        registry.release_reservation("reservation-014", spine, pointer, "test-domain")
 
         # Reservation should be released
         assert "reservation-014" not in registry._reservations
@@ -1544,6 +1578,7 @@ class TestEvidenceAuthenticityEnforcement:
             evidence_reference="evidence-015",
             state="committed_not_dispatched",
             created_at=created_time,
+            control_domain="test-domain",
         )
         registry.commit_intent(intent)
 
@@ -1553,8 +1588,8 @@ class TestEvidenceAuthenticityEnforcement:
         )
 
         # Release twice
-        registry.release_reservation("reservation-015", spine, pointer)
-        registry.release_reservation("reservation-015", spine, pointer)
+        registry.release_reservation("reservation-015", spine, pointer, "test-domain")
+        registry.release_reservation("reservation-015", spine, pointer, "test-domain")
 
         # Reservation should still be released (idempotent)
         assert "reservation-015" not in registry._reservations
@@ -1647,6 +1682,7 @@ class TestTerminalDispositionSecurityBoundary:
                 disposition_at=_now(),
                 evidence_spine=empty_spine,
                 evidence_pointer=pointer,
+                control_domain="test-domain",
             )
 
     def test_2_wrong_source_type_rejected(self):
@@ -1684,6 +1720,7 @@ class TestTerminalDispositionSecurityBoundary:
                 disposition_at=_now(),
                 evidence_spine=spine,
                 evidence_pointer=pointer,
+                control_domain="test-domain",
             )
 
     def test_3_wrong_decision_type_rejected(self):
@@ -1745,6 +1782,7 @@ class TestTerminalDispositionSecurityBoundary:
                 disposition_at=_now(),
                 evidence_spine=spine,
                 evidence_pointer=pointer,
+                control_domain="test-domain",
             )
 
     def test_6_wrong_reservation_id_rejected(self):
@@ -1763,6 +1801,7 @@ class TestTerminalDispositionSecurityBoundary:
                 disposition_at=_now(),
                 evidence_spine=spine,
                 evidence_pointer=pointer,
+                control_domain="test-domain",
             )
 
     def test_7_wrong_obligation_id_rejected(self):
@@ -1781,6 +1820,7 @@ class TestTerminalDispositionSecurityBoundary:
                 created_at=_now(),
                 evidence_spine=spine,
                 evidence_pointer=pointer,
+                control_domain="test-domain",
             )
 
     def test_8_wrong_dispatch_id_rejected(self):
@@ -1799,6 +1839,7 @@ class TestTerminalDispositionSecurityBoundary:
                 created_at=_now(),
                 evidence_spine=spine,
                 evidence_pointer=pointer,
+                control_domain="test-domain",
             )
 
     def test_9_obligation_with_terminal_must_be_escalated(self):
@@ -1817,6 +1858,7 @@ class TestTerminalDispositionSecurityBoundary:
             created_at=_now(),
             evidence_spine=spine,
             evidence_pointer=pointer,
+            control_domain="test-domain",
         )
         assert obligation.state == ReconciliationState.ESCALATED
 
@@ -1835,6 +1877,7 @@ class TestTerminalDispositionSecurityBoundary:
             disposition_at=_now(),
             evidence_spine=spine,
             evidence_pointer=pointer,
+            control_domain="test-domain",
         )
         assert reservation.disposition == AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED
 
@@ -1864,7 +1907,7 @@ class TestTerminalDispositionSecurityBoundary:
         spine = EvidenceSpine.from_records([record])
 
         with pytest.raises(ValueError, match="Reservation.*not found"):
-            registry.release_reservation("unknown-reservation", spine, pointer)
+            registry.release_reservation("unknown-reservation", spine, pointer, "test-domain")
 
     def test_12_duplicate_release_same_evidence_idempotent(self):
         """12. Duplicate release with identical evidence is idempotent."""
@@ -1890,6 +1933,7 @@ class TestTerminalDispositionSecurityBoundary:
             evidence_reference="evidence-012",
             state="committed_not_dispatched",
             created_at=_now(),
+            control_domain="test-domain",
         )
         registry.commit_intent(intent)
 
@@ -1909,8 +1953,8 @@ class TestTerminalDispositionSecurityBoundary:
         spine = EvidenceSpine.from_records([record])
 
         # Release twice - should be idempotent
-        registry.release_reservation("res-012", spine, pointer)
-        registry.release_reservation("res-012", spine, pointer)  # Should not raise
+        registry.release_reservation("res-012", spine, pointer, "test-domain")
+        registry.release_reservation("res-012", spine, pointer, "test-domain")  # Should not raise
 
     def test_13_duplicate_release_different_evidence_rejected(self):
         """13. Duplicate release with conflicting evidence is rejected."""
@@ -1936,6 +1980,7 @@ class TestTerminalDispositionSecurityBoundary:
             evidence_reference="evidence-013",
             state="committed_not_dispatched",
             created_at=_now(),
+            control_domain="test-domain",
         )
         registry.commit_intent(intent)
 
@@ -1970,11 +2015,11 @@ class TestTerminalDispositionSecurityBoundary:
         spine2 = EvidenceSpine.from_records([record2])
 
         # First release
-        registry.release_reservation("res-013", spine1, pointer1)
+        registry.release_reservation("res-013", spine1, pointer1, "test-domain")
 
         # Second release with different evidence should fail
         with pytest.raises(ValueError, match="already released with different evidence"):
-            registry.release_reservation("res-013", spine2, pointer2)
+            registry.release_reservation("res-013", spine2, pointer2, "test-domain")
 
     def test_14_reconciliation_wrong_dispatch_rejected(self):
         """14. Reconciliation evidence for wrong dispatch is rejected."""
@@ -2071,6 +2116,7 @@ class TestTerminalDispositionSecurityBoundary:
                 reserved_at=_now(),
                 disposition_at=_now(),
                 disposition_evidence=fake_pointer,
+                control_domain="test-domain",
             )
 
     def test_18_legacy_allow_terminal_flag_cannot_bypass_verification(self):
@@ -2121,6 +2167,7 @@ class TestTerminalDispositionSecurityBoundary:
             evidence_reference="evidence-019",
             state="committed_not_dispatched",
             created_at=_now(),
+            control_domain="test-domain",
         )
         registry.commit_intent(intent)
         evidence = ProviderBoundaryReconciliationEvidence(
@@ -2137,7 +2184,7 @@ class TestTerminalDispositionSecurityBoundary:
         record = provider_boundary_reconciliation_record(evidence, mission_id="mission-019")
         pointer = EvidencePointer.from_record(record)
         spine = EvidenceSpine.from_records([record])
-        registry.release_reservation("res-019", spine, pointer)
+        registry.release_reservation("res-019", spine, pointer, "test-domain")
 
         forged_pointer = EvidencePointer(
             key=EvidenceCorrelationKey(
@@ -2149,7 +2196,257 @@ class TestTerminalDispositionSecurityBoundary:
             record_fingerprint=pointer.record_fingerprint,
         )
         with pytest.raises(EvidenceSpineError, match="Evidence not found"):
-            registry.release_reservation("res-019", spine, forged_pointer)
+            registry.release_reservation("res-019", spine, forged_pointer, "test-domain")
+
+
+class TestControlDomainBinding:
+    """CONTROL DOMAIN GAP REMEDIATION — Mandatory domain binding and cross-domain isolation.
+
+    Tests verify that ControlDomain binding is mandatory throughout the effect chain
+    and that cross-domain objects cannot satisfy or mutate one another.
+    """
+
+    def test_effect_intent_requires_control_domain(self):
+        """EffectIntent must have mandatory control_domain field."""
+        # This test will fail until we add control_domain to EffectIntent
+        with pytest.raises((TypeError, AttributeError)):
+            intent = EffectIntent(
+                effect_intent_id="intent-domain-001",
+                decision_id="decision-001",
+                mission_id="mission-001",
+                task_id="task-001",
+                attempt_id="attempt-001",
+                operation_digest=_fingerprint({"op": "test"}),
+                idempotency_key="idem-001",
+                provider_scope="test",
+                authority_reservation_id="res-001",
+                compensation_strategy=None,
+                evidence_reference="evidence-001",
+                state="committed_not_dispatched",
+                created_at=_now(),
+                # Missing control_domain - should fail
+            )
+
+    def test_effect_intent_rejects_empty_control_domain(self):
+        """EffectIntent must reject empty/whitespace control_domain."""
+        with pytest.raises(ValueError, match="control_domain must be a non-empty string"):
+            EffectIntent(
+                effect_intent_id="intent-domain-002",
+                decision_id="decision-002",
+                mission_id="mission-002",
+                task_id="task-002",
+                attempt_id="attempt-002",
+                operation_digest=_fingerprint({"op": "test"}),
+                idempotency_key="idem-002",
+                provider_scope="test",
+                authority_reservation_id="res-002",
+                compensation_strategy=None,
+                evidence_reference="evidence-002",
+                state="committed_not_dispatched",
+                created_at=_now(),
+                control_domain="",  # Empty - should fail
+            )
+
+        with pytest.raises(ValueError, match="control_domain must be a non-empty string"):
+            EffectIntent(
+                effect_intent_id="intent-domain-003",
+                decision_id="decision-003",
+                mission_id="mission-003",
+                task_id="task-003",
+                attempt_id="attempt-003",
+                operation_digest=_fingerprint({"op": "test"}),
+                idempotency_key="idem-003",
+                provider_scope="test",
+                authority_reservation_id="res-003",
+                compensation_strategy=None,
+                evidence_reference="evidence-003",
+                state="committed_not_dispatched",
+                created_at=_now(),
+                control_domain="   ",  # Whitespace - should fail
+            )
+
+    def test_cross_domain_intents_with_same_id_are_isolated(self):
+        """Intents with identical IDs in different domains must not conflict."""
+        registry = EffectIntentRegistry()
+        created_time = _now()
+
+        # Same intent ID in domain A
+        intent_a = EffectIntent(
+            effect_intent_id="intent-shared-id",
+            decision_id="decision-a",
+            mission_id="mission-a",
+            task_id="task-a",
+            attempt_id="attempt-a",
+            operation_digest=_fingerprint({"op": "test-a"}),
+            idempotency_key="idem-a",
+            provider_scope="test",
+            authority_reservation_id="res-a",
+            compensation_strategy=None,
+            evidence_reference="evidence-a",
+            state="committed_not_dispatched",
+            created_at=created_time,
+            control_domain="domain-a",
+        )
+
+        # Same intent ID in domain B (different payload)
+        intent_b = EffectIntent(
+            effect_intent_id="intent-shared-id",  # Same ID!
+            decision_id="decision-b",  # Different payload
+            mission_id="mission-b",
+            task_id="task-b",
+            attempt_id="attempt-b",
+            operation_digest=_fingerprint({"op": "test-b"}),
+            idempotency_key="idem-b",
+            provider_scope="test",
+            authority_reservation_id="res-b",
+            compensation_strategy=None,
+            evidence_reference="evidence-b",
+            state="committed_not_dispatched",
+            created_at=created_time,
+            control_domain="domain-b",  # Different domain
+        )
+
+        # Both should commit successfully (no conflict across domains)
+        registry.commit_intent(intent_a)
+        registry.commit_intent(intent_b)
+
+        # Verify both are stored independently
+        retrieved_a = registry.get_intent("intent-shared-id", "domain-a")
+        retrieved_b = registry.get_intent("intent-shared-id", "domain-b")
+
+        assert retrieved_a == intent_a
+        assert retrieved_b == intent_b
+        assert retrieved_a.decision_id == "decision-a"
+        assert retrieved_b.decision_id == "decision-b"
+
+    def test_cross_domain_idempotency_keys_are_isolated(self):
+        """Idempotency keys are scoped to control_domain."""
+        registry = EffectIntentRegistry()
+        created_time = _now()
+
+        # Same idempotency key in domain A
+        intent_a = EffectIntent(
+            effect_intent_id="intent-idem-a",
+            decision_id="decision-a",
+            mission_id="mission-a",
+            task_id="task-a",
+            attempt_id="attempt-a",
+            operation_digest=_fingerprint({"op": "test-a"}),
+            idempotency_key="shared-idem-key",
+            provider_scope="test",
+            authority_reservation_id="res-a",
+            compensation_strategy=None,
+            evidence_reference="evidence-a",
+            state="committed_not_dispatched",
+            created_at=created_time,
+            control_domain="domain-a",
+        )
+
+        # Same idempotency key in domain B
+        intent_b = EffectIntent(
+            effect_intent_id="intent-idem-b",
+            decision_id="decision-b",
+            mission_id="mission-b",
+            task_id="task-b",
+            attempt_id="attempt-b",
+            operation_digest=_fingerprint({"op": "test-b"}),
+            idempotency_key="shared-idem-key",  # Same idempotency key!
+            provider_scope="test",
+            authority_reservation_id="res-b",
+            compensation_strategy=None,
+            evidence_reference="evidence-b",
+            state="committed_not_dispatched",
+            created_at=created_time,
+            control_domain="domain-b",  # Different domain
+        )
+
+        # Both should commit successfully (idempotency keys are domain-scoped)
+        registry.commit_intent(intent_a)
+        registry.commit_intent(intent_b)
+
+        # Verify both are stored independently
+        assert registry.get_intent("intent-idem-a", "domain-a") == intent_a
+        assert registry.get_intent("intent-idem-b", "domain-b") == intent_b
+
+    def test_cross_domain_authority_reservations_cannot_satisfy(self):
+        """Authority reservation from domain A cannot be used by effect in domain B."""
+        registry = EffectIntentRegistry()
+        created_time = _now()
+
+        # Commit intent with reservation in domain A
+        intent_a = EffectIntent(
+            effect_intent_id="intent-res-a",
+            decision_id="decision-a",
+            mission_id="mission-a",
+            task_id="task-a",
+            attempt_id="attempt-a",
+            operation_digest=_fingerprint({"op": "test-a"}),
+            idempotency_key="idem-a",
+            provider_scope="test",
+            authority_reservation_id="shared-reservation",
+            compensation_strategy=None,
+            evidence_reference="evidence-a",
+            state="committed_not_dispatched",
+            created_at=created_time,
+            control_domain="domain-a",
+        )
+        registry.commit_intent(intent_a)
+
+        # Try to use same reservation ID in domain B (should succeed - reservations are domain-scoped)
+        intent_b = EffectIntent(
+            effect_intent_id="intent-res-b",
+            decision_id="decision-b",
+            mission_id="mission-b",
+            task_id="task-b",
+            attempt_id="attempt-b",
+            operation_digest=_fingerprint({"op": "test-b"}),
+            idempotency_key="idem-b",
+            provider_scope="test",
+            authority_reservation_id="shared-reservation",  # Same reservation ID!
+            compensation_strategy=None,
+            evidence_reference="evidence-b",
+            state="committed_not_dispatched",
+            created_at=created_time,
+            control_domain="domain-b",  # Different domain
+        )
+
+        # Should succeed - reservations are isolated per domain
+        registry.commit_intent(intent_b)
+
+        # Verify both intents exist independently
+        assert registry.get_intent("intent-res-a", "domain-a") == intent_a
+        assert registry.get_intent("intent-res-b", "domain-b") == intent_b
+
+    def test_registry_lookup_requires_domain_match(self):
+        """Registry lookups must verify domain binding."""
+        registry = EffectIntentRegistry()
+        created_time = _now()
+
+        # Commit intent in domain-a
+        intent = EffectIntent(
+            effect_intent_id="intent-lookup-test",
+            decision_id="decision-lookup",
+            mission_id="mission-lookup",
+            task_id="task-lookup",
+            attempt_id="attempt-lookup",
+            operation_digest=_fingerprint({"op": "test"}),
+            idempotency_key="idem-lookup",
+            provider_scope="test",
+            authority_reservation_id="res-lookup",
+            compensation_strategy=None,
+            evidence_reference="evidence-lookup",
+            state="committed_not_dispatched",
+            created_at=created_time,
+            control_domain="domain-a",
+        )
+        registry.commit_intent(intent)
+
+        # Lookup in correct domain - should succeed
+        assert registry.get_intent("intent-lookup-test", "domain-a") == intent
+
+        # Lookup in wrong domain - should return None (not found)
+        assert registry.get_intent("intent-lookup-test", "domain-b") is None
+        assert registry.get_intent("intent-lookup-test", "domain-c") is None
 
 
 class TestAuthoritativeDispatchRegistry:
@@ -2171,6 +2468,7 @@ class TestAuthoritativeDispatchRegistry:
             evidence_reference="evidence-dispatch-registry-001",
             state="committed_not_dispatched",
             created_at=_now(),
+            control_domain="test-domain",
         )
 
     @staticmethod
@@ -2187,6 +2485,7 @@ class TestAuthoritativeDispatchRegistry:
             "provider_operation_id": None,
             "evidence_reference": "dispatch-evidence-registry-001",
             "dispatched_at": _now(),
+            "control_domain": "test-domain",
         }
         values.update(overrides)
         return EffectDispatch(**values)
@@ -2195,14 +2494,14 @@ class TestAuthoritativeDispatchRegistry:
         registry = EffectIntentRegistry()
         with pytest.raises(ValueError, match="committed effect intent.*not found"):
             registry.commit_dispatch(self._dispatch())
-        assert registry.get_dispatch("dispatch-registry-001") is None
+        assert registry.get_dispatch("dispatch-registry-001", "test-domain") is None
 
     def test_dispatch_registers_against_matching_intent(self):
         registry = EffectIntentRegistry()
         dispatch = self._dispatch()
         registry.commit_intent(self._intent())
         registry.commit_dispatch(dispatch)
-        assert registry.get_dispatch(dispatch.dispatch_id) == dispatch
+        assert registry.get_dispatch(dispatch.dispatch_id, "test-domain") == dispatch
 
     def test_exact_duplicate_dispatch_is_idempotent(self):
         registry = EffectIntentRegistry()
@@ -2210,7 +2509,7 @@ class TestAuthoritativeDispatchRegistry:
         registry.commit_intent(self._intent())
         registry.commit_dispatch(dispatch)
         registry.commit_dispatch(dispatch)
-        assert registry.get_dispatch(dispatch.dispatch_id) == dispatch
+        assert registry.get_dispatch(dispatch.dispatch_id, "test-domain") == dispatch
 
     def test_dispatch_id_conflict_is_rejected_without_overwrite(self):
         registry = EffectIntentRegistry()
@@ -2220,18 +2519,18 @@ class TestAuthoritativeDispatchRegistry:
         registry.commit_dispatch(original)
         with pytest.raises(ValueError, match="already registered with different payload"):
             registry.commit_dispatch(conflicting)
-        assert registry.get_dispatch(original.dispatch_id) == original
+        assert registry.get_dispatch(original.dispatch_id, "test-domain") == original
 
     def test_dispatch_attempt_must_match_intent(self):
         registry = EffectIntentRegistry()
         registry.commit_intent(self._intent())
         with pytest.raises(ValueError, match="attempt_id mismatch"):
             registry.commit_dispatch(self._dispatch(attempt_id="attempt-wrong"))
-        assert registry.get_dispatch("dispatch-registry-001") is None
+        assert registry.get_dispatch("dispatch-registry-001", "test-domain") is None
 
     def test_dispatch_idempotency_key_must_match_intent(self):
         registry = EffectIntentRegistry()
         registry.commit_intent(self._intent())
         with pytest.raises(ValueError, match="idempotency_key mismatch"):
             registry.commit_dispatch(self._dispatch(idempotency_key="idem-wrong"))
-        assert registry.get_dispatch("dispatch-registry-001") is None
+        assert registry.get_dispatch("dispatch-registry-001", "test-domain") is None
