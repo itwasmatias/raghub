@@ -48,6 +48,25 @@ def _check_env_file_reference(text: str) -> bool:
     return bool(re.search(r"\.env\b", text))
 
 
+def _parse_timestamp(value: Any, field_name: str) -> datetime:
+    """Parse an ISO-8601 timestamp and require timezone awareness."""
+    if isinstance(value, str):
+        try:
+            timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise DevStatusValidationError(
+                f"{field_name} must be a valid ISO-8601 timestamp"
+            ) from exc
+    elif isinstance(value, datetime):
+        timestamp = value
+    else:
+        raise DevStatusValidationError(f"{field_name} must be ISO-8601 string or datetime")
+
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise DevStatusValidationError(f"{field_name} must be timezone-aware")
+    return timestamp
+
+
 def validate_dev_status(data: Any, *, reference_time: datetime | None = None) -> dict[str, Any]:
     """Validate dev-status handoff.
 
@@ -75,16 +94,20 @@ def validate_dev_status(data: Any, *, reference_time: datetime | None = None) ->
         raise DevStatusValidationError(f"dev-status missing required field: {missing[0]}")
 
     # Check timestamp freshness
-    timestamp_str = data["timestamp"]
-    if isinstance(timestamp_str, str):
-        timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-    elif isinstance(timestamp_str, datetime):
-        timestamp = timestamp_str
-    else:
-        raise DevStatusValidationError("timestamp must be ISO-8601 string or datetime")
+    timestamp = _parse_timestamp(data["timestamp"], "timestamp")
 
-    now = reference_time.astimezone(timezone.utc) if reference_time is not None else datetime.now(timezone.utc)
-    age = now - timestamp.astimezone(timezone.utc)
+    if reference_time is not None:
+        if reference_time.tzinfo is None or reference_time.utcoffset() is None:
+            raise DevStatusValidationError("reference_time must be timezone-aware")
+        now = reference_time.astimezone(timezone.utc)
+    else:
+        now = datetime.now(timezone.utc)
+
+    timestamp_utc = timestamp.astimezone(timezone.utc)
+    if timestamp_utc > now:
+        raise DevStatusValidationError("dev-status timestamp is in the future")
+
+    age = now - timestamp_utc
     if age > timedelta(hours=24):
         raise DevStatusValidationError(f"dev-status is stale (>{age.total_seconds()/3600:.1f} hours old, max 24 hours)")
 

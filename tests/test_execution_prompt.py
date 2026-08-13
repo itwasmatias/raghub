@@ -187,6 +187,37 @@ class TestDevStatusValidation:
                 # Missing repo, branch, head, status
             })
 
+        reference_time = datetime(2026, 8, 12, 12, 0, 0, tzinfo=timezone.utc)
+        with pytest.raises(DevStatusValidationError, match="timestamp is in the future"):
+            validate_dev_status({
+                "timestamp": datetime(2026, 8, 12, 13, 0, 0, tzinfo=timezone.utc).isoformat(),
+                "repo": "/test/repo",
+                "branch": "integration/test",
+                "head": "abc123",
+                "status": "CANONICAL_INTEGRATED",
+                "diff": "",
+            }, reference_time=reference_time)
+
+        with pytest.raises(DevStatusValidationError, match="timestamp must be timezone-aware"):
+            validate_dev_status({
+                "timestamp": datetime(2026, 8, 12, 12, 0, 0).isoformat(),
+                "repo": "/test/repo",
+                "branch": "integration/test",
+                "head": "abc123",
+                "status": "CANONICAL_INTEGRATED",
+                "diff": "",
+            })
+
+        with pytest.raises(DevStatusValidationError, match="valid ISO-8601 timestamp"):
+            validate_dev_status({
+                "timestamp": "not-a-timestamp",
+                "repo": "/test/repo",
+                "branch": "integration/test",
+                "head": "abc123",
+                "status": "CANONICAL_INTEGRATED",
+                "diff": "",
+            })
+
     def test_stale_dev_status_rejected(self):
         """Stale dev-status (too old) must be rejected."""
         stale_time = _now() - timedelta(hours=25)  # > 24 hours old
