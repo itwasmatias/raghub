@@ -1010,6 +1010,7 @@ class EffectIntentRegistry:
 
     def __init__(self) -> None:
         self._intents: dict[str, EffectIntent] = {}
+        self._dispatches: dict[str, EffectDispatch] = {}
         self._reservations: dict[str, str] = {}  # reservation_id -> effect_intent_id
         # Track successful releases: reservation_id -> (effect_intent_id, evidence_fingerprint)
         self._releases: dict[str, tuple[str, str]] = {}
@@ -1049,6 +1050,38 @@ class EffectIntentRegistry:
         # Commit new intent
         self._intents[intent.effect_intent_id] = intent
         self._reservations[intent.authority_reservation_id] = intent.effect_intent_id
+
+    def commit_dispatch(self, dispatch: EffectDispatch) -> None:
+        """Register an authoritative dispatch against its committed intent."""
+        if type(dispatch) is not EffectDispatch:
+            raise TypeError("dispatch must be an EffectDispatch")
+
+        intent = self._intents.get(dispatch.effect_intent_id)
+        if intent is None:
+            raise ValueError(
+                f"Cannot register dispatch {dispatch.dispatch_id}: committed effect intent "
+                f"{dispatch.effect_intent_id!r} not found"
+            )
+        if dispatch.attempt_id != intent.attempt_id:
+            raise ValueError(
+                f"Dispatch attempt_id mismatch: expected {intent.attempt_id!r}, "
+                f"found {dispatch.attempt_id!r}"
+            )
+        if dispatch.idempotency_key != intent.idempotency_key:
+            raise ValueError(
+                f"Dispatch idempotency_key mismatch: expected {intent.idempotency_key!r}, "
+                f"found {dispatch.idempotency_key!r}"
+            )
+
+        existing = self._dispatches.get(dispatch.dispatch_id)
+        if existing is not None:
+            if existing.to_dict() != dispatch.to_dict():
+                raise ValueError(
+                    f"dispatch_id {dispatch.dispatch_id} already registered with different payload"
+                )
+            return
+
+        self._dispatches[dispatch.dispatch_id] = dispatch
 
     def release_reservation(
         self,
@@ -1191,6 +1224,11 @@ class EffectIntentRegistry:
     def get_intent(self, effect_intent_id: str) -> EffectIntent | None:
         """Retrieve committed intent by ID."""
         return self._intents.get(effect_intent_id)
+
+    def get_dispatch(self, dispatch_id: str) -> EffectDispatch | None:
+        """Retrieve an authoritative registered dispatch by ID."""
+        dispatch_id = _require_text(dispatch_id, "dispatch_id")
+        return self._dispatches.get(dispatch_id)
 
 
 __all__ = [

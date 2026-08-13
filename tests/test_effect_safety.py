@@ -2150,3 +2150,88 @@ class TestTerminalDispositionSecurityBoundary:
         )
         with pytest.raises(EvidenceSpineError, match="Evidence not found"):
             registry.release_reservation("res-019", spine, forged_pointer)
+
+
+class TestAuthoritativeDispatchRegistry:
+    """Dispatches are registered only after and against committed intents."""
+
+    @staticmethod
+    def _intent() -> EffectIntent:
+        return EffectIntent(
+            effect_intent_id="intent-dispatch-registry-001",
+            decision_id="decision-dispatch-registry-001",
+            mission_id="mission-dispatch-registry-001",
+            task_id="task-dispatch-registry-001",
+            attempt_id="attempt-dispatch-registry-001",
+            operation_digest=_fingerprint({"op": "dispatch-registry"}),
+            idempotency_key="idem-dispatch-registry-001",
+            provider_scope="provider-dispatch-registry",
+            authority_reservation_id="reservation-dispatch-registry-001",
+            compensation_strategy=None,
+            evidence_reference="evidence-dispatch-registry-001",
+            state="committed_not_dispatched",
+            created_at=_now(),
+        )
+
+    @staticmethod
+    def _dispatch(**overrides: Any) -> EffectDispatch:
+        values = {
+            "dispatch_id": "dispatch-registry-001",
+            "effect_intent_id": "intent-dispatch-registry-001",
+            "attempt_id": "attempt-dispatch-registry-001",
+            "idempotency_key": "idem-dispatch-registry-001",
+            "provider_adapter": "provider-dispatch-registry",
+            "capability_profile_version": "v1",
+            "transport_digest": _fingerprint({"transport": "dispatch-registry"}),
+            "posture": "transport_outcome_unknown",
+            "provider_operation_id": None,
+            "evidence_reference": "dispatch-evidence-registry-001",
+            "dispatched_at": _now(),
+        }
+        values.update(overrides)
+        return EffectDispatch(**values)
+
+    def test_dispatch_requires_committed_intent(self):
+        registry = EffectIntentRegistry()
+        with pytest.raises(ValueError, match="committed effect intent.*not found"):
+            registry.commit_dispatch(self._dispatch())
+        assert registry.get_dispatch("dispatch-registry-001") is None
+
+    def test_dispatch_registers_against_matching_intent(self):
+        registry = EffectIntentRegistry()
+        dispatch = self._dispatch()
+        registry.commit_intent(self._intent())
+        registry.commit_dispatch(dispatch)
+        assert registry.get_dispatch(dispatch.dispatch_id) == dispatch
+
+    def test_exact_duplicate_dispatch_is_idempotent(self):
+        registry = EffectIntentRegistry()
+        dispatch = self._dispatch()
+        registry.commit_intent(self._intent())
+        registry.commit_dispatch(dispatch)
+        registry.commit_dispatch(dispatch)
+        assert registry.get_dispatch(dispatch.dispatch_id) == dispatch
+
+    def test_dispatch_id_conflict_is_rejected_without_overwrite(self):
+        registry = EffectIntentRegistry()
+        original = self._dispatch()
+        conflicting = self._dispatch(posture="accepted_by_transport")
+        registry.commit_intent(self._intent())
+        registry.commit_dispatch(original)
+        with pytest.raises(ValueError, match="already registered with different payload"):
+            registry.commit_dispatch(conflicting)
+        assert registry.get_dispatch(original.dispatch_id) == original
+
+    def test_dispatch_attempt_must_match_intent(self):
+        registry = EffectIntentRegistry()
+        registry.commit_intent(self._intent())
+        with pytest.raises(ValueError, match="attempt_id mismatch"):
+            registry.commit_dispatch(self._dispatch(attempt_id="attempt-wrong"))
+        assert registry.get_dispatch("dispatch-registry-001") is None
+
+    def test_dispatch_idempotency_key_must_match_intent(self):
+        registry = EffectIntentRegistry()
+        registry.commit_intent(self._intent())
+        with pytest.raises(ValueError, match="idempotency_key mismatch"):
+            registry.commit_dispatch(self._dispatch(idempotency_key="idem-wrong"))
+        assert registry.get_dispatch("dispatch-registry-001") is None
