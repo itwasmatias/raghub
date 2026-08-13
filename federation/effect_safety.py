@@ -24,6 +24,7 @@ from enum import Enum
 from typing import Any, TYPE_CHECKING
 
 from federation.effect_boundary import EffectRequest, EffectDecision
+from federation.control_domain import validate_domain_id
 
 if TYPE_CHECKING:
     from research_mission.evidence_spine import EvidencePointer, EvidenceSpine
@@ -59,10 +60,16 @@ def _require_timestamp(value: Any, field: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _require_control_domain(value: Any, field: str) -> str:
+    """Require a canonical control-domain identifier."""
+    return validate_domain_id(value, field)
+
+
 def _verify_terminal_decision_evidence(
     evidence_spine: "EvidenceSpine",
     evidence_pointer: "EvidencePointer",
     expected_effect_intent_id: str,
+    expected_control_domain: str,
     expected_reservation_id: str | None = None,
     expected_obligation_id: str | None = None,
     expected_dispatch_id: str | None = None,
@@ -90,9 +97,17 @@ def _verify_terminal_decision_evidence(
         raise TypeError("evidence_pointer must be an EvidencePointer")
 
     expected_effect_intent_id = _require_text(expected_effect_intent_id, "expected_effect_intent_id")
+    expected_control_domain = _require_control_domain(expected_control_domain, "expected_control_domain")
 
     # Verify evidence exists in spine and fingerprints match
     record = evidence_spine.verify_evidence(evidence_pointer)
+
+    recorded_control_domain = record.key.domain_id
+    if recorded_control_domain != expected_control_domain:
+        raise ValueError(
+            f"Evidence control_domain mismatch: expected {expected_control_domain!r}, "
+            f"found {recorded_control_domain!r}"
+        )
 
     # Verify evidence source is a terminal effect decision
     if record.key.source != "terminal_effect_decision":
@@ -302,6 +317,11 @@ class EffectIntent:
                 _require_text(self.compensation_strategy, "compensation_strategy"),
             )
         object.__setattr__(self, "created_at", _require_timestamp(self.created_at, "created_at"))
+        object.__setattr__(
+            self,
+            "control_domain",
+            _require_control_domain(self.control_domain, "control_domain"),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -371,6 +391,11 @@ class EffectDispatch:
             "dispatched_at",
             _require_timestamp(self.dispatched_at, "dispatched_at"),
         )
+        object.__setattr__(
+            self,
+            "control_domain",
+            _require_control_domain(self.control_domain, "control_domain"),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -435,6 +460,11 @@ class AuthorityReservation:
                 "disposition_at",
                 _require_timestamp(self.disposition_at, "disposition_at"),
             )
+        object.__setattr__(
+            self,
+            "control_domain",
+            _require_control_domain(self.control_domain, "control_domain"),
+        )
 
         # Terminal disposition must be created through verified factory
         if self.disposition == AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED:
@@ -454,6 +484,7 @@ class AuthorityReservation:
                 evidence_spine=_terminal_evidence_spine,
                 evidence_pointer=self.disposition_evidence,
                 expected_effect_intent_id=self.effect_intent_id,
+                expected_control_domain=self.control_domain,
                 expected_reservation_id=self.reservation_id,
             )
         elif self.disposition_evidence is not None:
@@ -502,6 +533,7 @@ class AuthorityReservation:
             evidence_spine=evidence_spine,
             evidence_pointer=evidence_pointer,
             expected_effect_intent_id=effect_intent_id,
+            expected_control_domain=control_domain,
             expected_reservation_id=reservation_id,
         )
 
@@ -586,6 +618,11 @@ class ReconciliationObligation:
             )
         if not isinstance(self.probe_history, tuple):
             raise TypeError("probe_history must be a tuple")
+        object.__setattr__(
+            self,
+            "control_domain",
+            _require_control_domain(self.control_domain, "control_domain"),
+        )
 
         # Terminal disposition must be created through verified factory
         if self.terminal_disposition is not None:
@@ -606,6 +643,7 @@ class ReconciliationObligation:
                 evidence_spine=_terminal_evidence_spine,
                 evidence_pointer=self.terminal_disposition,
                 expected_effect_intent_id=self.effect_intent_id,
+                expected_control_domain=self.control_domain,
                 expected_obligation_id=self.obligation_id,
                 expected_dispatch_id=self.dispatch_id,
             )
@@ -658,6 +696,7 @@ class ReconciliationObligation:
             evidence_spine=evidence_spine,
             evidence_pointer=evidence_pointer,
             expected_effect_intent_id=effect_intent_id,
+            expected_control_domain=control_domain,
             expected_obligation_id=obligation_id,
             expected_dispatch_id=dispatch_id,
         )
@@ -876,6 +915,7 @@ def resolve_indeterminate_from_evidence(
     evidence_spine: "EvidenceSpine",
     evidence_pointer: "EvidencePointer",
     effect_intent_id: str,
+    control_domain: str,
     dispatch_id: str | None = None,
     idempotency_key: str | None = None,
 ) -> EffectState:
@@ -917,6 +957,7 @@ def resolve_indeterminate_from_evidence(
         raise TypeError("evidence_pointer must be an EvidencePointer")
 
     effect_intent_id = _require_text(effect_intent_id, "effect_intent_id")
+    control_domain = _require_control_domain(control_domain, "control_domain")
     if dispatch_id is not None:
         dispatch_id = _require_text(dispatch_id, "dispatch_id")
     if idempotency_key is not None:
@@ -930,6 +971,11 @@ def resolve_indeterminate_from_evidence(
         raise ValueError(
             f"Evidence must be provider_boundary_reconciliation, "
             f"got {record.key.source!r}"
+        )
+    if record.key.domain_id != control_domain:
+        raise ValueError(
+            f"Evidence control_domain mismatch: expected {control_domain!r}, "
+            f"found {record.key.domain_id!r}"
         )
 
     # Verify evidence is for this specific effect intent
@@ -1045,7 +1091,7 @@ class EffectIntentRegistry:
         if type(intent) is not EffectIntent:
             raise TypeError("intent must be an EffectIntent")
 
-        domain = intent.control_domain
+        domain = _require_control_domain(intent.control_domain, "control_domain")
         intent_key = (domain, intent.effect_intent_id)
         reservation_key = (domain, intent.authority_reservation_id)
 
@@ -1082,7 +1128,7 @@ class EffectIntentRegistry:
         if type(dispatch) is not EffectDispatch:
             raise TypeError("dispatch must be an EffectDispatch")
 
-        domain = dispatch.control_domain
+        domain = _require_control_domain(dispatch.control_domain, "control_domain")
         intent_key = (domain, dispatch.effect_intent_id)
         dispatch_key = (domain, dispatch.dispatch_id)
 
@@ -1171,11 +1217,12 @@ class EffectIntentRegistry:
             raise TypeError("evidence_pointer must be an EvidencePointer")
 
         reservation_id = _require_text(reservation_id, "reservation_id")
-        control_domain = _require_text(control_domain, "control_domain")
+        control_domain = _require_control_domain(control_domain, "control_domain")
         if dispatch_id is not None:
             dispatch_id = _require_text(dispatch_id, "dispatch_id")
         if idempotency_key is not None:
             idempotency_key = _require_text(idempotency_key, "idempotency_key")
+        control_domain = _require_control_domain(control_domain, "control_domain")
 
         reservation_key = (control_domain, reservation_id)
 
@@ -1190,6 +1237,11 @@ class EffectIntentRegistry:
                 raise ValueError(
                     f"Evidence must be provider_boundary_reconciliation, "
                     f"got {record.key.source!r}"
+                )
+            if record.key.domain_id != control_domain:
+                raise ValueError(
+                    f"Evidence control_domain mismatch: expected {control_domain!r}, "
+                    f"found {record.key.domain_id!r}"
                 )
             recorded_effect_intent_id = record.metadata.get("effect_intent_id")
             if recorded_effect_intent_id != existing_effect_intent_id:
@@ -1226,6 +1278,11 @@ class EffectIntentRegistry:
             raise ValueError(
                 f"Evidence must be provider_boundary_reconciliation, "
                 f"got {record.key.source!r}"
+            )
+        if record.key.domain_id != control_domain:
+            raise ValueError(
+                f"Evidence control_domain mismatch: expected {control_domain!r}, "
+                f"found {record.key.domain_id!r}"
             )
 
         # Verify evidence is for this specific effect intent
@@ -1270,13 +1327,13 @@ class EffectIntentRegistry:
     def get_intent(self, effect_intent_id: str, control_domain: str) -> EffectIntent | None:
         """Retrieve committed intent by ID within specified domain."""
         effect_intent_id = _require_text(effect_intent_id, "effect_intent_id")
-        control_domain = _require_text(control_domain, "control_domain")
+        control_domain = _require_control_domain(control_domain, "control_domain")
         return self._intents.get((control_domain, effect_intent_id))
 
     def get_dispatch(self, dispatch_id: str, control_domain: str) -> EffectDispatch | None:
         """Retrieve an authoritative registered dispatch by ID within specified domain."""
         dispatch_id = _require_text(dispatch_id, "dispatch_id")
-        control_domain = _require_text(control_domain, "control_domain")
+        control_domain = _require_control_domain(control_domain, "control_domain")
         return self._dispatches.get((control_domain, dispatch_id))
 
 

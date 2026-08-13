@@ -10,6 +10,9 @@ from datetime import datetime, timezone
 from enum import Enum
 
 
+MAX_DOMAIN_ID_LENGTH = 255
+
+
 class DomainLifecycle(str, Enum):
     """Lifecycle state of a control domain."""
 
@@ -25,6 +28,17 @@ def normalize_domain_timestamp(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("timestamp must be timezone-aware")
     return value.astimezone(timezone.utc)
+
+
+def validate_domain_id(value: object, field_name: str = "domain_id") -> str:
+    """Validate a control-domain identifier using canonical rules."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    if len(value) > MAX_DOMAIN_ID_LENGTH:
+        raise ValueError(f"{field_name} exceeds {MAX_DOMAIN_ID_LENGTH} characters")
+    if "\x00" in value:
+        raise ValueError(f"{field_name} must not contain NULL bytes")
+    return value
 
 
 @dataclass(slots=True)
@@ -53,18 +67,11 @@ class ControlDomain:
 
     def __post_init__(self) -> None:
         """Validate control domain fields."""
-        # Maximum field lengths
-        MAX_DOMAIN_ID_LENGTH = 255
         MAX_NAME_LENGTH = 1024
         MAX_OWNER_LENGTH = 512
 
         # Validate domain_id
-        if not isinstance(self.domain_id, str) or not self.domain_id.strip():
-            raise ValueError("domain_id must be a non-empty string")
-        if len(self.domain_id) > MAX_DOMAIN_ID_LENGTH:
-            raise ValueError(f"domain_id exceeds {MAX_DOMAIN_ID_LENGTH} characters")
-        if "\x00" in self.domain_id:
-            raise ValueError("domain_id must not contain NULL bytes")
+        self.domain_id = validate_domain_id(self.domain_id, "domain_id")
 
         # Validate name
         if not isinstance(self.name, str) or not self.name.strip():

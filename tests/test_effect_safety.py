@@ -200,7 +200,11 @@ class TestEffectState:
             provider_scope="test-provider",
             reconciliation_method="idempotency_key_lookup",
         )
-        record = provider_boundary_reconciliation_record(evidence, mission_id="mission-test-001")
+        record = provider_boundary_reconciliation_record(
+            evidence,
+            mission_id="mission-test-001",
+            domain_id="test-domain",
+        )
         pointer = EvidencePointer.from_record(record)
         spine = EvidenceSpine.from_records([record])
 
@@ -209,6 +213,7 @@ class TestEffectState:
             evidence_spine=spine,
             evidence_pointer=pointer,
             effect_intent_id="intent-test-001",
+            control_domain="test-domain",
         )
         assert resolved_state == EffectState.NOTHING_LANDED
 
@@ -366,7 +371,7 @@ class TestAuthorityReservation:
             decided_at=_now(),
             mission_id="mission-006",
             task_id=None,
-            domain_id=None,
+            domain_id="test-domain",
             decision_rationale="Effect permanently indeterminate after 7 days",
         )
         record = terminal_effect_decision_record(decision)
@@ -449,7 +454,7 @@ class TestReconciliationObligation:
             decided_at=_now(),
             mission_id="mission-003",
             task_id=None,
-            domain_id=None,
+            domain_id="test-domain",
             decision_rationale="Provider unreconcilable - policy decision to assume consumed",
         )
         record = terminal_effect_decision_record(decision)
@@ -835,7 +840,11 @@ class TestEffectIntentRegistryDoubleSpendPrevention:
             provider_scope="test-provider",
             reconciliation_method="idempotency_key_lookup",
         )
-        record = provider_boundary_reconciliation_record(evidence, mission_id="mission-001")
+        record = provider_boundary_reconciliation_record(
+            evidence,
+            mission_id="mission-001",
+            domain_id="test-domain",
+        )
         pointer = EvidencePointer.from_record(record)
         spine = EvidenceSpine.from_records([record])
 
@@ -1100,7 +1109,7 @@ class TestAssumedConsumedUnreconciledEvidenceRequirement:
             decided_at=_now(),
             mission_id="mission-assumed-001",
             task_id=None,
-            domain_id=None,
+            domain_id="test-domain",
             decision_rationale="Escalated after exhausting reconciliation",
         )
         record = terminal_effect_decision_record(decision)
@@ -1179,6 +1188,7 @@ class TestEvidenceAuthenticityEnforcement:
         record = provider_boundary_reconciliation_record(
             evidence,
             mission_id=mission_id or "mission-test",
+            domain_id="test-domain",
         )
         pointer = EvidencePointer.from_record(record)
         spine = EvidenceSpine.from_records([record])
@@ -1194,6 +1204,7 @@ class TestEvidenceAuthenticityEnforcement:
                 evidence_spine=EvidenceSpine.from_records([]),
                 evidence_pointer="boundary_reconciliation:fabricated",
                 effect_intent_id="intent-001",
+                control_domain="test-domain",
             )
 
     def test_2_fabricated_reference_rejected(self):
@@ -1212,6 +1223,7 @@ class TestEvidenceAuthenticityEnforcement:
                 evidence_spine=EvidenceSpine.from_records([]),
                 evidence_pointer=fake_ref,
                 effect_intent_id="intent-002",
+                control_domain="test-domain",
             )
 
     def test_3_well_formed_pointer_absent_from_spine_rejected(self):
@@ -1240,6 +1252,7 @@ class TestEvidenceAuthenticityEnforcement:
                 evidence_spine=empty_spine,
                 evidence_pointer=missing_pointer,
                 effect_intent_id="intent-003",
+                control_domain="test-domain",
             )
 
     def test_4_wrong_correlation_key_rejected(self):
@@ -1271,6 +1284,7 @@ class TestEvidenceAuthenticityEnforcement:
                 evidence_spine=spine,
                 evidence_pointer=wrong_pointer,
                 effect_intent_id="intent-004",
+                control_domain="test-domain",
             )
 
     def test_5_wrong_record_fingerprint_rejected(self):
@@ -1294,6 +1308,7 @@ class TestEvidenceAuthenticityEnforcement:
                 evidence_spine=spine,
                 evidence_pointer=wrong_pointer,
                 effect_intent_id="intent-005",
+                control_domain="test-domain",
             )
 
     def test_6_evidence_for_different_effect_intent_rejected(self):
@@ -1308,6 +1323,7 @@ class TestEvidenceAuthenticityEnforcement:
                 evidence_spine=spine,
                 evidence_pointer=pointer,
                 effect_intent_id="intent-wrong",  # Wrong intent ID
+                control_domain="test-domain",
             )
 
     def test_7_evidence_for_different_dispatch_rejected(self):
@@ -1403,6 +1419,7 @@ class TestEvidenceAuthenticityEnforcement:
                 evidence_spine=timeout_spine,
                 evidence_pointer=timeout_pointer,
                 effect_intent_id="intent-009",
+                control_domain="test-domain",
             )
 
     def test_10_task_completion_cannot_resolve(self):
@@ -1439,6 +1456,7 @@ class TestEvidenceAuthenticityEnforcement:
                 evidence_spine=task_spine,
                 evidence_pointer=task_pointer,
                 effect_intent_id="intent-010",
+                control_domain="test-domain",
             )
 
     def test_11_release_reservation_without_evidence_fails(self):
@@ -1632,6 +1650,7 @@ class TestTerminalDispositionSecurityBoundary:
         reservation_id: str | None = None,
         obligation_id: str | None = None,
         dispatch_id: str | None = None,
+        domain_id: str = "test-domain",
     ):
         """Helper to create valid terminal decision evidence and spine."""
         from research_mission import (
@@ -1653,7 +1672,7 @@ class TestTerminalDispositionSecurityBoundary:
             decided_at=_now(),
             mission_id=f"mission-{decision_id}",
             task_id=None,
-            domain_id=None,
+            domain_id=domain_id,
             decision_rationale="Test terminal decision",
         )
         record = terminal_effect_decision_record(decision)
@@ -1699,6 +1718,7 @@ class TestTerminalDispositionSecurityBoundary:
         key = EvidenceCorrelationKey(
             source="escalation_policy",  # Wrong! Should be terminal_effect_decision_*
             record_id="wrong-source-002",
+            domain_id="test-domain",
         )
         ref = EvidenceReference(
             source_revision="wrong-rev",
@@ -1741,7 +1761,7 @@ class TestTerminalDispositionSecurityBoundary:
                 decided_at=_now(),
                 mission_id="mission-003",
                 task_id=None,
-                domain_id=None,
+                domain_id="test-domain",
                 decision_rationale="test",
             )
 
@@ -1762,7 +1782,7 @@ class TestTerminalDispositionSecurityBoundary:
                 decided_at=_now(),
                 mission_id="mission-004",
                 task_id=None,
-                domain_id=None,
+                domain_id="test-domain",
                 decision_rationale="test",
             )
 
@@ -1902,7 +1922,11 @@ class TestTerminalDispositionSecurityBoundary:
             provider_scope="test",
             reconciliation_method="idempotency_key_lookup",
         )
-        record = provider_boundary_reconciliation_record(evidence, mission_id="mission-011")
+        record = provider_boundary_reconciliation_record(
+            evidence,
+            mission_id="mission-011",
+            domain_id="test-domain",
+        )
         pointer = EvidencePointer.from_record(record)
         spine = EvidenceSpine.from_records([record])
 
@@ -1948,7 +1972,11 @@ class TestTerminalDispositionSecurityBoundary:
             provider_scope="test",
             reconciliation_method="idempotency_key_lookup",
         )
-        record = provider_boundary_reconciliation_record(evidence, mission_id="mission-012")
+        record = provider_boundary_reconciliation_record(
+            evidence,
+            mission_id="mission-012",
+            domain_id="test-domain",
+        )
         pointer = EvidencePointer.from_record(record)
         spine = EvidenceSpine.from_records([record])
 
@@ -1995,7 +2023,11 @@ class TestTerminalDispositionSecurityBoundary:
             provider_scope="test",
             reconciliation_method="idempotency_key_lookup",
         )
-        record1 = provider_boundary_reconciliation_record(evidence1, mission_id="mission-013")
+        record1 = provider_boundary_reconciliation_record(
+            evidence1,
+            mission_id="mission-013",
+            domain_id="test-domain",
+        )
         pointer1 = EvidencePointer.from_record(record1)
         spine1 = EvidenceSpine.from_records([record1])
 
@@ -2010,7 +2042,11 @@ class TestTerminalDispositionSecurityBoundary:
             provider_scope="test",
             reconciliation_method="provider_operation_lookup",  # Different method
         )
-        record2 = provider_boundary_reconciliation_record(evidence2, mission_id="mission-013")
+        record2 = provider_boundary_reconciliation_record(
+            evidence2,
+            mission_id="mission-013",
+            domain_id="test-domain",
+        )
         pointer2 = EvidencePointer.from_record(record2)
         spine2 = EvidenceSpine.from_records([record2])
 
@@ -2041,7 +2077,11 @@ class TestTerminalDispositionSecurityBoundary:
             provider_scope="test",
             reconciliation_method="idempotency_key_lookup",
         )
-        record = provider_boundary_reconciliation_record(evidence, mission_id="mission-014")
+        record = provider_boundary_reconciliation_record(
+            evidence,
+            mission_id="mission-014",
+            domain_id="test-domain",
+        )
         pointer = EvidencePointer.from_record(record)
         spine = EvidenceSpine.from_records([record])
 
@@ -2051,6 +2091,7 @@ class TestTerminalDispositionSecurityBoundary:
                 evidence_spine=spine,
                 evidence_pointer=pointer,
                 effect_intent_id="intent-014",
+                control_domain="test-domain",
                 dispatch_id="dispatch-014-WRONG",  # Mismatch!
             )
 
@@ -2074,7 +2115,11 @@ class TestTerminalDispositionSecurityBoundary:
             provider_scope="test",
             reconciliation_method="idempotency_key_lookup",
         )
-        record = provider_boundary_reconciliation_record(evidence, mission_id="mission-015")
+        record = provider_boundary_reconciliation_record(
+            evidence,
+            mission_id="mission-015",
+            domain_id="test-domain",
+        )
         pointer = EvidencePointer.from_record(record)
         spine = EvidenceSpine.from_records([record])
 
@@ -2084,6 +2129,7 @@ class TestTerminalDispositionSecurityBoundary:
                 evidence_spine=spine,
                 evidence_pointer=pointer,
                 effect_intent_id="intent-015",
+                control_domain="test-domain",
                 dispatch_id="dispatch-015",
                 idempotency_key="idem-015-WRONG",  # Mismatch!
             )
@@ -2181,7 +2227,11 @@ class TestTerminalDispositionSecurityBoundary:
             provider_scope="test",
             reconciliation_method="idempotency_key_lookup",
         )
-        record = provider_boundary_reconciliation_record(evidence, mission_id="mission-019")
+        record = provider_boundary_reconciliation_record(
+            evidence,
+            mission_id="mission-019",
+            domain_id="test-domain",
+        )
         pointer = EvidencePointer.from_record(record)
         spine = EvidenceSpine.from_records([record])
         registry.release_reservation("res-019", spine, pointer, "test-domain")
@@ -2265,6 +2315,46 @@ class TestControlDomainBinding:
                 control_domain="   ",  # Whitespace - should fail
             )
 
+    def test_effect_intent_rejects_nul_control_domain(self):
+        """EffectIntent must reject NUL-bearing control_domain values."""
+        with pytest.raises(ValueError, match="control_domain must not contain NULL bytes"):
+            EffectIntent(
+                effect_intent_id="intent-domain-004",
+                decision_id="decision-004",
+                mission_id="mission-004",
+                task_id="task-004",
+                attempt_id="attempt-004",
+                operation_digest=_fingerprint({"op": "test"}),
+                idempotency_key="idem-004",
+                provider_scope="test",
+                authority_reservation_id="res-004",
+                compensation_strategy=None,
+                evidence_reference="evidence-004",
+                state="committed_not_dispatched",
+                created_at=_now(),
+                control_domain="domain\x00a",
+            )
+
+    def test_effect_intent_rejects_oversized_control_domain(self):
+        """EffectIntent must reject excessively long control_domain values."""
+        with pytest.raises(ValueError, match="control_domain exceeds 255 characters"):
+            EffectIntent(
+                effect_intent_id="intent-domain-005",
+                decision_id="decision-005",
+                mission_id="mission-005",
+                task_id="task-005",
+                attempt_id="attempt-005",
+                operation_digest=_fingerprint({"op": "test"}),
+                idempotency_key="idem-005",
+                provider_scope="test",
+                authority_reservation_id="res-005",
+                compensation_strategy=None,
+                evidence_reference="evidence-005",
+                state="committed_not_dispatched",
+                created_at=_now(),
+                control_domain="d" * 256,
+            )
+
     def test_cross_domain_intents_with_same_id_are_isolated(self):
         """Intents with identical IDs in different domains must not conflict."""
         registry = EffectIntentRegistry()
@@ -2318,6 +2408,43 @@ class TestControlDomainBinding:
         assert retrieved_b == intent_b
         assert retrieved_a.decision_id == "decision-a"
         assert retrieved_b.decision_id == "decision-b"
+
+    def test_cross_domain_provider_evidence_is_rejected(self):
+        """Provider-boundary evidence from one domain must not satisfy another."""
+        from research_mission import (
+            ProviderBoundaryReconciliationEvidence,
+            provider_boundary_reconciliation_record,
+            EvidencePointer,
+            EvidenceSpine,
+        )
+
+        evidence = ProviderBoundaryReconciliationEvidence(
+            reconciliation_id="recon-domain-001",
+            effect_intent_id="intent-domain-001",
+            dispatch_id="dispatch-domain-001",
+            idempotency_key="idem-domain-001",
+            provider_operation_id=None,
+            reconciliation_outcome="no_operation_committed",
+            reconciled_at=_now(),
+            provider_scope="test-provider",
+            reconciliation_method="idempotency_key_lookup",
+        )
+        record = provider_boundary_reconciliation_record(
+            evidence,
+            mission_id="mission-domain-001",
+            domain_id="domain-b",
+        )
+        pointer = EvidencePointer.from_record(record)
+        spine = EvidenceSpine.from_records([record])
+
+        with pytest.raises(ValueError, match="control_domain mismatch"):
+            resolve_indeterminate_from_evidence(
+                effect_state=EffectState.INDETERMINATE,
+                evidence_spine=spine,
+                evidence_pointer=pointer,
+                effect_intent_id="intent-domain-001",
+                control_domain="domain-a",
+            )
 
     def test_cross_domain_idempotency_keys_are_isolated(self):
         """Idempotency keys are scoped to control_domain."""
