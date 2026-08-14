@@ -536,3 +536,248 @@ def test_concurrent_v1_migration_converges_on_single_current_version_row() -> No
         finally:
             conn.close()
 
+def test_v1_to_v2_migration_preserves_all_authoritative_records() -> None:
+    """Prove v1→v2 migration preserves every authoritative row byte-for-byte.
+
+    Creates complete representative v1 database with:
+    - EffectIntent (committed, dispatched states)
+    - EffectDispatch (success, failure postures)
+    - AuthorityReservation (RESERVED, CONSUMED, RELEASED dispositions)
+    - ReconciliationObligation (active, terminal states)
+    - ReservationBinding (idempotency binding)
+    - ReservationRelease (release records)
+
+    Verifies all 12 preservation guarantees.
+    """
+    import json
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "store.sqlite3"
+        _create_v1_schema(db_path)
+
+        # Populate complete authoritative v1 data
+        conn = sqlite3.connect(db_path)
+        try:
+            # EffectIntent: committed and dispatched states
+            conn.execute(
+                """
+                INSERT INTO effect_intents VALUES
+                ('domain-a', 'intent-1', 'decision-1', 'mission-1', 'task-1', 'attempt-1',
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'idem-1',
+                 'provider-scope-1', 'reservation-1', NULL, 'evidence-1',
+                 'committed_not_dispatched', '2026-08-01T10:00:00Z'),
+                ('domain-a', 'intent-2', 'decision-2', 'mission-1', 'task-2', 'attempt-2',
+                 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'idem-2',
+                 'provider-scope-2', 'reservation-2', 'abort', 'evidence-2',
+                 'dispatched', '2026-08-02T11:00:00Z')
+                """
+            )
+
+            # EffectDispatch: success and failure postures
+            conn.execute(
+                """
+                INSERT INTO effect_dispatches VALUES
+                ('domain-a', 'dispatch-1', 'intent-2', 'attempt-2', 'idem-2',
+                 'provider-adapter-1', 'profile-v1',
+                 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                 'submitted', 'provider-op-1', 'evidence-3', '2026-08-02T11:05:00Z'),
+                ('domain-a', 'dispatch-2', 'intent-2', 'attempt-2', 'idem-2',
+                 'provider-adapter-1', 'profile-v1',
+                 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+                 'confirmed', 'provider-op-2', 'evidence-4', '2026-08-02T11:10:00Z')
+                """
+            )
+
+            # AuthorityReservation: all dispositions
+            consumed_evidence = json.dumps({
+                "key": {"source": "durable_store", "record_id": "reservation-2"},
+                "reference_fingerprint": "aaaa" * 16,
+                "record_fingerprint": "bbbb" * 16,
+            })
+            released_evidence = json.dumps({
+                "key": {"source": "durable_store", "record_id": "reservation-3"},
+                "reference_fingerprint": "cccc" * 16,
+                "record_fingerprint": "dddd" * 16,
+            })
+            conn.execute(
+                """
+                INSERT INTO authority_reservations VALUES
+                ('domain-a', 'reservation-1', 'intent-1', 'capability-1', 1.0,
+                 'reserved', '2026-08-01T10:00:00Z', NULL, NULL),
+                ('domain-a', 'reservation-2', 'intent-2', 'capability-2', 2.5,
+                 'consumed', '2026-08-02T11:00:00Z', '2026-08-02T11:15:00Z', ?),
+                ('domain-a', 'reservation-3', 'intent-1', 'capability-3', 0.5,
+                 'released', '2026-08-01T10:01:00Z', '2026-08-01T10:30:00Z', ?)
+                """,
+                (consumed_evidence, released_evidence),
+            )
+
+            # ReconciliationObligation: active and terminal
+            conn.execute(
+                """
+                INSERT INTO reconciliation_obligations VALUES
+                ('domain-a', 'obligation-1', 'intent-2', 'dispatch-1',
+                 'active', 'IDEMPOTENCY_KEY_LOOKUP', '2026-08-03T12:00:00Z',
+                 '[{"probed_at": "2026-08-02T12:00:00Z", "outcome": "pending"}]',
+                 NULL, '2026-08-02T11:06:00Z'),
+                ('domain-a', 'obligation-2', 'intent-2', 'dispatch-2',
+                 'terminal', 'PROVIDER_OPERATION_LOOKUP', NULL,
+                 '[{"probed_at": "2026-08-02T12:00:00Z", "outcome": "confirmed"}]',
+                 '{"disposition": "CONSUMED", "finalized_at": "2026-08-02T12:30:00Z"}',
+                 '2026-08-02T11:11:00Z')
+                """
+            )
+
+            # ReservationBinding: idempotency binding
+            conn.execute(
+                """
+                INSERT INTO reservation_bindings VALUES
+                ('domain-a', 'reservation-1', 'intent-1', '2026-08-01T10:00:01Z'),
+                ('domain-a', 'reservation-2', 'intent-2', '2026-08-02T11:00:01Z')
+                """
+            )
+
+            # ReservationRelease: release records
+            conn.execute(
+                """
+                INSERT INTO reservation_releases VALUES
+                ('domain-a', 'reservation-3', 'intent-1',
+                 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+                 '2026-08-01T10:30:00Z')
+                """
+            )
+
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Take pre-migration snapshot
+        conn_snap = sqlite3.connect(db_path)
+        try:
+            v1_tables = [
+                "effect_intents",
+                "effect_dispatches",
+                "authority_reservations",
+                "reconciliation_obligations",
+                "reservation_bindings",
+                "reservation_releases",
+            ]
+
+            pre_migration_data = {}
+            pre_migration_schemas = {}
+
+            for table in v1_tables:
+                # Capture schema
+                schema_rows = conn_snap.execute(
+                    f"SELECT sql FROM sqlite_master WHERE type='table' AND name=?",(table,)
+                ).fetchall()
+                pre_migration_schemas[table] = schema_rows[0][0] if schema_rows else None
+
+                # Capture all rows
+                rows = conn_snap.execute(f"SELECT * FROM {table}").fetchall()
+                pre_migration_data[table] = rows
+
+            pre_version = conn_snap.execute(
+                "SELECT version FROM effect_store_schema"
+            ).fetchall()
+            assert pre_version == [(1,)], "Pre-migration must be v1"
+
+            pre_master = conn_snap.execute(
+                "SELECT name, type, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        finally:
+            conn_snap.close()
+
+        # Trigger migration through DurableEffectStore
+        store = DurableEffectStore(db_path)
+        assert isinstance(store, DurableEffectStore)
+
+        # Post-migration verification
+        conn_post = sqlite3.connect(db_path)
+        try:
+            # Property 1: Schema version is exactly [2]
+            post_version = conn_post.execute(
+                "SELECT version FROM effect_store_schema"
+            ).fetchall()
+            assert post_version == [(2,)], "Post-migration must be exactly [2], not [1,2]"
+
+            # Property 2-8: Every v1 row preserved byte-for-byte
+            post_migration_data = {}
+            for table in v1_tables:
+                rows = conn_post.execute(f"SELECT * FROM {table}").fetchall()
+                post_migration_data[table] = rows
+
+                # Verify row count unchanged
+                assert len(rows) == len(pre_migration_data[table]), (
+                    f"{table}: row count changed {len(pre_migration_data[table])} → {len(rows)}"
+                )
+
+                # Verify byte-for-byte equality
+                assert rows == pre_migration_data[table], (
+                    f"{table}: data changed after migration"
+                )
+
+            # Property 9: Gateway tables exist and are empty
+            gateway_claims = conn_post.execute(
+                "SELECT COUNT(*) FROM effect_gateway_claims"
+            ).fetchone()[0]
+            gateway_permits = conn_post.execute(
+                "SELECT COUNT(*) FROM effect_gateway_permits"
+            ).fetchone()[0]
+            assert gateway_claims == 0, "Gateway claims must be empty post-migration"
+            assert gateway_permits == 0, "Gateway permits must be empty post-migration"
+
+            # Property 11: V1 table schemas unchanged
+            for table in v1_tables:
+                post_schema = conn_post.execute(
+                    f"SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+                ).fetchall()
+                assert post_schema[0][0] == pre_migration_schemas[table], (
+                    f"{table}: schema changed after migration"
+                )
+
+            # Property 12: Only expected differences (schema_version change + gateway tables)
+            post_master = conn_post.execute(
+                "SELECT name, type, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+
+            pre_names = {row[0] for row in pre_master}
+            post_names = {row[0] for row in post_master}
+
+            added_objects = post_names - pre_names
+            expected_additions = {
+                "effect_gateway_claims",
+                "effect_gateway_permits",
+                "idx_gateway_claims_intent",
+                "idx_gateway_claims_idempotency",
+                "idx_gateway_claims_request",
+                "idx_gateway_permits_claim",
+                "idx_gateway_permits_verifier",
+            }
+            assert added_objects == expected_additions, (
+                f"Unexpected schema additions: {added_objects - expected_additions}"
+            )
+
+            removed_objects = pre_names - post_names
+            assert removed_objects == set(), f"Unexpected removals: {removed_objects}"
+        finally:
+            conn_post.close()
+
+        # Property 10: Reopening causes no further mutation
+        store2 = DurableEffectStore(db_path)
+        assert isinstance(store2, DurableEffectStore)
+
+        conn_reopen = sqlite3.connect(db_path)
+        try:
+            reopen_version = conn_reopen.execute(
+                "SELECT version FROM effect_store_schema"
+            ).fetchall()
+            assert reopen_version == [(2,)], "Reopen must preserve [2]"
+
+            for table in v1_tables:
+                reopen_rows = conn_reopen.execute(f"SELECT * FROM {table}").fetchall()
+                assert reopen_rows == post_migration_data[table], (
+                    f"{table}: data changed on reopen"
+                )
+        finally:
+            conn_reopen.close()
