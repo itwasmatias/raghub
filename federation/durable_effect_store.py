@@ -402,8 +402,9 @@ class DurableEffectStore:
                         # Skip future migrations
                         continue
                     connection.executescript(sql)
+                    # Use INSERT OR IGNORE to handle concurrent schema initialization
                     connection.execute(
-                        "INSERT INTO effect_store_schema(version) VALUES (?)",
+                        "INSERT OR IGNORE INTO effect_store_schema(version) VALUES (?)",
                         (version,),
                     )
 
