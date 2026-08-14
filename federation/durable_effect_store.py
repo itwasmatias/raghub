@@ -2269,6 +2269,546 @@ class DurableEffectStore:
         except sqlite3.OperationalError as e:
             raise StorageIntegrityError(f"Failed to retrieve obligation: {e}") from e
 
+    def claim_gateway_dispatch(
+        self,
+        gateway_claim_id: str,
+        request_fingerprint: str,
+        effect_intent_id: str,
+        effect_dispatch_id: str,
+        authority_reservation_id: str,
+        delegation_grant_id: str,
+        delegation_grant_fingerprint: str,
+        requested_capability: str,
+        idempotency_key: str,
+        operation_digest: str,
+        provider_id: str,
+        adapter_id: str,
+        owner_identity: str,
+        claimed_at: datetime,
+        expires_at: datetime,
+        control_domain: str,
+    ) -> None:
+        """Atomically claim gateway dispatch ownership (single-winner).
+
+        Args:
+            gateway_claim_id: Unique claim ID
+            request_fingerprint: Request fingerprint
+            effect_intent_id: Effect intent ID
+            effect_dispatch_id: Effect dispatch ID
+            authority_reservation_id: Authority reservation ID
+            delegation_grant_id: Delegation grant ID
+            delegation_grant_fingerprint: Delegation grant fingerprint
+            requested_capability: Requested capability
+            idempotency_key: Idempotency key
+            operation_digest: Operation digest
+            provider_id: Provider ID
+            adapter_id: Adapter ID
+            owner_identity: Owner identity
+            claimed_at: Claim timestamp
+            expires_at: Claim expiry
+            control_domain: Control domain
+
+        Raises:
+            ConcurrencyConflictError: If claim already exists (another winner)
+            ValueError: If authoritative records missing or mismatched
+            StorageIntegrityError: If transaction fails
+        """
+        domain = validate_domain_id(control_domain, "control_domain")
+        self._ensure_open()
+
+        try:
+            with self._connection() as connection:
+                with connection:
+                    # Verify intent exists
+                    intent_row = connection.execute(
+                        """
+                        SELECT idempotency_key, operation_digest, authority_reservation_id
+                        FROM effect_intents
+                        WHERE control_domain = ? AND effect_intent_id = ?
+                        """,
+                        (domain, effect_intent_id),
+                    ).fetchone()
+                    if intent_row is None:
+                        raise ValueError(
+                            f"effect_intent_id {effect_intent_id!r} not found in domain {domain}"
+                        )
+                    if intent_row[0] != idempotency_key:
+                        raise ValueError(
+                            f"idempotency_key mismatch: intent has {intent_row[0]!r}, "
+                            f"request has {idempotency_key!r}"
+                        )
+                    if intent_row[1] != operation_digest:
+                        raise ValueError(
+                            f"operation_digest mismatch: intent has {intent_row[1]!r}, "
+                            f"request has {operation_digest!r}"
+                        )
+                    if intent_row[2] != authority_reservation_id:
+                        raise ValueError(
+                            f"authority_reservation_id mismatch: intent has {intent_row[2]!r}, "
+                            f"request has {authority_reservation_id!r}"
+                        )
+
+                    # Verify dispatch exists
+                    dispatch_row = connection.execute(
+                        """
+                        SELECT effect_intent_id, idempotency_key
+                        FROM effect_dispatches
+                        WHERE control_domain = ? AND dispatch_id = ?
+                        """,
+                        (domain, effect_dispatch_id),
+                    ).fetchone()
+                    if dispatch_row is None:
+                        raise ValueError(
+                            f"effect_dispatch_id {effect_dispatch_id!r} not found in domain {domain}"
+                        )
+                    if dispatch_row[0] != effect_intent_id:
+                        raise ValueError(
+                            f"dispatch intent mismatch: dispatch has {dispatch_row[0]!r}, "
+                            f"request has {effect_intent_id!r}"
+                        )
+                    if dispatch_row[1] != idempotency_key:
+                        raise ValueError(
+                            f"dispatch idempotency_key mismatch: dispatch has {dispatch_row[1]!r}, "
+                            f"request has {idempotency_key!r}"
+                        )
+
+                    # Verify reservation exists and is RESERVED
+                    reservation_row = connection.execute(
+                        """
+                        SELECT effect_intent_id, disposition
+                        FROM authority_reservations
+                        WHERE control_domain = ? AND reservation_id = ?
+                        """,
+                        (domain, authority_reservation_id),
+                    ).fetchone()
+                    if reservation_row is None:
+                        raise ValueError(
+                            f"authority_reservation_id {authority_reservation_id!r} not found "
+                            f"in domain {domain}"
+                        )
+                    if reservation_row[0] != effect_intent_id:
+                        raise ValueError(
+                            f"reservation intent mismatch: reservation has {reservation_row[0]!r}, "
+                            f"request has {effect_intent_id!r}"
+                        )
+                    if reservation_row[1] != AuthorityDisposition.RESERVED.value:
+                        raise ValueError(
+                            f"authority_reservation_id {authority_reservation_id!r} has disposition "
+                            f"{reservation_row[1]!r}, must be RESERVED"
+                        )
+
+                    # Check for idempotent retry
+                    existing = connection.execute(
+                        """
+                        SELECT request_fingerprint, effect_intent_id, effect_dispatch_id,
+                               authority_reservation_id, delegation_grant_id,
+                               delegation_grant_fingerprint, requested_capability,
+                               idempotency_key, operation_digest, provider_id, adapter_id,
+                               owner_identity, claimed_at, expires_at
+                        FROM effect_gateway_claims
+                        WHERE control_domain = ? AND gateway_claim_id = ?
+                        """,
+                        (domain, gateway_claim_id),
+                    ).fetchone()
+                    if existing is not None:
+                        # Verify exact match for idempotent retry
+                        if (
+                            existing[0] == request_fingerprint
+                            and existing[1] == effect_intent_id
+                            and existing[2] == effect_dispatch_id
+                            and existing[3] == authority_reservation_id
+                            and existing[4] == delegation_grant_id
+                            and existing[5] == delegation_grant_fingerprint
+                            and existing[6] == requested_capability
+                            and existing[7] == idempotency_key
+                            and existing[8] == operation_digest
+                            and existing[9] == provider_id
+                            and existing[10] == adapter_id
+                            and existing[11] == owner_identity
+                            and existing[12] == _serialize_timestamp(claimed_at)
+                            and existing[13] == _serialize_timestamp(expires_at)
+                        ):
+                            return
+                        raise ConcurrencyConflictError(
+                            f"gateway_claim_id {gateway_claim_id!r} already exists with different payload"
+                        )
+
+                    # Insert claim (single-winner enforced by UNIQUE constraints)
+                    try:
+                        connection.execute(
+                            """
+                            INSERT INTO effect_gateway_claims (
+                                control_domain, gateway_claim_id, request_fingerprint,
+                                effect_intent_id, effect_dispatch_id, authority_reservation_id,
+                                delegation_grant_id, delegation_grant_fingerprint,
+                                requested_capability, idempotency_key, operation_digest,
+                                provider_id, adapter_id, owner_identity, state,
+                                claimed_at, expires_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                domain,
+                                gateway_claim_id,
+                                request_fingerprint,
+                                effect_intent_id,
+                                effect_dispatch_id,
+                                authority_reservation_id,
+                                delegation_grant_id,
+                                delegation_grant_fingerprint,
+                                requested_capability,
+                                idempotency_key,
+                                operation_digest,
+                                provider_id,
+                                adapter_id,
+                                owner_identity,
+                                "claimed",
+                                _serialize_timestamp(claimed_at),
+                                _serialize_timestamp(expires_at),
+                            ),
+                        )
+                    except sqlite3.IntegrityError as integrity_error:
+                        # UNIQUE constraint violation - another winner exists
+                        raise ConcurrencyConflictError(
+                            f"Claim conflict: another claim exists for effect_intent_id "
+                            f"{effect_intent_id!r} in domain {domain}"
+                        ) from integrity_error
+
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower():
+                raise ConcurrencyConflictError(
+                    f"Database lock timeout while claiming dispatch {gateway_claim_id}"
+                ) from e
+            raise StorageIntegrityError(f"Failed to claim dispatch: {e}") from e
+
+    def issue_gateway_permit(
+        self,
+        permit_id: str,
+        permit_verifier: str,
+        request_fingerprint: str,
+        effect_intent_id: str,
+        effect_dispatch_id: str,
+        authority_reservation_id: str,
+        gateway_claim_id: str,
+        delegation_grant_id: str,
+        delegation_grant_fingerprint: str,
+        requested_capability: str,
+        operation_digest: str,
+        idempotency_key: str,
+        provider_id: str,
+        adapter_id: str,
+        credential_scope: tuple[str, ...],
+        owner_identity: str,
+        issued_at: datetime,
+        expires_at: datetime,
+        control_domain: str,
+    ) -> None:
+        """Issue a gateway dispatch permit for the winning claim.
+
+        Args:
+            permit_id: Unique permit ID
+            permit_verifier: One-way hash of permit token (NOT the token itself)
+            request_fingerprint: Request fingerprint
+            effect_intent_id: Effect intent ID
+            effect_dispatch_id: Effect dispatch ID
+            authority_reservation_id: Authority reservation ID
+            gateway_claim_id: Gateway claim ID
+            delegation_grant_id: Delegation grant ID
+            delegation_grant_fingerprint: Delegation grant fingerprint
+            requested_capability: Requested capability
+            operation_digest: Operation digest
+            idempotency_key: Idempotency key
+            provider_id: Provider ID
+            adapter_id: Adapter ID
+            credential_scope: Credential scope tuple
+            owner_identity: Owner identity
+            issued_at: Issue timestamp
+            expires_at: Expiry timestamp
+            control_domain: Control domain
+
+        Raises:
+            ValueError: If claim not found or not eligible
+            ConcurrencyConflictError: If permit already exists
+            StorageIntegrityError: If transaction fails
+        """
+        domain = validate_domain_id(control_domain, "control_domain")
+        self._ensure_open()
+
+        try:
+            with self._connection() as connection:
+                with connection:
+                    # Verify claim exists and is in CLAIMED state
+                    claim_row = connection.execute(
+                        """
+                        SELECT state, request_fingerprint, effect_intent_id,
+                               effect_dispatch_id, authority_reservation_id
+                        FROM effect_gateway_claims
+                        WHERE control_domain = ? AND gateway_claim_id = ?
+                        """,
+                        (domain, gateway_claim_id),
+                    ).fetchone()
+                    if claim_row is None:
+                        raise ValueError(
+                            f"gateway_claim_id {gateway_claim_id!r} not found in domain {domain}"
+                        )
+                    if claim_row[0] != "claimed":
+                        raise ValueError(
+                            f"gateway_claim_id {gateway_claim_id!r} has state {claim_row[0]!r}, "
+                            "must be 'claimed'"
+                        )
+                    if claim_row[1] != request_fingerprint:
+                        raise ValueError(
+                            f"request_fingerprint mismatch for claim {gateway_claim_id!r}"
+                        )
+                    if claim_row[2] != effect_intent_id:
+                        raise ValueError(f"effect_intent_id mismatch for claim {gateway_claim_id!r}")
+                    if claim_row[3] != effect_dispatch_id:
+                        raise ValueError(
+                            f"effect_dispatch_id mismatch for claim {gateway_claim_id!r}"
+                        )
+                    if claim_row[4] != authority_reservation_id:
+                        raise ValueError(
+                            f"authority_reservation_id mismatch for claim {gateway_claim_id!r}"
+                        )
+
+                    # Check for idempotent retry
+                    existing = connection.execute(
+                        """
+                        SELECT permit_verifier
+                        FROM effect_gateway_permits
+                        WHERE control_domain = ? AND permit_id = ?
+                        """,
+                        (domain, permit_id),
+                    ).fetchone()
+                    if existing is not None:
+                        if existing[0] == permit_verifier:
+                            return
+                        raise ConcurrencyConflictError(
+                            f"permit_id {permit_id!r} already exists with different verifier"
+                        )
+
+                    # Insert permit
+                    credential_scope_json = json.dumps(list(credential_scope))
+                    connection.execute(
+                        """
+                        INSERT INTO effect_gateway_permits (
+                            control_domain, permit_id, permit_verifier, request_fingerprint,
+                            effect_intent_id, effect_dispatch_id, authority_reservation_id,
+                            gateway_claim_id, delegation_grant_id, delegation_grant_fingerprint,
+                            requested_capability, operation_digest, idempotency_key,
+                            provider_id, adapter_id, credential_scope_json, owner_identity,
+                            issued_at, expires_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            domain,
+                            permit_id,
+                            permit_verifier,
+                            request_fingerprint,
+                            effect_intent_id,
+                            effect_dispatch_id,
+                            authority_reservation_id,
+                            gateway_claim_id,
+                            delegation_grant_id,
+                            delegation_grant_fingerprint,
+                            requested_capability,
+                            operation_digest,
+                            idempotency_key,
+                            provider_id,
+                            adapter_id,
+                            credential_scope_json,
+                            owner_identity,
+                            _serialize_timestamp(issued_at),
+                            _serialize_timestamp(expires_at),
+                        ),
+                    )
+
+                    # Store permit_verifier in claim
+                    connection.execute(
+                        """
+                        UPDATE effect_gateway_claims
+                        SET permit_verifier = ?
+                        WHERE control_domain = ? AND gateway_claim_id = ?
+                        """,
+                        (permit_verifier, domain, gateway_claim_id),
+                    )
+
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower():
+                raise ConcurrencyConflictError(
+                    f"Database lock timeout while issuing permit {permit_id}"
+                ) from e
+            raise StorageIntegrityError(f"Failed to issue permit: {e}") from e
+
+    def verify_and_consume_permit(
+        self,
+        permit_verifier: str,
+        control_domain: str,
+        now: datetime,
+    ) -> str:
+        """Atomically verify and consume permit, transition claim to HANDOFF_STARTED.
+
+        This is the CRITICAL HANDOFF AUTHORIZATION boundary.
+
+        Args:
+            permit_verifier: Permit verifier to validate
+            control_domain: Control domain
+            now: Current timestamp for expiry check
+
+        Returns:
+            gateway_claim_id of the winning claim
+
+        Raises:
+            ValueError: If permit invalid/expired/revoked/consumed
+            ConcurrencyConflictError: If concurrent consumption
+            StorageIntegrityError: If transaction fails
+        """
+        domain = validate_domain_id(control_domain, "control_domain")
+        self._ensure_open()
+
+        try:
+            with self._connection() as connection:
+                # Use BEGIN IMMEDIATE for writer ownership
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    # Find permit by verifier
+                    permit_row = connection.execute(
+                        """
+                        SELECT permit_id, gateway_claim_id, expires_at, consumed_at, revoked_at
+                        FROM effect_gateway_permits
+                        WHERE control_domain = ? AND permit_verifier = ?
+                        """,
+                        (domain, permit_verifier),
+                    ).fetchone()
+
+                    if permit_row is None:
+                        raise ValueError(f"permit not found in domain {domain}")
+
+                    permit_id, gateway_claim_id, expires_at_str, consumed_at, revoked_at = permit_row
+
+                    # Check expiry (strict: now >= expires_at means expired)
+                    expires_at = _deserialize_timestamp(expires_at_str)
+                    if now >= expires_at:
+                        raise ValueError(f"permit {permit_id!r} expired at {expires_at_str}")
+
+                    # Check revoked
+                    if revoked_at is not None:
+                        raise ValueError(f"permit {permit_id!r} was revoked at {revoked_at}")
+
+                    # Check consumed
+                    if consumed_at is not None:
+                        raise ValueError(f"permit {permit_id!r} already consumed at {consumed_at}")
+
+                    # Verify claim exists and is in CLAIMED state
+                    claim_row = connection.execute(
+                        """
+                        SELECT state
+                        FROM effect_gateway_claims
+                        WHERE control_domain = ? AND gateway_claim_id = ?
+                        """,
+                        (domain, gateway_claim_id),
+                    ).fetchone()
+                    if claim_row is None:
+                        raise ValueError(
+                            f"gateway_claim_id {gateway_claim_id!r} not found in domain {domain}"
+                        )
+                    if claim_row[0] != "claimed":
+                        raise ValueError(
+                            f"gateway_claim_id {gateway_claim_id!r} has state {claim_row[0]!r}, "
+                            "expected 'claimed'"
+                        )
+
+                    # ATOMIC: Mark permit consumed AND transition claim to HANDOFF_STARTED
+                    connection.execute(
+                        """
+                        UPDATE effect_gateway_permits
+                        SET consumed_at = ?
+                        WHERE control_domain = ? AND permit_id = ? AND consumed_at IS NULL
+                        """,
+                        (_serialize_timestamp(now), domain, permit_id),
+                    )
+
+                    connection.execute(
+                        """
+                        UPDATE effect_gateway_claims
+                        SET state = 'handoff_started', handoff_started_at = ?
+                        WHERE control_domain = ? AND gateway_claim_id = ? AND state = 'claimed'
+                        """,
+                        (_serialize_timestamp(now), domain, gateway_claim_id),
+                    )
+
+                    connection.commit()
+                    return gateway_claim_id
+
+                except Exception:
+                    connection.rollback()
+                    raise
+
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower():
+                raise ConcurrencyConflictError(
+                    f"Database lock timeout while consuming permit in domain {domain}"
+                ) from e
+            raise StorageIntegrityError(f"Failed to consume permit: {e}") from e
+
+    def get_gateway_claim(
+        self, gateway_claim_id: str, control_domain: str
+    ) -> dict[str, Any] | None:
+        """Retrieve gateway claim by ID.
+
+        Args:
+            gateway_claim_id: Claim ID
+            control_domain: Control domain
+
+        Returns:
+            Claim row dict if found, None otherwise
+        """
+        domain = validate_domain_id(control_domain, "control_domain")
+        self._ensure_open()
+
+        try:
+            with self._connection() as connection:
+                row = connection.execute(
+                    """
+                    SELECT gateway_claim_id, request_fingerprint, effect_intent_id,
+                           effect_dispatch_id, authority_reservation_id, delegation_grant_id,
+                           delegation_grant_fingerprint, requested_capability,
+                           idempotency_key, operation_digest, provider_id, adapter_id,
+                           owner_identity, state, permit_verifier, claimed_at, expires_at,
+                           handoff_started_at, receipt_recorded_at, terminal_at
+                    FROM effect_gateway_claims
+                    WHERE control_domain = ? AND gateway_claim_id = ?
+                    """,
+                    (domain, gateway_claim_id),
+                ).fetchone()
+
+                if row is None:
+                    return None
+
+                return {
+                    "gateway_claim_id": row[0],
+                    "request_fingerprint": row[1],
+                    "effect_intent_id": row[2],
+                    "effect_dispatch_id": row[3],
+                    "authority_reservation_id": row[4],
+                    "delegation_grant_id": row[5],
+                    "delegation_grant_fingerprint": row[6],
+                    "requested_capability": row[7],
+                    "idempotency_key": row[8],
+                    "operation_digest": row[9],
+                    "provider_id": row[10],
+                    "adapter_id": row[11],
+                    "owner_identity": row[12],
+                    "state": row[13],
+                    "permit_verifier": row[14],
+                    "claimed_at": row[15],
+                    "expires_at": row[16],
+                    "handoff_started_at": row[17],
+                    "receipt_recorded_at": row[18],
+                    "terminal_at": row[19],
+                }
+        except sqlite3.OperationalError as e:
+            raise StorageIntegrityError(f"Failed to retrieve claim: {e}") from e
+
     def close(self) -> None:
         """Close the store and release resources.
 

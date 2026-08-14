@@ -68,6 +68,65 @@ class GatewayStateError(GatewayError):
     """Gateway state invariant violated."""
 
 
+class DenialReason(str, Enum):
+    """Closed taxonomy of gateway authorization denial reasons."""
+
+    # Request validation
+    REQUEST_EXPIRED = "request_expired"
+
+    # Claim conflicts
+    CLAIM_CONFLICT = "claim_conflict"
+
+    # Authority and chain validation
+    RESERVATION_MISSING = "reservation_missing"
+    RESERVATION_INELIGIBLE = "reservation_ineligible"
+    INTENT_MISMATCH = "intent_mismatch"
+    DISPATCH_MISMATCH = "dispatch_mismatch"
+
+    # Request binding validation
+    IDEMPOTENCY_MISMATCH = "idempotency_mismatch"
+    REQUEST_FINGERPRINT_MISMATCH = "request_fingerprint_mismatch"
+    DELEGATION_MISMATCH = "delegation_mismatch"
+    CAPABILITY_MISMATCH = "capability_mismatch"
+    PROVIDER_MISMATCH = "provider_mismatch"
+    ADAPTER_MISMATCH = "adapter_mismatch"
+    CREDENTIAL_SCOPE_MISMATCH = "credential_scope_mismatch"
+    OWNER_MISMATCH = "owner_mismatch"
+    OPERATION_DIGEST_MISMATCH = "operation_digest_mismatch"
+
+    # Domain isolation
+    CONTROL_DOMAIN_MISMATCH = "control_domain_mismatch"
+
+    # Permit validation
+    PERMIT_INVALID = "permit_invalid"
+    PERMIT_EXPIRED = "permit_expired"
+    PERMIT_REVOKED = "permit_revoked"
+    PERMIT_ALREADY_CONSUMED = "permit_already_consumed"
+
+    # State machine
+    ILLEGAL_STATE_TRANSITION = "illegal_state_transition"
+    CLAIM_NOT_FOUND = "claim_not_found"
+
+
+@dataclass(slots=True)
+class GatewayDenied(GatewayError):
+    """Gateway authorization denial with semantic reason."""
+
+    reason: DenialReason
+    context: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reason, DenialReason):
+            raise TypeError("reason must be a DenialReason")
+        if not isinstance(self.context, str):
+            raise TypeError("context must be a string")
+
+    def __str__(self) -> str:
+        if self.context:
+            return f"Gateway denied: {self.reason.value} ({self.context})"
+        return f"Gateway denied: {self.reason.value}"
+
+
 class EffectConsequence(str, Enum):
     """Classification of effect external consequence severity."""
 
@@ -549,15 +608,237 @@ class GatewayEffectResult:
                 raise GatewayStateError("resolved results cannot retain reserved authority")
 
 
+class GovernedEffectGateway:
+    """Canonical enforcement path for credential-bearing effect dispatch.
+
+    This gateway provides the mandatory authorization-to-dispatch flow enforcing:
+    - Single-winner dispatch ownership
+    - Single-use cryptographic permits
+    - Atomic permit consumption + handoff authorization
+    - Durable state transitions
+    - Control domain isolation
+    """
+
+    def __init__(self, store: Any, *, clock: Any = None) -> None:
+        """Initialize gateway with durable store.
+
+        Args:
+            store: DurableEffectStore instance
+            clock: Optional clock for testing (defaults to datetime.now(timezone.utc))
+        """
+        self._store = store
+        self._clock = clock if clock is not None else lambda: datetime.now(timezone.utc)
+        self._lock = threading.Lock()
+
+    def claim_dispatch(
+        self, request: GatewayEffectRequest, owner_identity: str
+    ) -> tuple[str, str]:
+        """Claim dispatch ownership (single-winner).
+
+        Args:
+            request: Gateway effect request
+            owner_identity: Identity claiming ownership
+
+        Returns:
+            (gateway_claim_id, request_fingerprint)
+
+        Raises:
+            GatewayDenied: If authorization denied with specific reason
+        """
+        # Check expiry
+        now = self._clock()
+        if now >= request.request_expiry:
+            raise GatewayDenied(DenialReason.REQUEST_EXPIRED, f"expired at {request.request_expiry}")
+
+        request_fingerprint = request.request_fingerprint()
+
+        # Check for idempotent retry by looking for existing claim with this request fingerprint
+        from federation.durable_effect_store import ConcurrencyConflictError
+
+        try:
+            # First try to find existing claim
+            conn = self._store._connect()
+            try:
+                existing_row = conn.execute(
+                    """
+                    SELECT gateway_claim_id, owner_identity
+                    FROM effect_gateway_claims
+                    WHERE control_domain = ? AND request_fingerprint = ?
+                    """,
+                    (request.control_domain, request_fingerprint),
+                ).fetchone()
+            finally:
+                if self._store._memory_connection is None:
+                    conn.close()
+
+            if existing_row is not None:
+                # Idempotent retry - return existing claim if same owner
+                if existing_row[1] == owner_identity:
+                    return (existing_row[0], request_fingerprint)
+                # Different owner means conflict
+                raise GatewayDenied(
+                    DenialReason.CLAIM_CONFLICT,
+                    f"Request already claimed by different owner"
+                )
+        except Exception as e:
+            if isinstance(e, GatewayDenied):
+                raise
+            # Continue to new claim if any error checking for existing
+
+        # Generate new claim ID
+        gateway_claim_id = f"gateway-claim-{secrets.token_urlsafe(16)}"
+
+        # Claim duration: from now to request expiry
+        claimed_at = now
+        expires_at = request.request_expiry
+
+        try:
+            self._store.claim_gateway_dispatch(
+                gateway_claim_id=gateway_claim_id,
+                request_fingerprint=request_fingerprint,
+                effect_intent_id=request.effect_intent_id,
+                effect_dispatch_id=request.effect_dispatch_id,
+                authority_reservation_id=request.authority_reservation_id,
+                delegation_grant_id=request.delegation_grant_id,
+                delegation_grant_fingerprint=request.delegation_grant_fingerprint,
+                requested_capability=request.requested_capability,
+                idempotency_key=request.idempotency_key,
+                operation_digest=request.operation_digest,
+                provider_id=request.provider_id,
+                adapter_id=request.adapter_id,
+                owner_identity=owner_identity,
+                claimed_at=claimed_at,
+                expires_at=expires_at,
+                control_domain=request.control_domain,
+            )
+            return (gateway_claim_id, request_fingerprint)
+        except ValueError as e:
+            # Map ValueError to specific DenialReason
+            msg = str(e).lower()
+            if "not found" in msg:
+                if "intent" in msg:
+                    raise GatewayDenied(DenialReason.INTENT_MISMATCH, str(e)) from e
+                if "dispatch" in msg:
+                    raise GatewayDenied(DenialReason.DISPATCH_MISMATCH, str(e)) from e
+                if "reservation" in msg:
+                    raise GatewayDenied(DenialReason.RESERVATION_MISSING, str(e)) from e
+            if "mismatch" in msg:
+                if "idempotency" in msg:
+                    raise GatewayDenied(DenialReason.IDEMPOTENCY_MISMATCH, str(e)) from e
+                if "operation_digest" in msg:
+                    raise GatewayDenied(DenialReason.OPERATION_DIGEST_MISMATCH, str(e)) from e
+                if "reservation" in msg:
+                    raise GatewayDenied(DenialReason.RESERVATION_INELIGIBLE, str(e)) from e
+            if "disposition" in msg:
+                raise GatewayDenied(DenialReason.RESERVATION_INELIGIBLE, str(e)) from e
+            raise GatewayDenied(DenialReason.RESERVATION_INELIGIBLE, str(e)) from e
+        except Exception as e:
+            if isinstance(e, ConcurrencyConflictError):
+                raise GatewayDenied(DenialReason.CLAIM_CONFLICT, str(e)) from e
+            raise
+
+    def issue_dispatch_permit(self, request: GatewayEffectRequest, gateway_claim_id: str) -> tuple[str, str]:
+        """Issue single-use permit for winning claim.
+
+        Args:
+            request: Gateway effect request
+            gateway_claim_id: Gateway claim ID
+
+        Returns:
+            (permit_id, permit_token) - token is NEVER stored, only verifier
+
+        Raises:
+            GatewayDenied: If authorization denied
+        """
+        # Generate permit
+        permit_id = f"gateway-permit-{secrets.token_urlsafe(16)}"
+        permit_token = _generate_permit_token()
+        permit_verifier = _permit_verifier(permit_token)
+
+        now = self._clock()
+        issued_at = now
+        # Permit inherits request expiry
+        expires_at = request.request_expiry
+
+        try:
+            self._store.issue_gateway_permit(
+                permit_id=permit_id,
+                permit_verifier=permit_verifier,
+                request_fingerprint=request.request_fingerprint(),
+                effect_intent_id=request.effect_intent_id,
+                effect_dispatch_id=request.effect_dispatch_id,
+                authority_reservation_id=request.authority_reservation_id,
+                gateway_claim_id=gateway_claim_id,
+                delegation_grant_id=request.delegation_grant_id,
+                delegation_grant_fingerprint=request.delegation_grant_fingerprint,
+                requested_capability=request.requested_capability,
+                operation_digest=request.operation_digest,
+                idempotency_key=request.idempotency_key,
+                provider_id=request.provider_id,
+                adapter_id=request.adapter_id,
+                credential_scope=request.credential_scope,
+                owner_identity=request.principal_identity,
+                issued_at=issued_at,
+                expires_at=expires_at,
+                control_domain=request.control_domain,
+            )
+            return (permit_id, permit_token)
+        except ValueError as e:
+            raise GatewayDenied(DenialReason.CLAIM_NOT_FOUND, str(e)) from e
+
+    def verify_and_consume_permit(
+        self,
+        permit_token: str,
+        control_domain: str,
+    ) -> str:
+        """Atomically verify and consume permit, authorize provider handoff.
+
+        This is the CRITICAL HANDOFF AUTHORIZATION boundary.
+
+        Args:
+            permit_token: Permit token to consume
+            control_domain: Control domain
+
+        Returns:
+            gateway_claim_id of authorized claim
+
+        Raises:
+            GatewayDenied: If permit invalid/expired/revoked/consumed
+        """
+        permit_verifier = _permit_verifier(permit_token)
+        now = self._clock()
+
+        try:
+            return self._store.verify_and_consume_permit(
+                permit_verifier=permit_verifier,
+                control_domain=control_domain,
+                now=now,
+            )
+        except ValueError as e:
+            msg = str(e).lower()
+            if "expired" in msg:
+                raise GatewayDenied(DenialReason.PERMIT_EXPIRED, str(e)) from e
+            if "revoked" in msg:
+                raise GatewayDenied(DenialReason.PERMIT_REVOKED, str(e)) from e
+            if "consumed" in msg:
+                raise GatewayDenied(DenialReason.PERMIT_ALREADY_CONSUMED, str(e)) from e
+            if "not found" in msg:
+                raise GatewayDenied(DenialReason.PERMIT_INVALID, str(e)) from e
+            raise GatewayDenied(DenialReason.PERMIT_INVALID, str(e)) from e
+
+
 __all__ = [
+    "DenialReason",
     "EffectConsequence",
     "GatewayAuthorizationError",
     "GatewayClaimConflictError",
     "GatewayClaimState",
+    "GatewayDenied",
     "GatewayDispatchPermit",
     "GatewayEffectRequest",
     "GatewayEffectResult",
     "GatewayError",
     "GatewayPermitError",
     "GatewayStateError",
+    "GovernedEffectGateway",
 ]
