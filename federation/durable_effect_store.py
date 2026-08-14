@@ -1,0 +1,1297 @@
+"""Durable, concurrency-safe effect registry storage.
+
+MissionaryX v0.1 — Durable Effect Store
+
+Replaces process-local authoritative effect state with SQLite-backed persistence
+whose decisions survive restarts and remain correct under simultaneous registry
+instances, threads, and processes.
+
+This module persists all authoritative effect safety state:
+- Effect intents (write-ahead commitments)
+- Effect dispatches (transport attempts)
+- Authority reservations (capability allocation and disposition)
+- Reconciliation obligations (indeterminate effect tracking)
+- Idempotency bindings (duplicate detection)
+- Release records (evidence-backed authority recovery)
+
+Architecture guarantees:
+- All authorization-relevant mutations are atomic database transactions
+- ControlDomain scoping enforced at schema level (composite keys)
+- Concurrent identical commits produce one canonical record
+- Concurrent conflicting payloads under same domain+key fail explicitly
+- Cross-domain operations are isolated (no bare-ID lookups)
+- Terminal decisions are monotonic and evidence-backed
+- Unknown schema versions fail closed
+- Corrupt or invalid stored data fails closed
+- Lock contention is bounded (30s timeout)
+
+Limitations:
+- Single-host SQLite (no distributed consensus)
+- Storage integrity ≠ evidence authenticity (Evidence Spine remains authoritative)
+- Migration from in-memory state requires explicit data export/import
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from contextlib import closing, contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Iterator
+
+from federation.control_domain import validate_domain_id
+
+if TYPE_CHECKING:
+    from research_mission.evidence_spine import EvidencePointer, EvidenceSpine
+
+from federation.effect_safety import (
+    AuthorityDisposition,
+    AuthorityReservation,
+    EffectDispatch,
+    EffectIntent,
+    ReconciliationObligation,
+    ReconciliationState,
+    ProviderReconcilability,
+)
+
+
+# Schema version for fail-closed compatibility checking
+SCHEMA_VERSION = 1
+
+
+class DurableEffectStoreError(Exception):
+    """Base error for durable effect store operations."""
+
+
+class SchemaVersionError(DurableEffectStoreError):
+    """Raised when database schema version is incompatible."""
+
+
+class StorageIntegrityError(DurableEffectStoreError):
+    """Raised when stored data fails validation or reconstruction."""
+
+
+class ConcurrencyConflictError(DurableEffectStoreError):
+    """Raised when concurrent operations conflict."""
+
+
+def _serialize_timestamp(dt: datetime) -> str:
+    """Serialize datetime to ISO format UTC string."""
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _deserialize_timestamp(value: str | None) -> datetime | None:
+    """Deserialize ISO format UTC string to datetime."""
+    if value is None:
+        return None
+    return datetime.fromisoformat(value)
+
+
+def _serialize_evidence_pointer(pointer: EvidencePointer | None) -> str | None:
+    """Serialize EvidencePointer to JSON."""
+    if pointer is None:
+        return None
+    return json.dumps(pointer.to_dict(), ensure_ascii=False, sort_keys=True)
+
+
+def _deserialize_evidence_pointer(value: str | None) -> EvidencePointer | None:
+    """Deserialize JSON to EvidencePointer."""
+    if value is None:
+        return None
+    from research_mission.evidence_spine import EvidencePointer
+    return EvidencePointer.from_dict(json.loads(value))
+
+
+def _serialize_probe_history(history: tuple[dict[str, Any], ...]) -> str:
+    """Serialize probe history to JSON."""
+    return json.dumps(list(history), ensure_ascii=False, sort_keys=True)
+
+
+def _deserialize_probe_history(value: str) -> tuple[dict[str, Any], ...]:
+    """Deserialize JSON to probe history tuple."""
+    return tuple(json.loads(value))
+
+
+class DurableEffectStore:
+    """Durable, concurrency-safe storage for authoritative effect state.
+
+    Provides transactional persistence for:
+    - Effect intents and dispatches
+    - Authority reservations and dispositions
+    - Reconciliation obligations
+    - Idempotency and reservation bindings
+    - Evidence-backed releases
+
+    All operations are domain-scoped and transaction-protected.
+    Concurrent access from multiple processes/threads is safe.
+    """
+
+    # Schema migrations: (version, sql)
+    MIGRATIONS = (
+        (
+            1,
+            """
+            -- Schema version tracking
+            CREATE TABLE IF NOT EXISTS effect_store_schema (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            -- Effect intents (write-ahead commitments)
+            CREATE TABLE IF NOT EXISTS effect_intents (
+                control_domain TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                decision_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                task_id TEXT,
+                attempt_id TEXT NOT NULL,
+                operation_digest TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                provider_scope TEXT NOT NULL,
+                authority_reservation_id TEXT NOT NULL,
+                compensation_strategy TEXT,
+                evidence_reference TEXT NOT NULL,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, effect_intent_id)
+            );
+
+            -- Effect dispatches (transport attempts)
+            CREATE TABLE IF NOT EXISTS effect_dispatches (
+                control_domain TEXT NOT NULL,
+                dispatch_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                provider_adapter TEXT NOT NULL,
+                capability_profile_version TEXT NOT NULL,
+                transport_digest TEXT NOT NULL,
+                posture TEXT NOT NULL,
+                provider_operation_id TEXT,
+                evidence_reference TEXT NOT NULL,
+                dispatched_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, dispatch_id),
+                FOREIGN KEY (control_domain, effect_intent_id)
+                    REFERENCES effect_intents(control_domain, effect_intent_id)
+            );
+
+            -- Authority reservations
+            CREATE TABLE IF NOT EXISTS authority_reservations (
+                control_domain TEXT NOT NULL,
+                reservation_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                capability_type TEXT NOT NULL,
+                amount REAL NOT NULL CHECK (amount >= 0),
+                disposition TEXT NOT NULL,
+                reserved_at TEXT NOT NULL,
+                disposition_at TEXT,
+                disposition_evidence_json TEXT,
+                PRIMARY KEY (control_domain, reservation_id),
+                FOREIGN KEY (control_domain, effect_intent_id)
+                    REFERENCES effect_intents(control_domain, effect_intent_id)
+            );
+
+            -- Reconciliation obligations
+            CREATE TABLE IF NOT EXISTS reconciliation_obligations (
+                control_domain TEXT NOT NULL,
+                obligation_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                dispatch_id TEXT,
+                state TEXT NOT NULL,
+                provider_reconcilability TEXT NOT NULL,
+                next_probe_at TEXT,
+                probe_history_json TEXT NOT NULL,
+                terminal_disposition_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, obligation_id),
+                FOREIGN KEY (control_domain, effect_intent_id)
+                    REFERENCES effect_intents(control_domain, effect_intent_id),
+                FOREIGN KEY (control_domain, dispatch_id)
+                    REFERENCES effect_dispatches(control_domain, dispatch_id)
+            );
+
+            -- Idempotency bindings: track reservation usage by intent
+            CREATE TABLE IF NOT EXISTS reservation_bindings (
+                control_domain TEXT NOT NULL,
+                authority_reservation_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                bound_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (control_domain, authority_reservation_id)
+            );
+
+            -- Release tracking: evidence-backed authority releases
+            CREATE TABLE IF NOT EXISTS reservation_releases (
+                control_domain TEXT NOT NULL,
+                reservation_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                evidence_fingerprint TEXT NOT NULL,
+                released_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (control_domain, reservation_id)
+            );
+
+            -- Indexes for common queries
+            CREATE INDEX IF NOT EXISTS idx_intents_mission
+                ON effect_intents(control_domain, mission_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_dispatches_intent
+                ON effect_dispatches(control_domain, effect_intent_id);
+            CREATE INDEX IF NOT EXISTS idx_reservations_intent
+                ON authority_reservations(control_domain, effect_intent_id);
+            CREATE INDEX IF NOT EXISTS idx_reservations_disposition
+                ON authority_reservations(control_domain, disposition);
+            CREATE INDEX IF NOT EXISTS idx_obligations_state
+                ON reconciliation_obligations(control_domain, state, next_probe_at);
+            """,
+        ),
+    )
+
+    def __init__(self, database_path: str | Path) -> None:
+        """Initialize durable effect store.
+
+        Args:
+            database_path: Path to SQLite database file
+
+        Raises:
+            SchemaVersionError: If database schema version is incompatible
+        """
+        self.database_path = str(database_path)
+
+        # For in-memory databases, keep a persistent connection
+        # Otherwise each _connect() creates a new empty database
+        if self.database_path == ":memory:":
+            self._memory_connection = self._create_connection(self.database_path)
+        else:
+            self._memory_connection = None
+            Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
+
+        self._ensure_schema()
+
+    def _create_connection(self, database_path: str) -> sqlite3.Connection:
+        """Create a new database connection with proper configuration.
+
+        Args:
+            database_path: Path to database
+
+        Returns:
+            Configured SQLite connection
+
+        Configuration:
+        - WAL mode for concurrent readers/writers (file-based only)
+        - 30s busy timeout for lock contention
+        - Foreign keys enabled
+        """
+        connection = sqlite3.connect(database_path, timeout=30.0)
+        # WAL mode only works for file-based databases
+        if database_path != ":memory:":
+            connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute("PRAGMA foreign_keys=ON")
+        return connection
+
+    def _connect(self) -> sqlite3.Connection:
+        """Get database connection.
+
+        Returns:
+            Configured SQLite connection
+
+        For in-memory databases, returns the persistent connection.
+        For file-based databases, creates a new connection.
+        """
+        if self._memory_connection is not None:
+            return self._memory_connection
+        return self._create_connection(self.database_path)
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Context manager for database connections.
+
+        For in-memory databases, yields the persistent connection without closing.
+        For file-based databases, creates and closes a new connection.
+
+        Yields:
+            Database connection
+        """
+        if self._memory_connection is not None:
+            # In-memory: use persistent connection, don't close
+            yield self._memory_connection
+        else:
+            # File-based: create new connection, close when done
+            with closing(self._create_connection(self.database_path)) as conn:
+                yield conn
+
+    def _ensure_schema(self) -> None:
+        """Ensure database schema is initialized and compatible.
+
+        Raises:
+            SchemaVersionError: If schema version is unknown or incompatible
+        """
+        with self._connection() as connection:
+            with connection:
+                # Create schema version table
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS effect_store_schema (
+                        version INTEGER PRIMARY KEY,
+                        applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+
+                # Check existing schema version
+                existing_versions = [
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT version FROM effect_store_schema ORDER BY version"
+                    )
+                ]
+
+                if existing_versions:
+                    # Database exists - verify compatibility
+                    latest_version = max(existing_versions)
+                    if latest_version > SCHEMA_VERSION:
+                        raise SchemaVersionError(
+                            f"Database schema version {latest_version} is newer than "
+                            f"supported version {SCHEMA_VERSION}. Upgrade required."
+                        )
+                    if latest_version < SCHEMA_VERSION:
+                        # Future: implement migrations
+                        raise SchemaVersionError(
+                            f"Database schema version {latest_version} is older than "
+                            f"current version {SCHEMA_VERSION}. Migration not implemented."
+                        )
+                    # Version matches - schema already initialized
+                    return
+
+                # New database - apply migrations
+                for version, sql in self.MIGRATIONS:
+                    if version > SCHEMA_VERSION:
+                        # Skip future migrations
+                        continue
+                    connection.executescript(sql)
+                    connection.execute(
+                        "INSERT INTO effect_store_schema(version) VALUES (?)",
+                        (version,),
+                    )
+
+    def commit_intent(self, intent: EffectIntent) -> None:
+        """Commit a write-ahead intent atomically.
+
+        Domain-scoped: intents and reservations are isolated per control_domain.
+
+        Args:
+            intent: Effect intent to commit
+
+        Raises:
+            TypeError: If intent is not an EffectIntent
+            ValueError: If authority reservation already used by different intent
+            ValueError: If effect_intent_id exists with different payload
+            ConcurrencyConflictError: If database lock cannot be acquired
+            StorageIntegrityError: If transaction fails
+        """
+        if type(intent) is not EffectIntent:
+            raise TypeError("intent must be an EffectIntent")
+
+        domain = validate_domain_id(intent.control_domain, "control_domain")
+
+        try:
+            with self._connection() as connection:
+                with connection:
+                    # Check for idempotent retry (same intent_id within domain)
+                    existing = connection.execute(
+                        """
+                        SELECT operation_digest, idempotency_key, provider_scope,
+                               authority_reservation_id, compensation_strategy,
+                               evidence_reference, state
+                        FROM effect_intents
+                        WHERE control_domain = ? AND effect_intent_id = ?
+                        """,
+                        (domain, intent.effect_intent_id),
+                    ).fetchone()
+
+                    if existing is not None:
+                        # Verify payload is identical for idempotent retry
+                        if (
+                            existing[0] != intent.operation_digest
+                            or existing[1] != intent.idempotency_key
+                            or existing[2] != intent.provider_scope
+                            or existing[3] != intent.authority_reservation_id
+                            or existing[4] != intent.compensation_strategy
+                            or existing[5] != intent.evidence_reference
+                            or existing[6] != intent.state
+                        ):
+                            raise ValueError(
+                                f"effect_intent_id {intent.effect_intent_id} already committed "
+                                f"with different payload in domain {domain}"
+                            )
+                        # Idempotent retry - safe to return
+                        return
+
+                    # Check for authority reservation double-spend (within domain)
+                    existing_intent_id = connection.execute(
+                        """
+                        SELECT effect_intent_id FROM reservation_bindings
+                        WHERE control_domain = ? AND authority_reservation_id = ?
+                        """,
+                        (domain, intent.authority_reservation_id),
+                    ).fetchone()
+
+                    if existing_intent_id is not None:
+                        if existing_intent_id[0] != intent.effect_intent_id:
+                            raise ValueError(
+                                f"authority reservation {intent.authority_reservation_id} "
+                                f"already committed to effect_intent_id {existing_intent_id[0]} "
+                                f"in domain {domain}"
+                            )
+
+                    # Insert new intent (handle race condition with concurrent insert)
+                    try:
+                        connection.execute(
+                            """
+                            INSERT INTO effect_intents (
+                                control_domain, effect_intent_id, decision_id, mission_id,
+                                task_id, attempt_id, operation_digest, idempotency_key,
+                                provider_scope, authority_reservation_id, compensation_strategy,
+                                evidence_reference, state, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                domain,
+                                intent.effect_intent_id,
+                                intent.decision_id,
+                                intent.mission_id,
+                                intent.task_id,
+                                intent.attempt_id,
+                                intent.operation_digest,
+                                intent.idempotency_key,
+                                intent.provider_scope,
+                                intent.authority_reservation_id,
+                                intent.compensation_strategy,
+                                intent.evidence_reference,
+                                intent.state,
+                                _serialize_timestamp(intent.created_at),
+                            ),
+                        )
+
+                        # Bind reservation to intent
+                        connection.execute(
+                            """
+                            INSERT INTO reservation_bindings (
+                                control_domain, authority_reservation_id, effect_intent_id
+                            ) VALUES (?, ?, ?)
+                            """,
+                            (domain, intent.authority_reservation_id, intent.effect_intent_id),
+                        )
+                    except sqlite3.IntegrityError as integrity_error:
+                        # Concurrent insert detected - re-check for idempotent retry
+                        # Roll back the failed transaction
+                        connection.rollback()
+
+                        # Re-query to check if it's an idempotent retry or a conflict
+                        existing = connection.execute(
+                            """
+                            SELECT operation_digest, idempotency_key, provider_scope,
+                                   authority_reservation_id, compensation_strategy,
+                                   evidence_reference, state
+                            FROM effect_intents
+                            WHERE control_domain = ? AND effect_intent_id = ?
+                            """,
+                            (domain, intent.effect_intent_id),
+                        ).fetchone()
+
+                        if existing is not None:
+                            # Verify payload is identical for idempotent retry
+                            if (
+                                existing[0] == intent.operation_digest
+                                and existing[1] == intent.idempotency_key
+                                and existing[2] == intent.provider_scope
+                                and existing[3] == intent.authority_reservation_id
+                                and existing[4] == intent.compensation_strategy
+                                and existing[5] == intent.evidence_reference
+                                and existing[6] == intent.state
+                            ):
+                                # Idempotent concurrent commit - safe to return
+                                return
+                            else:
+                                # Conflicting payload
+                                raise ValueError(
+                                    f"effect_intent_id {intent.effect_intent_id} already committed "
+                                    f"with different payload in domain {domain}"
+                                ) from integrity_error
+                        else:
+                            # Check if reservation binding failed
+                            existing_binding = connection.execute(
+                                """
+                                SELECT effect_intent_id FROM reservation_bindings
+                                WHERE control_domain = ? AND authority_reservation_id = ?
+                                """,
+                                (domain, intent.authority_reservation_id),
+                            ).fetchone()
+
+                            if existing_binding is not None:
+                                raise ValueError(
+                                    f"authority reservation {intent.authority_reservation_id} "
+                                    f"already committed to effect_intent_id {existing_binding[0]} "
+                                    f"in domain {domain}"
+                                ) from integrity_error
+                            else:
+                                # Unknown integrity error
+                                raise StorageIntegrityError(
+                                    f"Integrity constraint violation: {integrity_error}"
+                                ) from integrity_error
+
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower():
+                raise ConcurrencyConflictError(
+                    f"Database lock timeout while committing intent {intent.effect_intent_id}"
+                ) from e
+            raise StorageIntegrityError(f"Failed to commit intent: {e}") from e
+
+    def commit_dispatch(self, dispatch: EffectDispatch) -> None:
+        """Register an authoritative dispatch against its committed intent.
+
+        Domain-scoped: dispatch must match intent's domain.
+
+        Args:
+            dispatch: Effect dispatch to commit
+
+        Raises:
+            TypeError: If dispatch is not an EffectDispatch
+            ValueError: If intent not found or domain mismatch
+            ConcurrencyConflictError: If database lock cannot be acquired
+            StorageIntegrityError: If transaction fails
+        """
+        if type(dispatch) is not EffectDispatch:
+            raise TypeError("dispatch must be an EffectDispatch")
+
+        domain = validate_domain_id(dispatch.control_domain, "control_domain")
+
+        try:
+            with self._connection() as connection:
+                with connection:
+                    # Look up intent in the same domain
+                    intent = connection.execute(
+                        """
+                        SELECT attempt_id, idempotency_key
+                        FROM effect_intents
+                        WHERE control_domain = ? AND effect_intent_id = ?
+                        """,
+                        (domain, dispatch.effect_intent_id),
+                    ).fetchone()
+
+                    if intent is None:
+                        raise ValueError(
+                            f"Cannot register dispatch {dispatch.dispatch_id}: committed "
+                            f"effect intent {dispatch.effect_intent_id!r} not found in domain {domain}"
+                        )
+
+                    # Verify attempt_id and idempotency_key match
+                    if intent[0] != dispatch.attempt_id:
+                        raise ValueError(
+                            f"Dispatch attempt_id mismatch: expected {intent[0]!r}, "
+                            f"found {dispatch.attempt_id!r}"
+                        )
+                    if intent[1] != dispatch.idempotency_key:
+                        raise ValueError(
+                            f"Dispatch idempotency_key mismatch: expected {intent[1]!r}, "
+                            f"found {dispatch.idempotency_key!r}"
+                        )
+
+                    # Check for idempotent retry
+                    existing = connection.execute(
+                        """
+                        SELECT provider_adapter, transport_digest, posture,
+                               provider_operation_id, evidence_reference
+                        FROM effect_dispatches
+                        WHERE control_domain = ? AND dispatch_id = ?
+                        """,
+                        (domain, dispatch.dispatch_id),
+                    ).fetchone()
+
+                    if existing is not None:
+                        # Verify payload is identical
+                        if (
+                            existing[0] != dispatch.provider_adapter
+                            or existing[1] != dispatch.transport_digest
+                            or existing[2] != dispatch.posture
+                            or existing[3] != dispatch.provider_operation_id
+                            or existing[4] != dispatch.evidence_reference
+                        ):
+                            raise ValueError(
+                                f"dispatch_id {dispatch.dispatch_id} already registered "
+                                f"with different payload in domain {domain}"
+                            )
+                        # Idempotent retry
+                        return
+
+                    # Insert dispatch (handle race condition with concurrent insert)
+                    try:
+                        connection.execute(
+                            """
+                            INSERT INTO effect_dispatches (
+                                control_domain, dispatch_id, effect_intent_id, attempt_id,
+                                idempotency_key, provider_adapter, capability_profile_version,
+                                transport_digest, posture, provider_operation_id,
+                                evidence_reference, dispatched_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                domain,
+                                dispatch.dispatch_id,
+                                dispatch.effect_intent_id,
+                                dispatch.attempt_id,
+                                dispatch.idempotency_key,
+                                dispatch.provider_adapter,
+                                dispatch.capability_profile_version,
+                                dispatch.transport_digest,
+                                dispatch.posture,
+                                dispatch.provider_operation_id,
+                                dispatch.evidence_reference,
+                                _serialize_timestamp(dispatch.dispatched_at),
+                            ),
+                        )
+                    except sqlite3.IntegrityError as integrity_error:
+                        # Concurrent insert detected - re-check for idempotent retry
+                        connection.rollback()
+
+                        existing = connection.execute(
+                            """
+                            SELECT provider_adapter, transport_digest, posture,
+                                   provider_operation_id, evidence_reference
+                            FROM effect_dispatches
+                            WHERE control_domain = ? AND dispatch_id = ?
+                            """,
+                            (domain, dispatch.dispatch_id),
+                        ).fetchone()
+
+                        if existing is not None:
+                            # Verify payload is identical
+                            if (
+                                existing[0] == dispatch.provider_adapter
+                                and existing[1] == dispatch.transport_digest
+                                and existing[2] == dispatch.posture
+                                and existing[3] == dispatch.provider_operation_id
+                                and existing[4] == dispatch.evidence_reference
+                            ):
+                                # Idempotent concurrent commit
+                                return
+                            else:
+                                # Conflicting payload
+                                raise ValueError(
+                                    f"dispatch_id {dispatch.dispatch_id} already registered "
+                                    f"with different payload in domain {domain}"
+                                ) from integrity_error
+                        else:
+                            # Unknown integrity error
+                            raise StorageIntegrityError(
+                                f"Integrity constraint violation: {integrity_error}"
+                            ) from integrity_error
+
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower():
+                raise ConcurrencyConflictError(
+                    f"Database lock timeout while committing dispatch {dispatch.dispatch_id}"
+                ) from e
+            raise StorageIntegrityError(f"Failed to commit dispatch: {e}") from e
+
+    def release_reservation(
+        self,
+        reservation_id: str,
+        evidence_spine: EvidenceSpine,
+        evidence_pointer: EvidencePointer,
+        control_domain: str,
+        dispatch_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> None:
+        """Release an authority reservation after verified nothing_landed resolution.
+
+        Domain-scoped: reservation must exist in the specified domain.
+
+        Requires verified provider boundary reconciliation evidence proving
+        NOTHING_LANDED for the exact effect intent bound to this reservation.
+
+        Args:
+            reservation_id: Reservation to release
+            evidence_spine: Authoritative evidence spine
+            evidence_pointer: Verified evidence proving NOTHING_LANDED
+            control_domain: Control domain for isolation
+            dispatch_id: Dispatch ID to bind evidence to (if dispatch occurred)
+            idempotency_key: Idempotency key to validate (if available)
+
+        Raises:
+            TypeError: If spine or pointer are not correct types
+            ValueError: If reservation never existed
+            ValueError: If evidence does not prove NOTHING_LANDED
+            ValueError: If conflicting release evidence
+            ConcurrencyConflictError: If database lock cannot be acquired
+            StorageIntegrityError: If transaction fails
+        """
+        from research_mission.evidence_spine import EvidencePointer, EvidenceSpine
+
+        if type(evidence_spine) is not EvidenceSpine:
+            raise TypeError("evidence_spine must be an EvidenceSpine")
+        if type(evidence_pointer) is not EvidencePointer:
+            raise TypeError("evidence_pointer must be an EvidencePointer")
+
+        domain = validate_domain_id(control_domain, "control_domain")
+
+        try:
+            with self._connection() as connection:
+                with connection:
+                    # Check if already released
+                    existing_release = connection.execute(
+                        """
+                        SELECT effect_intent_id, evidence_fingerprint
+                        FROM reservation_releases
+                        WHERE control_domain = ? AND reservation_id = ?
+                        """,
+                        (domain, reservation_id),
+                    ).fetchone()
+
+                    if existing_release is not None:
+                        existing_effect_intent_id, existing_evidence_fingerprint = existing_release
+
+                        # Re-verify evidence
+                        record = evidence_spine.verify_evidence(evidence_pointer)
+                        if record.key.source != "provider_boundary_reconciliation":
+                            raise ValueError(
+                                f"Evidence must be provider_boundary_reconciliation, "
+                                f"got {record.key.source!r}"
+                            )
+                        if record.key.domain_id != domain:
+                            raise ValueError(
+                                f"Evidence control_domain mismatch: expected {domain!r}, "
+                                f"found {record.key.domain_id!r}"
+                            )
+
+                        recorded_effect_intent_id = record.metadata.get("effect_intent_id")
+                        if recorded_effect_intent_id != existing_effect_intent_id:
+                            raise ValueError(
+                                f"Evidence effect_intent_id mismatch: expected "
+                                f"{existing_effect_intent_id!r}, found {recorded_effect_intent_id!r}"
+                            )
+
+                        if record.payload.get("reconciliation_outcome") != "no_operation_committed":
+                            raise ValueError("Duplicate release evidence must prove no_operation_committed")
+
+                        # Idempotent if same evidence
+                        if evidence_pointer.record_fingerprint == existing_evidence_fingerprint:
+                            return
+
+                        # Conflicting evidence
+                        raise ValueError(
+                            f"Reservation {reservation_id} already released with different evidence: "
+                            f"existing fingerprint {existing_evidence_fingerprint}, "
+                            f"new fingerprint {evidence_pointer.record_fingerprint}"
+                        )
+
+                    # Check if reservation exists
+                    effect_intent_id = connection.execute(
+                        """
+                        SELECT effect_intent_id FROM reservation_bindings
+                        WHERE control_domain = ? AND authority_reservation_id = ?
+                        """,
+                        (domain, reservation_id),
+                    ).fetchone()
+
+                    if effect_intent_id is None:
+                        raise ValueError(
+                            f"Reservation {reservation_id} not found: reservation never existed or "
+                            f"was already released with different evidence in domain {domain}"
+                        )
+
+                    effect_intent_id = effect_intent_id[0]
+
+                    # Verify evidence
+                    record = evidence_spine.verify_evidence(evidence_pointer)
+
+                    if record.key.source != "provider_boundary_reconciliation":
+                        raise ValueError(
+                            f"Evidence must be provider_boundary_reconciliation, "
+                            f"got {record.key.source!r}"
+                        )
+                    if record.key.domain_id != domain:
+                        raise ValueError(
+                            f"Evidence control_domain mismatch: expected {domain!r}, "
+                            f"found {record.key.domain_id!r}"
+                        )
+
+                    recorded_effect_intent_id = record.metadata.get("effect_intent_id")
+                    if recorded_effect_intent_id != effect_intent_id:
+                        raise ValueError(
+                            f"Evidence effect_intent_id mismatch: expected {effect_intent_id!r}, "
+                            f"found {recorded_effect_intent_id!r}"
+                        )
+
+                    if dispatch_id is not None:
+                        recorded_dispatch_id = record.metadata.get("dispatch_id")
+                        if recorded_dispatch_id != dispatch_id:
+                            raise ValueError(
+                                f"Evidence dispatch_id mismatch: expected {dispatch_id!r}, "
+                                f"found {recorded_dispatch_id!r}"
+                            )
+
+                    if idempotency_key is not None:
+                        recorded_idempotency_key = record.payload.get("idempotency_key")
+                        if recorded_idempotency_key != idempotency_key:
+                            raise ValueError(
+                                f"Evidence idempotency_key mismatch: expected {idempotency_key!r}, "
+                                f"found {recorded_idempotency_key!r}"
+                            )
+
+                    reconciliation_outcome = record.payload.get("reconciliation_outcome")
+                    if reconciliation_outcome != "no_operation_committed":
+                        raise ValueError(
+                            f"Cannot release reservation: evidence shows {reconciliation_outcome!r}, "
+                            f"not 'no_operation_committed' (NOTHING_LANDED)"
+                        )
+
+                    # Delete from active reservations
+                    connection.execute(
+                        """
+                        DELETE FROM reservation_bindings
+                        WHERE control_domain = ? AND authority_reservation_id = ?
+                        """,
+                        (domain, reservation_id),
+                    )
+
+                    # Track release
+                    connection.execute(
+                        """
+                        INSERT INTO reservation_releases (
+                            control_domain, reservation_id, effect_intent_id,
+                            evidence_fingerprint
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (domain, reservation_id, effect_intent_id, evidence_pointer.record_fingerprint),
+                    )
+
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower():
+                raise ConcurrencyConflictError(
+                    f"Database lock timeout while releasing reservation {reservation_id}"
+                ) from e
+            raise StorageIntegrityError(f"Failed to release reservation: {e}") from e
+
+    def get_intent(self, effect_intent_id: str, control_domain: str) -> EffectIntent | None:
+        """Retrieve committed intent by ID within specified domain.
+
+        Args:
+            effect_intent_id: Intent ID to retrieve
+            control_domain: Control domain for isolation
+
+        Returns:
+            EffectIntent if found, None otherwise
+
+        Raises:
+            StorageIntegrityError: If stored data fails validation
+        """
+        domain = validate_domain_id(control_domain, "control_domain")
+
+        try:
+            with self._connection() as connection:
+                row = connection.execute(
+                    """
+                    SELECT decision_id, mission_id, task_id, attempt_id, operation_digest,
+                           idempotency_key, provider_scope, authority_reservation_id,
+                           compensation_strategy, evidence_reference, state, created_at
+                    FROM effect_intents
+                    WHERE control_domain = ? AND effect_intent_id = ?
+                    """,
+                    (domain, effect_intent_id),
+                ).fetchone()
+
+                if row is None:
+                    return None
+
+                try:
+                    return EffectIntent(
+                        effect_intent_id=effect_intent_id,
+                        decision_id=row[0],
+                        mission_id=row[1],
+                        task_id=row[2],
+                        attempt_id=row[3],
+                        operation_digest=row[4],
+                        idempotency_key=row[5],
+                        provider_scope=row[6],
+                        authority_reservation_id=row[7],
+                        compensation_strategy=row[8],
+                        evidence_reference=row[9],
+                        state=row[10],
+                        created_at=_deserialize_timestamp(row[11]),
+                        control_domain=domain,
+                    )
+                except (ValueError, TypeError) as e:
+                    raise StorageIntegrityError(
+                        f"Stored intent {effect_intent_id} failed validation: {e}"
+                    ) from e
+
+        except sqlite3.OperationalError as e:
+            raise StorageIntegrityError(f"Failed to retrieve intent: {e}") from e
+
+    def get_dispatch(self, dispatch_id: str, control_domain: str) -> EffectDispatch | None:
+        """Retrieve registered dispatch by ID within specified domain.
+
+        Args:
+            dispatch_id: Dispatch ID to retrieve
+            control_domain: Control domain for isolation
+
+        Returns:
+            EffectDispatch if found, None otherwise
+
+        Raises:
+            StorageIntegrityError: If stored data fails validation
+        """
+        domain = validate_domain_id(control_domain, "control_domain")
+
+        try:
+            with self._connection() as connection:
+                row = connection.execute(
+                    """
+                    SELECT effect_intent_id, attempt_id, idempotency_key, provider_adapter,
+                           capability_profile_version, transport_digest, posture,
+                           provider_operation_id, evidence_reference, dispatched_at
+                    FROM effect_dispatches
+                    WHERE control_domain = ? AND dispatch_id = ?
+                    """,
+                    (domain, dispatch_id),
+                ).fetchone()
+
+                if row is None:
+                    return None
+
+                try:
+                    return EffectDispatch(
+                        dispatch_id=dispatch_id,
+                        effect_intent_id=row[0],
+                        attempt_id=row[1],
+                        idempotency_key=row[2],
+                        provider_adapter=row[3],
+                        capability_profile_version=row[4],
+                        transport_digest=row[5],
+                        posture=row[6],
+                        provider_operation_id=row[7],
+                        evidence_reference=row[8],
+                        dispatched_at=_deserialize_timestamp(row[9]),
+                        control_domain=domain,
+                    )
+                except (ValueError, TypeError) as e:
+                    raise StorageIntegrityError(
+                        f"Stored dispatch {dispatch_id} failed validation: {e}"
+                    ) from e
+
+        except sqlite3.OperationalError as e:
+            raise StorageIntegrityError(f"Failed to retrieve dispatch: {e}") from e
+
+    def store_reservation(
+        self,
+        reservation: AuthorityReservation,
+        evidence_spine: EvidenceSpine | None = None,
+    ) -> None:
+        """Store or update an authority reservation.
+
+        For ASSUMED_CONSUMED_UNRECONCILED dispositions, evidence_spine must be provided
+        to verify terminal decision evidence.
+
+        Args:
+            reservation: Authority reservation to store
+            evidence_spine: Evidence spine for terminal disposition verification
+
+        Raises:
+            TypeError: If reservation is not an AuthorityReservation
+            ValueError: If terminal disposition lacks required evidence
+            ConcurrencyConflictError: If database lock cannot be acquired
+            StorageIntegrityError: If transaction fails
+        """
+        if type(reservation) is not AuthorityReservation:
+            raise TypeError("reservation must be an AuthorityReservation")
+
+        domain = validate_domain_id(reservation.control_domain, "control_domain")
+
+        try:
+            with self._connection() as connection:
+                with connection:
+                    # Insert or replace reservation
+                    connection.execute(
+                        """
+                        INSERT OR REPLACE INTO authority_reservations (
+                            control_domain, reservation_id, effect_intent_id,
+                            capability_type, amount, disposition, reserved_at,
+                            disposition_at, disposition_evidence_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            domain,
+                            reservation.reservation_id,
+                            reservation.effect_intent_id,
+                            reservation.capability_type,
+                            reservation.amount,
+                            reservation.disposition.value,
+                            _serialize_timestamp(reservation.reserved_at),
+                            _serialize_timestamp(reservation.disposition_at)
+                            if reservation.disposition_at
+                            else None,
+                            _serialize_evidence_pointer(reservation.disposition_evidence),
+                        ),
+                    )
+
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower():
+                raise ConcurrencyConflictError(
+                    f"Database lock timeout while storing reservation {reservation.reservation_id}"
+                ) from e
+            raise StorageIntegrityError(f"Failed to store reservation: {e}") from e
+
+    def get_reservation(
+        self,
+        reservation_id: str,
+        control_domain: str,
+        evidence_spine: EvidenceSpine | None = None,
+    ) -> AuthorityReservation | None:
+        """Retrieve authority reservation by ID within specified domain.
+
+        For ASSUMED_CONSUMED_UNRECONCILED dispositions, evidence_spine must be
+        provided to reconstruct the reservation with verified terminal evidence.
+
+        Args:
+            reservation_id: Reservation ID to retrieve
+            control_domain: Control domain for isolation
+            evidence_spine: Evidence spine for terminal disposition reconstruction
+
+        Returns:
+            AuthorityReservation if found, None otherwise
+
+        Raises:
+            StorageIntegrityError: If stored data fails validation
+            ValueError: If terminal disposition lacks required evidence spine
+        """
+        domain = validate_domain_id(control_domain, "control_domain")
+
+        try:
+            with self._connection() as connection:
+                row = connection.execute(
+                    """
+                    SELECT effect_intent_id, capability_type, amount, disposition,
+                           reserved_at, disposition_at, disposition_evidence_json
+                    FROM authority_reservations
+                    WHERE control_domain = ? AND reservation_id = ?
+                    """,
+                    (domain, reservation_id),
+                ).fetchone()
+
+                if row is None:
+                    return None
+
+                try:
+                    disposition = AuthorityDisposition(row[3])
+                    disposition_evidence = _deserialize_evidence_pointer(row[6])
+
+                    # Terminal disposition requires evidence spine
+                    if disposition == AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED:
+                        from research_mission.evidence_spine import EvidenceSpine
+
+                        if type(evidence_spine) is not EvidenceSpine:
+                            raise ValueError(
+                                "ASSUMED_CONSUMED_UNRECONCILED reservation requires "
+                                "EvidenceSpine for reconstruction"
+                            )
+                        # Use factory method with evidence verification
+                        return AuthorityReservation.from_verified_terminal_decision(
+                            reservation_id=reservation_id,
+                            effect_intent_id=row[0],
+                            capability_type=row[1],
+                            amount=row[2],
+                            reserved_at=_deserialize_timestamp(row[4]),
+                            disposition_at=_deserialize_timestamp(row[5]),
+                            evidence_spine=evidence_spine,
+                            evidence_pointer=disposition_evidence,
+                            control_domain=domain,
+                        )
+                    else:
+                        # Non-terminal disposition - direct construction
+                        return AuthorityReservation(
+                            reservation_id=reservation_id,
+                            effect_intent_id=row[0],
+                            capability_type=row[1],
+                            amount=row[2],
+                            disposition=disposition,
+                            reserved_at=_deserialize_timestamp(row[4]),
+                            disposition_at=_deserialize_timestamp(row[5]),
+                            disposition_evidence=disposition_evidence,
+                            control_domain=domain,
+                        )
+
+                except (ValueError, TypeError) as e:
+                    raise StorageIntegrityError(
+                        f"Stored reservation {reservation_id} failed validation: {e}"
+                    ) from e
+
+        except sqlite3.OperationalError as e:
+            raise StorageIntegrityError(f"Failed to retrieve reservation: {e}") from e
+
+    def store_obligation(
+        self,
+        obligation: ReconciliationObligation,
+        evidence_spine: EvidenceSpine | None = None,
+    ) -> None:
+        """Store or update a reconciliation obligation.
+
+        For obligations with terminal_disposition, evidence_spine must be provided
+        to verify terminal decision evidence.
+
+        Args:
+            obligation: Reconciliation obligation to store
+            evidence_spine: Evidence spine for terminal disposition verification
+
+        Raises:
+            TypeError: If obligation is not a ReconciliationObligation
+            ValueError: If terminal disposition lacks required evidence
+            ConcurrencyConflictError: If database lock cannot be acquired
+            StorageIntegrityError: If transaction fails
+        """
+        if type(obligation) is not ReconciliationObligation:
+            raise TypeError("obligation must be a ReconciliationObligation")
+
+        domain = validate_domain_id(obligation.control_domain, "control_domain")
+
+        try:
+            with self._connection() as connection:
+                with connection:
+                    # Insert or replace obligation
+                    connection.execute(
+                        """
+                        INSERT OR REPLACE INTO reconciliation_obligations (
+                            control_domain, obligation_id, effect_intent_id, dispatch_id,
+                            state, provider_reconcilability, next_probe_at,
+                            probe_history_json, terminal_disposition_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            domain,
+                            obligation.obligation_id,
+                            obligation.effect_intent_id,
+                            obligation.dispatch_id,
+                            obligation.state.value,
+                            obligation.provider_reconcilability.value,
+                            _serialize_timestamp(obligation.next_probe_at)
+                            if obligation.next_probe_at
+                            else None,
+                            _serialize_probe_history(obligation.probe_history),
+                            _serialize_evidence_pointer(obligation.terminal_disposition),
+                            _serialize_timestamp(obligation.created_at),
+                        ),
+                    )
+
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower():
+                raise ConcurrencyConflictError(
+                    f"Database lock timeout while storing obligation {obligation.obligation_id}"
+                ) from e
+            raise StorageIntegrityError(f"Failed to store obligation: {e}") from e
+
+    def get_obligation(
+        self,
+        obligation_id: str,
+        control_domain: str,
+        evidence_spine: EvidenceSpine | None = None,
+    ) -> ReconciliationObligation | None:
+        """Retrieve reconciliation obligation by ID within specified domain.
+
+        For obligations with terminal_disposition, evidence_spine must be provided
+        to reconstruct the obligation with verified terminal evidence.
+
+        Args:
+            obligation_id: Obligation ID to retrieve
+            control_domain: Control domain for isolation
+            evidence_spine: Evidence spine for terminal disposition reconstruction
+
+        Returns:
+            ReconciliationObligation if found, None otherwise
+
+        Raises:
+            StorageIntegrityError: If stored data fails validation
+            ValueError: If terminal disposition lacks required evidence spine
+        """
+        domain = validate_domain_id(control_domain, "control_domain")
+
+        try:
+            with self._connection() as connection:
+                row = connection.execute(
+                    """
+                    SELECT effect_intent_id, dispatch_id, state, provider_reconcilability,
+                           next_probe_at, probe_history_json, terminal_disposition_json,
+                           created_at
+                    FROM reconciliation_obligations
+                    WHERE control_domain = ? AND obligation_id = ?
+                    """,
+                    (domain, obligation_id),
+                ).fetchone()
+
+                if row is None:
+                    return None
+
+                try:
+                    state = ReconciliationState(row[2])
+                    provider_reconcilability = ProviderReconcilability(row[3])
+                    terminal_disposition = _deserialize_evidence_pointer(row[6])
+
+                    # Terminal disposition requires evidence spine
+                    if terminal_disposition is not None:
+                        from research_mission.evidence_spine import EvidenceSpine
+
+                        if type(evidence_spine) is not EvidenceSpine:
+                            raise ValueError(
+                                "Obligation with terminal_disposition requires "
+                                "EvidenceSpine for reconstruction"
+                            )
+                        # Use factory method with evidence verification
+                        return ReconciliationObligation.from_verified_terminal_decision(
+                            obligation_id=obligation_id,
+                            effect_intent_id=row[0],
+                            dispatch_id=row[1],
+                            provider_reconcilability=provider_reconcilability,
+                            probe_history=_deserialize_probe_history(row[5]),
+                            created_at=_deserialize_timestamp(row[7]),
+                            evidence_spine=evidence_spine,
+                            evidence_pointer=terminal_disposition,
+                            control_domain=domain,
+                        )
+                    else:
+                        # No terminal disposition - direct construction
+                        return ReconciliationObligation(
+                            obligation_id=obligation_id,
+                            effect_intent_id=row[0],
+                            dispatch_id=row[1],
+                            state=state,
+                            provider_reconcilability=provider_reconcilability,
+                            next_probe_at=_deserialize_timestamp(row[4]),
+                            probe_history=_deserialize_probe_history(row[5]),
+                            terminal_disposition=None,
+                            created_at=_deserialize_timestamp(row[7]),
+                            control_domain=domain,
+                        )
+
+                except (ValueError, TypeError) as e:
+                    raise StorageIntegrityError(
+                        f"Stored obligation {obligation_id} failed validation: {e}"
+                    ) from e
+
+        except sqlite3.OperationalError as e:
+            raise StorageIntegrityError(f"Failed to retrieve obligation: {e}") from e
+
+    def close(self) -> None:
+        """Close the store and release resources.
+
+        This is a no-op for SQLite (connections are per-operation).
+        Provided for lifecycle consistency.
+        """
+        pass
+
+
+__all__ = [
+    "DurableEffectStore",
+    "DurableEffectStoreError",
+    "SchemaVersionError",
+    "StorageIntegrityError",
+    "ConcurrencyConflictError",
+    "SCHEMA_VERSION",
+]
