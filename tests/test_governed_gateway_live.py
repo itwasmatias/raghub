@@ -1525,6 +1525,187 @@ def test_crash_after_consumption_preserves_state(tmp_path: Path) -> None:
     assert exc_info.value.reason == DenialReason.PERMIT_ALREADY_CONSUMED
 
 
+def _crash_during_permit_issuance(db_path: str, request_dict: dict, claim_id: str, result_queue: mp.Queue) -> None:
+    """Child process that crashes DURING permit issuance transaction, BEFORE commit."""
+    try:
+        from federation.effect_gateway import GatewayEffectRequest
+        request = GatewayEffectRequest(**request_dict)
+
+        store = DurableEffectStore(db_path)
+
+        # Inject fault: crash before permit issuance commit
+        store._test_crash_before_permit_issuance_commit = lambda: os._exit(99)
+
+        clock = FrozenClock(_utc(1, 10, 0))
+        gateway = GovernedEffectGateway(store, clock=clock)
+
+        # This should trigger the crash during the transaction, before commit
+        permit_id, permit_token = gateway.issue_dispatch_permit(request, claim_id)
+
+        # Should NOT reach here
+        result_queue.put("should_not_reach")
+        os._exit(0)
+    except Exception as e:
+        result_queue.put(f"error: {e}")
+        os._exit(1)
+
+
+def test_crash_during_permit_issuance_no_durable_permit(tmp_path: Path) -> None:
+    """Test abrupt crash during permit issuance (before commit) leaves no durable permit."""
+    db_path = tmp_path / "store.sqlite3"
+    store = DurableEffectStore(db_path)
+    clock = FrozenClock(_utc(1, 10, 0))
+    gateway = GovernedEffectGateway(store, clock=clock)
+
+    _create_authoritative_records(store)
+    request = _create_request()
+
+    # Create claim first
+    claim_id, _ = gateway.claim_dispatch(request, owner_identity="owner-1")
+
+    # Convert request to dict for pickling
+    request_dict = {
+        "control_domain": request.control_domain,
+        "principal_identity": request.principal_identity,
+        "agent_identity": request.agent_identity,
+        "mission_id": request.mission_id,
+        "task_id": request.task_id,
+        "attempt_id": request.attempt_id,
+        "delegation_grant_id": request.delegation_grant_id,
+        "delegation_grant_fingerprint": request.delegation_grant_fingerprint,
+        "requested_capability": request.requested_capability,
+        "effect_intent_id": request.effect_intent_id,
+        "effect_dispatch_id": request.effect_dispatch_id,
+        "authority_reservation_id": request.authority_reservation_id,
+        "operation_digest": request.operation_digest,
+        "idempotency_key": request.idempotency_key,
+        "provider_id": request.provider_id,
+        "adapter_id": request.adapter_id,
+        "effect_consequence": request.effect_consequence,
+        "provider_reconcilability": request.provider_reconcilability,
+        "request_timestamp": request.request_timestamp,
+        "request_expiry": request.request_expiry,
+        "credential_scope": request.credential_scope,
+    }
+
+    ctx = mp.get_context("spawn")
+    queue: mp.Queue = ctx.Queue()
+
+    proc = ctx.Process(target=_crash_during_permit_issuance, args=(str(db_path), request_dict, claim_id, queue))
+    proc.start()
+    proc.join(timeout=10)
+
+    # Process should have crashed with exit code 99
+    assert proc.exitcode == 99, f"Expected exit code 99, got {proc.exitcode}"
+
+    # Reopen database and verify NO permit was durably stored
+    store2 = DurableEffectStore(db_path)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        permit_count = conn.execute(
+            "SELECT COUNT(*) FROM effect_gateway_permits WHERE effect_intent_id = ?",
+            ("intent-1",),
+        ).fetchone()[0]
+        assert permit_count == 0, "Crash before permit issuance commit should leave no durable permit"
+
+        # Verify claim is still in CLAIMED state (not updated)
+        claim = store2.get_gateway_claim(claim_id, "domain-a")
+        assert claim["state"] == "claimed", "Claim should remain in CLAIMED state after permit issuance crash"
+    finally:
+        conn.close()
+
+    # Verify we can retry permit issuance successfully
+    gateway2 = GovernedEffectGateway(store2, clock=clock)
+    permit_id, permit_token = gateway2.issue_dispatch_permit(request, claim_id)
+    assert permit_id.startswith("gateway-permit-")
+    assert len(permit_token) >= 43
+
+
+def _crash_before_consumption_commit(db_path: str, permit_token: str, result_queue: mp.Queue) -> None:
+    """Child process that crashes AFTER permit verification, BEFORE consumption commit."""
+    try:
+        store = DurableEffectStore(db_path)
+
+        # Inject fault: crash before consumption commit
+        store._test_crash_before_consumption_commit = lambda: os._exit(98)
+
+        clock = FrozenClock(_utc(1, 10, 0))
+        gateway = GovernedEffectGateway(store, clock=clock)
+
+        # This should trigger the crash after verification, before commit
+        gateway.verify_and_consume_permit(permit_token, control_domain="domain-a")
+
+        # Should NOT reach here
+        result_queue.put("should_not_reach")
+        os._exit(0)
+    except Exception as e:
+        result_queue.put(f"error: {e}")
+        os._exit(1)
+
+
+def test_crash_before_consumption_commit_preserves_unconsumed_state(tmp_path: Path) -> None:
+    """Test abrupt crash before consumption commit leaves permit unconsumed and claim CLAIMED."""
+    db_path = tmp_path / "store.sqlite3"
+    store = DurableEffectStore(db_path)
+    clock = FrozenClock(_utc(1, 10, 0))
+    gateway = GovernedEffectGateway(store, clock=clock)
+
+    _create_authoritative_records(store)
+    request = _create_request()
+
+    claim_id, _ = gateway.claim_dispatch(request, owner_identity="owner-1")
+    permit_id, permit_token = gateway.issue_dispatch_permit(request, claim_id)
+
+    ctx = mp.get_context("spawn")
+    queue: mp.Queue = ctx.Queue()
+
+    proc = ctx.Process(target=_crash_before_consumption_commit, args=(str(db_path), permit_token, queue))
+    proc.start()
+    proc.join(timeout=10)
+
+    # Process should have crashed with exit code 98
+    assert proc.exitcode == 98, f"Expected exit code 98, got {proc.exitcode}"
+
+    # Reopen database and verify durable state after crash
+    store2 = DurableEffectStore(db_path)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        # Verify permit is NOT consumed
+        permit_row = conn.execute(
+            "SELECT consumed_at FROM effect_gateway_permits WHERE permit_id = ?",
+            (permit_id,),
+        ).fetchone()
+        assert permit_row is not None, "Permit should exist"
+        assert permit_row[0] is None, "Permit should NOT be consumed after crash before commit"
+
+        # Verify claim is still CLAIMED (not HANDOFF_STARTED)
+        claim = store2.get_gateway_claim(claim_id, "domain-a")
+        assert claim is not None
+        assert claim["state"] == "claimed", "Claim should remain CLAIMED after consumption crash before commit"
+        assert claim["handoff_started_at"] is None, "handoff_started_at should be NULL"
+    finally:
+        conn.close()
+
+    # Verify permit is still consumable (retry succeeds)
+    gateway2 = GovernedEffectGateway(store2, clock=clock)
+    returned_claim_id = gateway2.verify_and_consume_permit(permit_token, control_domain="domain-a")
+    assert returned_claim_id == claim_id
+
+    # Verify consumption succeeded this time
+    conn2 = sqlite3.connect(str(db_path))
+    try:
+        permit_row = conn2.execute(
+            "SELECT consumed_at FROM effect_gateway_permits WHERE permit_id = ?",
+            (permit_id,),
+        ).fetchone()
+        assert permit_row[0] is not None, "Permit should be consumed after successful retry"
+
+        claim = store2.get_gateway_claim(claim_id, "domain-a")
+        assert claim["state"] == "handoff_started", "Claim should be HANDOFF_STARTED after successful consumption"
+    finally:
+        conn2.close()
+
+
 # Secret protection tests
 
 def test_permit_secret_not_in_repr(tmp_path: Path) -> None:

@@ -556,6 +556,10 @@ class DurableEffectStore:
 
         self._ensure_schema()
 
+        # Private test-only hooks for fault injection (TESTING ONLY)
+        self._test_crash_before_permit_issuance_commit: Any = None
+        self._test_crash_before_consumption_commit: Any = None
+
     def _create_connection(self, database_path: str, *, require_wal: bool = True) -> sqlite3.Connection:
         """Create a new database connection with proper configuration.
 
@@ -2632,6 +2636,10 @@ class DurableEffectStore:
                         (permit_verifier, domain, gateway_claim_id),
                     )
 
+                    # Test-only: allow crash simulation before commit
+                    if self._test_crash_before_permit_issuance_commit is not None:
+                        self._test_crash_before_permit_issuance_commit()
+
         except sqlite3.OperationalError as e:
             if "locked" in str(e).lower():
                 raise ConcurrencyConflictError(
@@ -2735,6 +2743,10 @@ class DurableEffectStore:
                         """,
                         (_serialize_timestamp(now), domain, gateway_claim_id),
                     )
+
+                    # Test-only: allow crash simulation before commit
+                    if self._test_crash_before_consumption_commit is not None:
+                        self._test_crash_before_consumption_commit()
 
                     connection.commit()
                     return gateway_claim_id
