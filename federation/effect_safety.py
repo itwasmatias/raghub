@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -445,8 +446,10 @@ class AuthorityReservation:
                 field_name,
                 _require_text(getattr(self, field_name), field_name),
             )
-        if not isinstance(self.amount, (int, float)) or self.amount < 0:
+        if isinstance(self.amount, bool) or not isinstance(self.amount, (int, float)) or self.amount < 0:
             raise ValueError("amount must be non-negative number")
+        if not math.isfinite(float(self.amount)):
+            raise ValueError("amount must be a finite number")
         if not isinstance(self.disposition, AuthorityDisposition):
             raise TypeError("disposition must be an AuthorityDisposition")
         object.__setattr__(

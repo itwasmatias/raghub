@@ -255,6 +255,7 @@ class DurableEffectStore:
             SchemaVersionError: If database schema version is incompatible
         """
         self.database_path = str(database_path)
+        self._closed = False
 
         # For in-memory databases, keep a persistent connection
         # Otherwise each _connect() creates a new empty database
@@ -283,10 +284,21 @@ class DurableEffectStore:
         connection = sqlite3.connect(database_path, timeout=30.0)
         # WAL mode only works for file-based databases
         if database_path != ":memory:":
-            connection.execute("PRAGMA journal_mode=WAL")
+            try:
+                connection.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError as e:
+                # WAL mode setting can fail if database is locked during concurrent initialization
+                # This is safe to ignore - WAL mode persists across connections once set
+                if "locked" not in str(e).lower():
+                    raise
         connection.execute("PRAGMA busy_timeout=30000")
         connection.execute("PRAGMA foreign_keys=ON")
         return connection
+
+    def _ensure_open(self) -> None:
+        """Fail closed if the store has been closed."""
+        if self._closed:
+            raise DurableEffectStoreError("DurableEffectStore has been closed")
 
     def _connect(self) -> sqlite3.Connection:
         """Get database connection.
@@ -297,6 +309,7 @@ class DurableEffectStore:
         For in-memory databases, returns the persistent connection.
         For file-based databases, creates a new connection.
         """
+        self._ensure_open()
         if self._memory_connection is not None:
             return self._memory_connection
         return self._create_connection(self.database_path)
@@ -311,6 +324,7 @@ class DurableEffectStore:
         Yields:
             Database connection
         """
+        self._ensure_open()
         if self._memory_connection is not None:
             # In-memory: use persistent connection, don't close
             yield self._memory_connection
@@ -325,6 +339,7 @@ class DurableEffectStore:
         Raises:
             SchemaVersionError: If schema version is unknown or incompatible
         """
+        self._ensure_open()
         with self._connection() as connection:
             with connection:
                 # Create schema version table
@@ -347,6 +362,12 @@ class DurableEffectStore:
 
                 if existing_versions:
                     # Database exists - verify compatibility
+                    distinct_versions = set(existing_versions)
+                    if len(distinct_versions) != 1:
+                        raise SchemaVersionError(
+                            f"Database schema metadata contains contradictory versions: "
+                            f"{sorted(distinct_versions)}"
+                        )
                     latest_version = max(existing_versions)
                     if latest_version > SCHEMA_VERSION:
                         raise SchemaVersionError(
@@ -392,6 +413,7 @@ class DurableEffectStore:
             raise TypeError("intent must be an EffectIntent")
 
         domain = validate_domain_id(intent.control_domain, "control_domain")
+        self._ensure_open()
 
         try:
             with self._connection() as connection:
@@ -564,6 +586,7 @@ class DurableEffectStore:
             raise TypeError("dispatch must be an EffectDispatch")
 
         domain = validate_domain_id(dispatch.control_domain, "control_domain")
+        self._ensure_open()
 
         try:
             with self._connection() as connection:
@@ -733,6 +756,7 @@ class DurableEffectStore:
             raise TypeError("evidence_pointer must be an EvidencePointer")
 
         domain = validate_domain_id(control_domain, "control_domain")
+        self._ensure_open()
 
         try:
             with self._connection() as connection:
@@ -1006,33 +1030,99 @@ class DurableEffectStore:
             raise TypeError("reservation must be an AuthorityReservation")
 
         domain = validate_domain_id(reservation.control_domain, "control_domain")
+        self._ensure_open()
 
         try:
             with self._connection() as connection:
                 with connection:
-                    # Insert or replace reservation
-                    connection.execute(
+                    existing = connection.execute(
                         """
-                        INSERT OR REPLACE INTO authority_reservations (
-                            control_domain, reservation_id, effect_intent_id,
-                            capability_type, amount, disposition, reserved_at,
-                            disposition_at, disposition_evidence_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        SELECT effect_intent_id, capability_type, amount, disposition,
+                               reserved_at, disposition_at, disposition_evidence_json
+                        FROM authority_reservations
+                        WHERE control_domain = ? AND reservation_id = ?
                         """,
-                        (
-                            domain,
-                            reservation.reservation_id,
+                        (domain, reservation.reservation_id),
+                    ).fetchone()
+
+                    serialized_disposition_at = (
+                        _serialize_timestamp(reservation.disposition_at)
+                        if reservation.disposition_at
+                        else None
+                    )
+                    serialized_evidence = _serialize_evidence_pointer(reservation.disposition_evidence)
+
+                    if existing is not None:
+                        existing_payload = (
+                            existing[0],
+                            existing[1],
+                            existing[2],
+                            existing[3],
+                            existing[4],
+                            existing[5],
+                            existing[6],
+                        )
+                        incoming_payload = (
                             reservation.effect_intent_id,
                             reservation.capability_type,
                             reservation.amount,
                             reservation.disposition.value,
                             _serialize_timestamp(reservation.reserved_at),
-                            _serialize_timestamp(reservation.disposition_at)
-                            if reservation.disposition_at
-                            else None,
-                            _serialize_evidence_pointer(reservation.disposition_evidence),
-                        ),
-                    )
+                            serialized_disposition_at,
+                            serialized_evidence,
+                        )
+                        if existing_payload == incoming_payload:
+                            return
+                        if existing[3] != AuthorityDisposition.RESERVED.value:
+                            raise ValueError(
+                                f"reservation {reservation.reservation_id} in domain {domain} "
+                                f"cannot regress from {existing[3]!r} to {reservation.disposition.value!r}"
+                            )
+                        connection.execute(
+                            """
+                            UPDATE authority_reservations
+                               SET effect_intent_id = ?,
+                                   capability_type = ?,
+                                   amount = ?,
+                                   disposition = ?,
+                                   reserved_at = ?,
+                                   disposition_at = ?,
+                                   disposition_evidence_json = ?
+                             WHERE control_domain = ? AND reservation_id = ?
+                            """,
+                            (
+                                reservation.effect_intent_id,
+                                reservation.capability_type,
+                                reservation.amount,
+                                reservation.disposition.value,
+                                _serialize_timestamp(reservation.reserved_at),
+                                serialized_disposition_at,
+                                serialized_evidence,
+                                domain,
+                                reservation.reservation_id,
+                            ),
+                        )
+                    else:
+                        connection.execute(
+                            """
+                            INSERT INTO authority_reservations (
+                                control_domain, reservation_id, effect_intent_id,
+                                capability_type, amount, disposition, reserved_at,
+                                disposition_at, disposition_evidence_json
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                domain,
+                                reservation.reservation_id,
+                                reservation.effect_intent_id,
+                                reservation.capability_type,
+                                reservation.amount,
+                                reservation.disposition.value,
+                                _serialize_timestamp(reservation.reserved_at),
+                                serialized_disposition_at,
+                                serialized_evidence,
+                            ),
+                        )
 
         except sqlite3.OperationalError as e:
             if "locked" in str(e).lower():
@@ -1152,34 +1242,112 @@ class DurableEffectStore:
             raise TypeError("obligation must be a ReconciliationObligation")
 
         domain = validate_domain_id(obligation.control_domain, "control_domain")
+        self._ensure_open()
 
         try:
             with self._connection() as connection:
                 with connection:
-                    # Insert or replace obligation
-                    connection.execute(
+                    existing = connection.execute(
                         """
-                        INSERT OR REPLACE INTO reconciliation_obligations (
-                            control_domain, obligation_id, effect_intent_id, dispatch_id,
-                            state, provider_reconcilability, next_probe_at,
-                            probe_history_json, terminal_disposition_json, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        SELECT effect_intent_id, dispatch_id, state, provider_reconcilability,
+                               next_probe_at, probe_history_json, terminal_disposition_json,
+                               created_at
+                        FROM reconciliation_obligations
+                        WHERE control_domain = ? AND obligation_id = ?
                         """,
-                        (
-                            domain,
-                            obligation.obligation_id,
+                        (domain, obligation.obligation_id),
+                    ).fetchone()
+
+                    serialized_next_probe_at = (
+                        _serialize_timestamp(obligation.next_probe_at)
+                        if obligation.next_probe_at
+                        else None
+                    )
+                    serialized_terminal_disposition = _serialize_evidence_pointer(
+                        obligation.terminal_disposition
+                    )
+                    serialized_probe_history = _serialize_probe_history(obligation.probe_history)
+                    serialized_created_at = _serialize_timestamp(obligation.created_at)
+
+                    if existing is not None:
+                        existing_payload = (
+                            existing[0],
+                            existing[1],
+                            existing[2],
+                            existing[3],
+                            existing[4],
+                            existing[5],
+                            existing[6],
+                            existing[7],
+                        )
+                        incoming_payload = (
                             obligation.effect_intent_id,
                             obligation.dispatch_id,
                             obligation.state.value,
                             obligation.provider_reconcilability.value,
-                            _serialize_timestamp(obligation.next_probe_at)
-                            if obligation.next_probe_at
-                            else None,
-                            _serialize_probe_history(obligation.probe_history),
-                            _serialize_evidence_pointer(obligation.terminal_disposition),
-                            _serialize_timestamp(obligation.created_at),
-                        ),
-                    )
+                            serialized_next_probe_at,
+                            serialized_probe_history,
+                            serialized_terminal_disposition,
+                            serialized_created_at,
+                        )
+                        if existing_payload == incoming_payload:
+                            return
+                        if existing[2] not in (
+                            ReconciliationState.PENDING.value,
+                            ReconciliationState.IN_PROGRESS.value,
+                        ):
+                            raise ValueError(
+                                f"obligation {obligation.obligation_id} in domain {domain} "
+                                f"cannot regress from {existing[2]!r} to {obligation.state.value!r}"
+                            )
+                        connection.execute(
+                            """
+                            UPDATE reconciliation_obligations
+                               SET effect_intent_id = ?,
+                                   dispatch_id = ?,
+                                   state = ?,
+                                   provider_reconcilability = ?,
+                                   next_probe_at = ?,
+                                   probe_history_json = ?,
+                                   terminal_disposition_json = ?,
+                                   created_at = ?
+                             WHERE control_domain = ? AND obligation_id = ?
+                            """,
+                            (
+                                obligation.effect_intent_id,
+                                obligation.dispatch_id,
+                                obligation.state.value,
+                                obligation.provider_reconcilability.value,
+                                serialized_next_probe_at,
+                                serialized_probe_history,
+                                serialized_terminal_disposition,
+                                serialized_created_at,
+                                domain,
+                                obligation.obligation_id,
+                            ),
+                        )
+                    else:
+                        connection.execute(
+                            """
+                            INSERT INTO reconciliation_obligations (
+                                control_domain, obligation_id, effect_intent_id, dispatch_id,
+                                state, provider_reconcilability, next_probe_at,
+                                probe_history_json, terminal_disposition_json, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                domain,
+                                obligation.obligation_id,
+                                obligation.effect_intent_id,
+                                obligation.dispatch_id,
+                                obligation.state.value,
+                                obligation.provider_reconcilability.value,
+                                serialized_next_probe_at,
+                                serialized_probe_history,
+                                serialized_terminal_disposition,
+                                serialized_created_at,
+                            ),
+                        )
 
         except sqlite3.OperationalError as e:
             if "locked" in str(e).lower():
@@ -1281,10 +1449,13 @@ class DurableEffectStore:
     def close(self) -> None:
         """Close the store and release resources.
 
-        This is a no-op for SQLite (connections are per-operation).
-        Provided for lifecycle consistency.
+        Marks the store closed and releases any persistent in-memory connection.
         """
-        pass
+        if self._closed:
+            return
+        self._closed = True
+        if self._memory_connection is not None:
+            self._memory_connection.close()
 
 
 __all__ = [
