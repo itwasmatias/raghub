@@ -1053,10 +1053,16 @@ def project_mission_posture(
 
 
 class EffectIntentRegistry:
-    """Minimal registry for effect intent tracking.
+    """Durable registry for effect intent tracking with concurrency safety.
 
-    This is a placeholder for the scheduler integration. Real implementation
-    would provide durable storage and prevent double-spending of reservations.
+    Provides transactional, domain-scoped persistence for:
+    - Effect intents (write-ahead commitments)
+    - Effect dispatches (transport attempts)
+    - Authority reservation bindings
+    - Evidence-backed releases
+
+    All operations are atomic and safe under concurrent access from
+    multiple processes/threads.
 
     Enforces:
     - Control domain isolation: cross-domain objects cannot interact
@@ -1069,14 +1075,26 @@ class EffectIntentRegistry:
     - Rejects conflicting releases with different evidence
     """
 
-    def __init__(self) -> None:
-        # Domain-scoped storage: (domain, id) -> object
-        self._intents: dict[tuple[str, str], EffectIntent] = {}  # (domain, intent_id) -> intent
-        self._dispatches: dict[tuple[str, str], EffectDispatch] = {}  # (domain, dispatch_id) -> dispatch
-        # Domain-scoped reservation tracking: (domain, reservation_id) -> effect_intent_id
-        self._reservations: dict[tuple[str, str], str] = {}
-        # Domain-scoped releases: (domain, reservation_id) -> (effect_intent_id, evidence_fingerprint)
-        self._releases: dict[tuple[str, str], tuple[str, str]] = {}
+    def __init__(self, database_path: str) -> None:
+        """Initialize registry with durable storage.
+
+        Args:
+            database_path: Path to SQLite database. Use ":memory:" ONLY for narrow unit tests.
+                          Production MUST provide a persistent database path.
+                          No default value - callers must explicitly choose storage location.
+
+        Raises:
+            ValueError: If database_path is not provided
+        """
+        from federation.durable_effect_store import DurableEffectStore
+
+        if not isinstance(database_path, str) or not database_path.strip():
+            raise ValueError(
+                "database_path is required. Use an explicit file path for production "
+                "or ':memory:' for narrow unit testing only."
+            )
+
+        self._store = DurableEffectStore(database_path)
 
     def commit_intent(self, intent: EffectIntent) -> None:
         """Commit a write-ahead intent.
@@ -1088,85 +1106,14 @@ class EffectIntentRegistry:
             ValueError: If authority reservation already used by different intent (in same domain)
             ValueError: If effect_intent_id exists with different payload (in same domain)
         """
-        if type(intent) is not EffectIntent:
-            raise TypeError("intent must be an EffectIntent")
-
-        domain = _require_control_domain(intent.control_domain, "control_domain")
-        intent_key = (domain, intent.effect_intent_id)
-        reservation_key = (domain, intent.authority_reservation_id)
-
-        # Check for idempotent retry (same effect_intent_id within domain)
-        existing_intent = self._intents.get(intent_key)
-        if existing_intent is not None:
-            # Allow only if canonical payload is identical
-            if intent.to_dict() != existing_intent.to_dict():
-                raise ValueError(
-                    f"effect_intent_id {intent.effect_intent_id} already committed with different payload"
-                )
-            # Idempotent retry - safe to return
-            return
-
-        # Check for authority reservation double-spend (within domain)
-        existing_intent_id = self._reservations.get(reservation_key)
-        if existing_intent_id is not None:
-            # Reservation already used by a different intent in this domain
-            if existing_intent_id != intent.effect_intent_id:
-                raise ValueError(
-                    f"authority reservation {intent.authority_reservation_id} already committed "
-                    f"to effect_intent_id {existing_intent_id}"
-                )
-
-        # Commit new intent (domain-scoped)
-        self._intents[intent_key] = intent
-        self._reservations[reservation_key] = intent.effect_intent_id
+        self._store.commit_intent(intent)
 
     def commit_dispatch(self, dispatch: EffectDispatch) -> None:
         """Register an authoritative dispatch against its committed intent.
 
         Domain-scoped: dispatch must match intent's domain. Cross-domain dispatches are rejected.
         """
-        if type(dispatch) is not EffectDispatch:
-            raise TypeError("dispatch must be an EffectDispatch")
-
-        domain = _require_control_domain(dispatch.control_domain, "control_domain")
-        intent_key = (domain, dispatch.effect_intent_id)
-        dispatch_key = (domain, dispatch.dispatch_id)
-
-        # Look up intent in the same domain
-        intent = self._intents.get(intent_key)
-        if intent is None:
-            raise ValueError(
-                f"Cannot register dispatch {dispatch.dispatch_id}: committed effect intent "
-                f"{dispatch.effect_intent_id!r} not found"
-            )
-
-        # Verify domain consistency
-        if dispatch.control_domain != intent.control_domain:
-            raise ValueError(
-                f"Domain mismatch: dispatch domain {dispatch.control_domain!r} != "
-                f"intent domain {intent.control_domain!r}"
-            )
-
-        if dispatch.attempt_id != intent.attempt_id:
-            raise ValueError(
-                f"Dispatch attempt_id mismatch: expected {intent.attempt_id!r}, "
-                f"found {dispatch.attempt_id!r}"
-            )
-        if dispatch.idempotency_key != intent.idempotency_key:
-            raise ValueError(
-                f"Dispatch idempotency_key mismatch: expected {intent.idempotency_key!r}, "
-                f"found {dispatch.idempotency_key!r}"
-            )
-
-        existing = self._dispatches.get(dispatch_key)
-        if existing is not None:
-            if existing.to_dict() != dispatch.to_dict():
-                raise ValueError(
-                    f"dispatch_id {dispatch.dispatch_id} already registered with different payload"
-                )
-            return
-
-        self._dispatches[dispatch_key] = dispatch
+        self._store.commit_dispatch(dispatch)
 
     def release_reservation(
         self,
@@ -1209,132 +1156,22 @@ class EffectIntentRegistry:
             ValueError: If conflicting release evidence
             EvidenceSpineError: If evidence verification fails
         """
-        from research_mission.evidence_spine import EvidencePointer, EvidenceSpine
-
-        if type(evidence_spine) is not EvidenceSpine:
-            raise TypeError("evidence_spine must be an EvidenceSpine")
-        if type(evidence_pointer) is not EvidencePointer:
-            raise TypeError("evidence_pointer must be an EvidencePointer")
-
-        reservation_id = _require_text(reservation_id, "reservation_id")
-        control_domain = _require_control_domain(control_domain, "control_domain")
-        if dispatch_id is not None:
-            dispatch_id = _require_text(dispatch_id, "dispatch_id")
-        if idempotency_key is not None:
-            idempotency_key = _require_text(idempotency_key, "idempotency_key")
-        control_domain = _require_control_domain(control_domain, "control_domain")
-
-        reservation_key = (control_domain, reservation_id)
-
-        # Check if already released (in this domain)
-        existing_release = self._releases.get(reservation_key)
-        if existing_release is not None:
-            existing_effect_intent_id, existing_evidence_fingerprint = existing_release
-            # Idempotence is evidence-backed: re-verify the supplied pointer before
-            # comparing it with the recorded successful release.
-            record = evidence_spine.verify_evidence(evidence_pointer)
-            if record.key.source != "provider_boundary_reconciliation":
-                raise ValueError(
-                    f"Evidence must be provider_boundary_reconciliation, "
-                    f"got {record.key.source!r}"
-                )
-            if record.key.domain_id != control_domain:
-                raise ValueError(
-                    f"Evidence control_domain mismatch: expected {control_domain!r}, "
-                    f"found {record.key.domain_id!r}"
-                )
-            recorded_effect_intent_id = record.metadata.get("effect_intent_id")
-            if recorded_effect_intent_id != existing_effect_intent_id:
-                raise ValueError(
-                    f"Evidence effect_intent_id mismatch: expected {existing_effect_intent_id!r}, "
-                    f"found {recorded_effect_intent_id!r}"
-                )
-            if record.payload.get("reconciliation_outcome") != "no_operation_committed":
-                raise ValueError("Duplicate release evidence must prove no_operation_committed")
-            # Idempotent if same evidence
-            if evidence_pointer.record_fingerprint == existing_evidence_fingerprint:
-                return  # Idempotent success
-            # Conflicting evidence - reject
-            raise ValueError(
-                f"Reservation {reservation_id} already released with different evidence: "
-                f"existing fingerprint {existing_evidence_fingerprint}, "
-                f"new fingerprint {evidence_pointer.record_fingerprint}"
-            )
-
-        # Check if reservation exists (in this domain)
-        effect_intent_id = self._reservations.get(reservation_key)
-        if effect_intent_id is None:
-            # Not in active reservations and not in releases - never existed in this domain
-            raise ValueError(
-                f"Reservation {reservation_id} not found: reservation never existed or "
-                f"was already released with different evidence"
-            )
-
-        # Verify evidence exists in spine
-        record = evidence_spine.verify_evidence(evidence_pointer)
-
-        # Verify evidence is provider boundary reconciliation
-        if record.key.source != "provider_boundary_reconciliation":
-            raise ValueError(
-                f"Evidence must be provider_boundary_reconciliation, "
-                f"got {record.key.source!r}"
-            )
-        if record.key.domain_id != control_domain:
-            raise ValueError(
-                f"Evidence control_domain mismatch: expected {control_domain!r}, "
-                f"found {record.key.domain_id!r}"
-            )
-
-        # Verify evidence is for this specific effect intent
-        recorded_effect_intent_id = record.metadata.get("effect_intent_id")
-        if recorded_effect_intent_id != effect_intent_id:
-            raise ValueError(
-                f"Evidence effect_intent_id mismatch: expected {effect_intent_id!r}, "
-                f"found {recorded_effect_intent_id!r}"
-            )
-
-        # Verify evidence is for the correct dispatch if specified
-        if dispatch_id is not None:
-            recorded_dispatch_id = record.metadata.get("dispatch_id")
-            if recorded_dispatch_id != dispatch_id:
-                raise ValueError(
-                    f"Evidence dispatch_id mismatch: expected {dispatch_id!r}, "
-                    f"found {recorded_dispatch_id!r}"
-                )
-
-        # Verify idempotency key matches if specified
-        if idempotency_key is not None:
-            recorded_idempotency_key = record.payload.get("idempotency_key")
-            if recorded_idempotency_key != idempotency_key:
-                raise ValueError(
-                    f"Evidence idempotency_key mismatch: expected {idempotency_key!r}, "
-                    f"found {recorded_idempotency_key!r}"
-                )
-
-        # Verify evidence proves NOTHING_LANDED
-        reconciliation_outcome = record.payload.get("reconciliation_outcome")
-        if reconciliation_outcome != "no_operation_committed":
-            raise ValueError(
-                f"Cannot release reservation: evidence shows {reconciliation_outcome!r}, "
-                f"not 'no_operation_committed' (NOTHING_LANDED)"
-            )
-
-        # Verified NOTHING_LANDED - safe to release
-        del self._reservations[reservation_key]
-        # Track release with evidence fingerprint for idempotency
-        self._releases[reservation_key] = (effect_intent_id, evidence_pointer.record_fingerprint)
+        self._store.release_reservation(
+            reservation_id=reservation_id,
+            evidence_spine=evidence_spine,
+            evidence_pointer=evidence_pointer,
+            control_domain=control_domain,
+            dispatch_id=dispatch_id,
+            idempotency_key=idempotency_key,
+        )
 
     def get_intent(self, effect_intent_id: str, control_domain: str) -> EffectIntent | None:
         """Retrieve committed intent by ID within specified domain."""
-        effect_intent_id = _require_text(effect_intent_id, "effect_intent_id")
-        control_domain = _require_control_domain(control_domain, "control_domain")
-        return self._intents.get((control_domain, effect_intent_id))
+        return self._store.get_intent(effect_intent_id, control_domain)
 
     def get_dispatch(self, dispatch_id: str, control_domain: str) -> EffectDispatch | None:
         """Retrieve an authoritative registered dispatch by ID within specified domain."""
-        dispatch_id = _require_text(dispatch_id, "dispatch_id")
-        control_domain = _require_control_domain(control_domain, "control_domain")
-        return self._dispatches.get((control_domain, dispatch_id))
+        return self._store.get_dispatch(dispatch_id, control_domain)
 
 
 __all__ = [
