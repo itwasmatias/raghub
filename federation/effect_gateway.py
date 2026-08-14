@@ -826,6 +826,72 @@ class GovernedEffectGateway:
                 raise GatewayDenied(DenialReason.PERMIT_INVALID, str(e)) from e
             raise GatewayDenied(DenialReason.PERMIT_INVALID, str(e)) from e
 
+    def record_receipt(
+        self,
+        gateway_claim_id: str,
+        control_domain: str,
+    ) -> None:
+        """Record receipt from provider, transition to RECEIPT_RECORDED.
+
+        Args:
+            gateway_claim_id: Claim ID
+            control_domain: Control domain
+
+        Raises:
+            GatewayStateError: If claim not in HANDOFF_STARTED state
+        """
+        now = self._clock()
+        try:
+            self._store.record_gateway_receipt(
+                gateway_claim_id=gateway_claim_id,
+                control_domain=control_domain,
+                now=now,
+            )
+        except ValueError as e:
+            raise GatewayStateError(str(e)) from e
+
+    def record_effect_result(
+        self,
+        gateway_claim_id: str,
+        control_domain: str,
+        result: GatewayEffectResult,
+    ) -> None:
+        """Record final effect result, transition to TERMINAL or INDETERMINATE.
+
+        Args:
+            gateway_claim_id: Claim ID
+            control_domain: Control domain
+            result: Validated gateway effect result
+
+        Raises:
+            GatewayStateError: If invalid state transition or result contract violation
+        """
+        if not isinstance(result, GatewayEffectResult):
+            raise TypeError("result must be GatewayEffectResult")
+
+        # Map EffectState to effect_status string
+        from federation.effect_safety import EffectState
+
+        if result.effect_status == EffectState.NOTHING_LANDED:
+            effect_status = "nothing_landed"
+        elif result.effect_status == EffectState.SOMETHING_LANDED:
+            effect_status = "something_landed"
+        elif result.effect_status == EffectState.INDETERMINATE:
+            effect_status = "indeterminate"
+        else:
+            raise GatewayStateError(f"Unknown effect_status: {result.effect_status}")
+
+        now = self._clock()
+        try:
+            self._store.record_gateway_result(
+                gateway_claim_id=gateway_claim_id,
+                control_domain=control_domain,
+                effect_status=effect_status,
+                now=now,
+            )
+        except ValueError as e:
+            raise GatewayStateError(str(e)) from e
+
 
 __all__ = [
     "DenialReason",

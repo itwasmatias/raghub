@@ -2809,6 +2809,243 @@ class DurableEffectStore:
         except sqlite3.OperationalError as e:
             raise StorageIntegrityError(f"Failed to retrieve claim: {e}") from e
 
+    def record_gateway_receipt(
+        self,
+        gateway_claim_id: str,
+        control_domain: str,
+        now: datetime,
+    ) -> None:
+        """Record receipt for gateway claim, transition to RECEIPT_RECORDED.
+
+        Args:
+            gateway_claim_id: Claim ID
+            control_domain: Control domain
+            now: Receipt timestamp
+
+        Raises:
+            ValueError: If claim not found or not in HANDOFF_STARTED state
+            StorageIntegrityError: If transaction fails
+        """
+        domain = validate_domain_id(control_domain, "control_domain")
+        self._ensure_open()
+
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    # Verify claim exists and is in HANDOFF_STARTED
+                    claim_row = connection.execute(
+                        """
+                        SELECT state FROM effect_gateway_claims
+                        WHERE control_domain = ? AND gateway_claim_id = ?
+                        """,
+                        (domain, gateway_claim_id),
+                    ).fetchone()
+
+                    if claim_row is None:
+                        raise ValueError(
+                            f"gateway_claim_id {gateway_claim_id!r} not found in domain {domain}"
+                        )
+
+                    current_state = claim_row[0]
+                    if current_state == "receipt_recorded":
+                        # Idempotent: already recorded
+                        connection.commit()
+                        return
+
+                    if current_state != "handoff_started":
+                        raise ValueError(
+                            f"Cannot record receipt for claim {gateway_claim_id!r} in state {current_state!r}, "
+                            "expected 'handoff_started'"
+                        )
+
+                    # Transition to RECEIPT_RECORDED
+                    connection.execute(
+                        """
+                        UPDATE effect_gateway_claims
+                        SET state = 'receipt_recorded', receipt_recorded_at = ?
+                        WHERE control_domain = ? AND gateway_claim_id = ? AND state = 'handoff_started'
+                        """,
+                        (_serialize_timestamp(now), domain, gateway_claim_id),
+                    )
+
+                    if connection.total_changes == 0:
+                        raise ConcurrencyConflictError(
+                            f"Claim {gateway_claim_id!r} state changed concurrently"
+                        )
+
+                    connection.commit()
+
+                except Exception:
+                    connection.rollback()
+                    raise
+
+        except sqlite3.OperationalError as e:
+            raise StorageIntegrityError(f"Failed to record receipt: {e}") from e
+
+    def record_gateway_result(
+        self,
+        gateway_claim_id: str,
+        control_domain: str,
+        effect_status: str,
+        now: datetime,
+    ) -> None:
+        """Record final gateway result, transition to TERMINAL or INDETERMINATE.
+
+        Args:
+            gateway_claim_id: Claim ID
+            control_domain: Control domain
+            effect_status: "nothing_landed", "something_landed", or "indeterminate"
+            now: Result timestamp
+
+        Raises:
+            ValueError: If claim not found or invalid state transition
+            StorageIntegrityError: If transaction fails
+        """
+        domain = validate_domain_id(control_domain, "control_domain")
+        self._ensure_open()
+
+        valid_statuses = {"nothing_landed", "something_landed", "indeterminate"}
+        if effect_status not in valid_statuses:
+            raise ValueError(f"effect_status must be one of {valid_statuses}")
+
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    # Verify claim exists
+                    claim_row = connection.execute(
+                        """
+                        SELECT state FROM effect_gateway_claims
+                        WHERE control_domain = ? AND gateway_claim_id = ?
+                        """,
+                        (domain, gateway_claim_id),
+                    ).fetchone()
+
+                    if claim_row is None:
+                        raise ValueError(
+                            f"gateway_claim_id {gateway_claim_id!r} not found in domain {domain}"
+                        )
+
+                    current_state = claim_row[0]
+
+                    # Reject terminal rewrite
+                    if current_state in ("terminal", "indeterminate"):
+                        raise ValueError(
+                            f"Cannot rewrite terminal state {current_state!r} for claim {gateway_claim_id!r}"
+                        )
+
+                    # INDETERMINATE requires HANDOFF_STARTED (no receipt)
+                    if effect_status == "indeterminate":
+                        if current_state != "handoff_started":
+                            raise ValueError(
+                                f"INDETERMINATE requires handoff_started, claim {gateway_claim_id!r} is {current_state!r}"
+                            )
+                        connection.execute(
+                            """
+                            UPDATE effect_gateway_claims
+                            SET state = 'indeterminate', terminal_at = ?
+                            WHERE control_domain = ? AND gateway_claim_id = ? AND state = 'handoff_started'
+                            """,
+                            (_serialize_timestamp(now), domain, gateway_claim_id),
+                        )
+                    else:
+                        # Terminal results require RECEIPT_RECORDED
+                        if current_state != "receipt_recorded":
+                            raise ValueError(
+                                f"Terminal result requires receipt_recorded, claim {gateway_claim_id!r} is {current_state!r}"
+                            )
+                        connection.execute(
+                            """
+                            UPDATE effect_gateway_claims
+                            SET state = 'terminal', terminal_at = ?
+                            WHERE control_domain = ? AND gateway_claim_id = ? AND state = 'receipt_recorded'
+                            """,
+                            (_serialize_timestamp(now), domain, gateway_claim_id),
+                        )
+
+                    if connection.total_changes == 0:
+                        raise ConcurrencyConflictError(
+                            f"Claim {gateway_claim_id!r} state changed concurrently"
+                        )
+
+                    connection.commit()
+
+                except Exception:
+                    connection.rollback()
+                    raise
+
+        except sqlite3.OperationalError as e:
+            raise StorageIntegrityError(f"Failed to record result: {e}") from e
+
+    def revoke_permit(
+        self,
+        permit_id: str,
+        control_domain: str,
+        now: datetime,
+    ) -> None:
+        """Revoke a gateway permit.
+
+        Args:
+            permit_id: Permit ID
+            control_domain: Control domain
+            now: Revocation timestamp
+
+        Raises:
+            ValueError: If permit not found or already consumed/revoked
+            StorageIntegrityError: If transaction fails
+        """
+        domain = validate_domain_id(control_domain, "control_domain")
+        self._ensure_open()
+
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    # Find permit
+                    permit_row = connection.execute(
+                        """
+                        SELECT consumed_at, revoked_at FROM effect_gateway_permits
+                        WHERE control_domain = ? AND permit_id = ?
+                        """,
+                        (domain, permit_id),
+                    ).fetchone()
+
+                    if permit_row is None:
+                        raise ValueError(f"permit_id {permit_id!r} not found in domain {domain}")
+
+                    consumed_at, revoked_at = permit_row
+
+                    if consumed_at is not None:
+                        raise ValueError(f"Cannot revoke consumed permit {permit_id!r}")
+
+                    if revoked_at is not None:
+                        # Idempotent: already revoked
+                        connection.commit()
+                        return
+
+                    # Mark revoked
+                    connection.execute(
+                        """
+                        UPDATE effect_gateway_permits
+                        SET revoked_at = ?
+                        WHERE control_domain = ? AND permit_id = ? AND consumed_at IS NULL AND revoked_at IS NULL
+                        """,
+                        (_serialize_timestamp(now), domain, permit_id),
+                    )
+
+                    if connection.total_changes == 0:
+                        raise ConcurrencyConflictError(f"Permit {permit_id!r} changed concurrently")
+
+                    connection.commit()
+
+                except Exception:
+                    connection.rollback()
+                    raise
+
+        except sqlite3.OperationalError as e:
+            raise StorageIntegrityError(f"Failed to revoke permit: {e}") from e
+
     def close(self) -> None:
         """Close the store and release resources.
 
