@@ -222,6 +222,15 @@ _EXPECTED_INDEXES_V1: dict[str, tuple[str, tuple[str, ...]]] = {
 }
 
 
+def _is_lower_hex_64(value: object) -> bool:
+    """Return True when value is exactly 64 lowercase hex characters."""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
 def _serialize_timestamp(dt: datetime) -> str:
     """Serialize datetime to ISO format UTC string."""
     return dt.astimezone(timezone.utc).isoformat()
@@ -458,7 +467,15 @@ class DurableEffectStore:
                 UNIQUE (control_domain, effect_dispatch_id),
                 UNIQUE (control_domain, authority_reservation_id),
                 UNIQUE (control_domain, idempotency_key),
-                UNIQUE (control_domain, request_fingerprint)
+                UNIQUE (control_domain, request_fingerprint),
+                CHECK (
+                    permit_verifier IS NULL
+                    OR (
+                        typeof(permit_verifier) = 'text'
+                        AND length(permit_verifier) = 64
+                        AND permit_verifier NOT GLOB '*[^0-9a-f]*'
+                    )
+                )
             );
 
             -- Gateway dispatch permits: cryptographic single-use adapter authorization
@@ -493,7 +510,11 @@ class DurableEffectStore:
                     REFERENCES effect_dispatches(control_domain, dispatch_id),
                 FOREIGN KEY (control_domain, authority_reservation_id)
                     REFERENCES authority_reservations(control_domain, reservation_id),
-                CHECK (length(permit_verifier) = 64 AND permit_verifier GLOB '[0-9a-f]*'),
+                CHECK (
+                    typeof(permit_verifier) = 'text'
+                    AND length(permit_verifier) = 64
+                    AND permit_verifier NOT GLOB '*[^0-9a-f]*'
+                ),
                 CHECK (NOT (consumed_at IS NOT NULL AND revoked_at IS NOT NULL))
             );
 
@@ -974,11 +995,7 @@ class DurableEffectStore:
                 raise StorageIntegrityError(
                     f"Stored gateway claim {gateway_claim_id} has invalid state {state!r}"
                 )
-            if permit_verifier is not None and (
-                not isinstance(permit_verifier, str)
-                or len(permit_verifier) != 64
-                or not all(c in "0123456789abcdef" for c in permit_verifier)
-            ):
+            if permit_verifier is not None and not _is_lower_hex_64(permit_verifier):
                 raise StorageIntegrityError(
                     f"Stored gateway claim {gateway_claim_id} has invalid permit_verifier"
                 )
@@ -1050,7 +1067,7 @@ class DurableEffectStore:
             FROM effect_gateway_permits
             """
         ):
-            if not isinstance(permit_verifier, str) or len(permit_verifier) != 64:
+            if not _is_lower_hex_64(permit_verifier):
                 raise StorageIntegrityError(
                     f"Stored permit {permit_id} has invalid verifier"
                 )

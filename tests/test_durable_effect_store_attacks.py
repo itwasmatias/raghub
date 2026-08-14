@@ -912,6 +912,175 @@ class TestAdditionalDurabilityAttacks:
             with pytest.raises(SchemaVersionError, match="contradictory versions"):
                 DurableEffectStore(db_path)
 
+    @pytest.mark.parametrize(
+        "bad_verifier",
+        [
+            "a" + "Z" * 63,
+            "a" + "g" * 63,
+            sqlite3.Binary(b"0" * 64),
+        ],
+    )
+    def test_gateway_verifier_storage_rejects_non_lower_hex_text(
+        self,
+        bad_verifier: object,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "store.sqlite3"
+            DurableEffectStore(db_path)
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO effect_intents (
+                        control_domain, effect_intent_id, decision_id, mission_id, task_id,
+                        attempt_id, operation_digest, idempotency_key, provider_scope,
+                        authority_reservation_id, compensation_strategy, evidence_reference,
+                        state, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "domain-a",
+                        "intent-gateway-verifier",
+                        "decision-gateway-verifier",
+                        "mission-gateway-verifier",
+                        "task-gateway-verifier",
+                        "attempt-gateway-verifier",
+                        "b" * 64,
+                        "idem-gateway-verifier",
+                        "provider",
+                        "reservation-gateway-verifier",
+                        None,
+                        "evidence-gateway-verifier",
+                        "committed_not_dispatched",
+                        "2026-08-14T00:00:00Z",
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO effect_dispatches (
+                        control_domain, dispatch_id, effect_intent_id, attempt_id,
+                        idempotency_key, provider_adapter, capability_profile_version,
+                        transport_digest, posture, provider_operation_id,
+                        evidence_reference, dispatched_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "domain-a",
+                        "dispatch-gateway-verifier",
+                        "intent-gateway-verifier",
+                        "attempt-gateway-verifier",
+                        "idem-gateway-verifier",
+                        "provider-adapter",
+                        "profile-v1",
+                        "c" * 64,
+                        "submitted",
+                        None,
+                        "evidence-gateway-verifier",
+                        "2026-08-14T00:00:01Z",
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO authority_reservations (
+                        control_domain, reservation_id, effect_intent_id, capability_type,
+                        amount, disposition, reserved_at, disposition_at,
+                        disposition_evidence_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "domain-a",
+                        "reservation-gateway-verifier",
+                        "intent-gateway-verifier",
+                        "compute",
+                        1.0,
+                        "reserved",
+                        "2026-08-14T00:00:00Z",
+                        None,
+                        None,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO effect_gateway_claims (
+                        control_domain, gateway_claim_id, request_fingerprint, effect_intent_id,
+                        effect_dispatch_id, authority_reservation_id, delegation_grant_id,
+                        delegation_grant_fingerprint, requested_capability, idempotency_key,
+                        operation_digest, provider_id, adapter_id, owner_identity, state,
+                        permit_verifier, claimed_at, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "domain-a",
+                        "claim-gateway-verifier",
+                        "f" * 64,
+                        "intent-gateway-verifier",
+                        "dispatch-gateway-verifier",
+                        "reservation-gateway-verifier",
+                        "delegation-gateway-verifier",
+                        "d" * 64,
+                        "effect:dispatch",
+                        "idem-gateway-verifier",
+                        "b" * 64,
+                        "provider-1",
+                        "adapter-1",
+                        "owner-1",
+                        "claimed",
+                        None,
+                        "2026-08-14T00:00:02Z",
+                        "2026-08-14T00:00:03Z",
+                    ),
+                )
+
+                with pytest.raises(sqlite3.IntegrityError):
+                    conn.execute(
+                        """
+                        UPDATE effect_gateway_claims
+                           SET permit_verifier = ?
+                         WHERE control_domain = ? AND gateway_claim_id = ?
+                        """,
+                        (bad_verifier, "domain-a", "claim-gateway-verifier"),
+                    )
+
+                with pytest.raises(sqlite3.IntegrityError):
+                    conn.execute(
+                        """
+                        INSERT INTO effect_gateway_permits (
+                            control_domain, permit_id, permit_verifier, request_fingerprint,
+                            effect_intent_id, effect_dispatch_id, authority_reservation_id,
+                            gateway_claim_id, delegation_grant_id,
+                            delegation_grant_fingerprint, requested_capability,
+                            operation_digest, idempotency_key, provider_id, adapter_id,
+                            credential_scope_json, owner_identity, issued_at, expires_at,
+                            consumed_at, revoked_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "domain-a",
+                            "permit-gateway-verifier",
+                            bad_verifier,
+                            "f" * 64,
+                            "intent-gateway-verifier",
+                            "dispatch-gateway-verifier",
+                            "reservation-gateway-verifier",
+                            "claim-gateway-verifier",
+                            "delegation-gateway-verifier",
+                            "d" * 64,
+                            "effect:dispatch",
+                            "b" * 64,
+                            "idem-gateway-verifier",
+                            "provider-1",
+                            "adapter-1",
+                            '["scope-a"]',
+                            "owner-1",
+                            "2026-08-14T00:00:04Z",
+                            "2026-08-14T00:00:05Z",
+                            None,
+                            None,
+                        ),
+                    )
+            finally:
+                conn.close()
+
     def test_terminal_evidence_pointer_reference_fingerprint_corruption_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "store.sqlite3"
