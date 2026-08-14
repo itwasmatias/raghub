@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,6 +75,88 @@ class StorageIntegrityError(DurableEffectStoreError):
 
 class ConcurrencyConflictError(DurableEffectStoreError):
     """Raised when concurrent operations conflict."""
+
+
+_FILE_JOURNAL_MODE = "wal"
+_MAX_BUSY_TIMEOUT_MS = 30000
+
+_EXPECTED_SCHEMA_TABLES: dict[str, tuple[str, ...]] = {
+    "effect_store_schema": ("version", "applied_at"),
+    "effect_intents": (
+        "control_domain",
+        "effect_intent_id",
+        "decision_id",
+        "mission_id",
+        "task_id",
+        "attempt_id",
+        "operation_digest",
+        "idempotency_key",
+        "provider_scope",
+        "authority_reservation_id",
+        "compensation_strategy",
+        "evidence_reference",
+        "state",
+        "created_at",
+    ),
+    "effect_dispatches": (
+        "control_domain",
+        "dispatch_id",
+        "effect_intent_id",
+        "attempt_id",
+        "idempotency_key",
+        "provider_adapter",
+        "capability_profile_version",
+        "transport_digest",
+        "posture",
+        "provider_operation_id",
+        "evidence_reference",
+        "dispatched_at",
+    ),
+    "authority_reservations": (
+        "control_domain",
+        "reservation_id",
+        "effect_intent_id",
+        "capability_type",
+        "amount",
+        "disposition",
+        "reserved_at",
+        "disposition_at",
+        "disposition_evidence_json",
+    ),
+    "reconciliation_obligations": (
+        "control_domain",
+        "obligation_id",
+        "effect_intent_id",
+        "dispatch_id",
+        "state",
+        "provider_reconcilability",
+        "next_probe_at",
+        "probe_history_json",
+        "terminal_disposition_json",
+        "created_at",
+    ),
+    "reservation_bindings": (
+        "control_domain",
+        "authority_reservation_id",
+        "effect_intent_id",
+        "bound_at",
+    ),
+    "reservation_releases": (
+        "control_domain",
+        "reservation_id",
+        "effect_intent_id",
+        "evidence_fingerprint",
+        "released_at",
+    ),
+}
+
+_EXPECTED_INDEXES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "idx_intents_mission": ("effect_intents", ("control_domain", "mission_id", "created_at")),
+    "idx_dispatches_intent": ("effect_dispatches", ("control_domain", "effect_intent_id")),
+    "idx_reservations_intent": ("authority_reservations", ("control_domain", "effect_intent_id")),
+    "idx_reservations_disposition": ("authority_reservations", ("control_domain", "disposition")),
+    "idx_obligations_state": ("reconciliation_obligations", ("control_domain", "state", "next_probe_at")),
+}
 
 
 def _serialize_timestamp(dt: datetime) -> str:
@@ -258,7 +341,7 @@ class DurableEffectStore:
         ),
     )
 
-    def __init__(self, database_path: str | Path) -> None:
+    def __init__(self, database_path: str | Path, *, busy_timeout_ms: int = _MAX_BUSY_TIMEOUT_MS) -> None:
         """Initialize durable effect store.
 
         Args:
@@ -269,6 +352,7 @@ class DurableEffectStore:
         """
         self.database_path = str(database_path)
         self._closed = False
+        self._busy_timeout_ms = self._validate_busy_timeout_ms(busy_timeout_ms)
 
         # For in-memory databases, keep a persistent connection
         # Otherwise each _connect() creates a new empty database
@@ -294,19 +378,57 @@ class DurableEffectStore:
         - 30s busy timeout for lock contention
         - Foreign keys enabled
         """
-        connection = sqlite3.connect(database_path, timeout=30.0)
+        connection = sqlite3.connect(database_path, timeout=self._busy_timeout_ms / 1000.0)
         # WAL mode only works for file-based databases
         if database_path != ":memory:":
-            try:
-                connection.execute("PRAGMA journal_mode=WAL")
-            except sqlite3.OperationalError as e:
-                # WAL mode setting can fail if database is locked during concurrent initialization
-                # This is safe to ignore - WAL mode persists across connections once set
-                if "locked" not in str(e).lower():
-                    raise
-        connection.execute("PRAGMA busy_timeout=30000")
+            self._ensure_wal_mode(connection, database_path)
+        connection.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
         connection.execute("PRAGMA foreign_keys=ON")
         return connection
+
+    @staticmethod
+    def _validate_busy_timeout_ms(value: Any) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError("busy_timeout_ms must be an int")
+        if value <= 0:
+            raise ValueError("busy_timeout_ms must be positive")
+        if value > _MAX_BUSY_TIMEOUT_MS:
+            raise ValueError(f"busy_timeout_ms exceeds {_MAX_BUSY_TIMEOUT_MS} ms")
+        return value
+
+    def _ensure_wal_mode(self, connection: sqlite3.Connection, database_path: str) -> None:
+        """Require WAL journal mode for file-backed stores."""
+        attempts = 3
+        last_error: sqlite3.OperationalError | None = None
+        for attempt in range(attempts):
+            try:
+                row = connection.execute("PRAGMA journal_mode=WAL").fetchone()
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower():
+                    raise StorageIntegrityError(
+                        f"Failed to establish WAL journal mode for {database_path}: {exc}"
+                    ) from exc
+                last_error = exc
+                if attempt < attempts - 1:
+                    time.sleep(0.01 * (attempt + 1))
+                continue
+
+            mode = row[0] if row else None
+            if isinstance(mode, str) and mode.lower() == _FILE_JOURNAL_MODE:
+                actual_row = connection.execute("PRAGMA journal_mode").fetchone()
+                actual_mode = actual_row[0] if actual_row else None
+                if isinstance(actual_mode, str) and actual_mode.lower() == _FILE_JOURNAL_MODE:
+                    return
+                raise StorageIntegrityError(
+                    f"Database journal mode {actual_mode!r} does not satisfy required WAL mode"
+                )
+            raise StorageIntegrityError(
+                f"Database journal mode {mode!r} does not satisfy required WAL mode"
+            )
+
+        raise StorageIntegrityError(
+            f"Failed to establish WAL journal mode for {database_path} after {attempts} attempts"
+        ) from last_error
 
     def _ensure_open(self) -> None:
         """Fail closed if the store has been closed."""
@@ -355,58 +477,174 @@ class DurableEffectStore:
         self._ensure_open()
         with self._connection() as connection:
             with connection:
-                # Create schema version table
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS effect_store_schema (
-                        version INTEGER PRIMARY KEY,
-                        applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                    )
-                    """
-                )
+                for attempt in range(5):
+                    existing_objects = {
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
+                        )
+                    }
 
-                # Check existing schema version
-                existing_versions = [
-                    int(row[0])
-                    for row in connection.execute(
-                        "SELECT version FROM effect_store_schema ORDER BY version"
-                    )
-                ]
+                    has_schema_table = "effect_store_schema" in existing_objects
+                    if has_schema_table:
+                        existing_versions = [
+                            int(row[0])
+                            for row in connection.execute(
+                                "SELECT version FROM effect_store_schema ORDER BY version"
+                            )
+                        ]
 
-                if existing_versions:
-                    # Database exists - verify compatibility
-                    distinct_versions = set(existing_versions)
-                    if len(distinct_versions) != 1:
+                        if existing_versions:
+                            # Database exists - verify compatibility
+                            distinct_versions = set(existing_versions)
+                            if len(existing_versions) != 1 or len(distinct_versions) != 1:
+                                raise SchemaVersionError(
+                                    f"Database schema metadata contains contradictory versions: "
+                                    f"{sorted(distinct_versions)}"
+                                )
+                            latest_version = max(existing_versions)
+                            if latest_version > SCHEMA_VERSION:
+                                raise SchemaVersionError(
+                                    f"Database schema version {latest_version} is newer than "
+                                    f"supported version {SCHEMA_VERSION}. Upgrade required."
+                                )
+                            if latest_version < SCHEMA_VERSION:
+                                # Future: implement migrations
+                                raise SchemaVersionError(
+                                    f"Database schema version {latest_version} is older than "
+                                    f"current version {SCHEMA_VERSION}. Migration not implemented."
+                                )
+                            self._validate_schema_contract(connection)
+                            self._validate_stored_rows(connection)
+                            return
+
+                    if existing_objects:
+                        if attempt < 4:
+                            time.sleep(0.01 * (attempt + 1))
+                            continue
                         raise SchemaVersionError(
-                            f"Database schema metadata contains contradictory versions: "
-                            f"{sorted(distinct_versions)}"
+                            "Database contains schema objects but no authoritative current-version metadata"
                         )
-                    latest_version = max(existing_versions)
-                    if latest_version > SCHEMA_VERSION:
-                        raise SchemaVersionError(
-                            f"Database schema version {latest_version} is newer than "
-                            f"supported version {SCHEMA_VERSION}. Upgrade required."
+
+                    # New database - apply migrations
+                    for version, sql in self.MIGRATIONS:
+                        if version > SCHEMA_VERSION:
+                            # Skip future migrations
+                            continue
+                        connection.executescript(sql)
+                        # Use INSERT OR IGNORE to handle concurrent schema initialization
+                        connection.execute(
+                            "INSERT OR IGNORE INTO effect_store_schema(version) VALUES (?)",
+                            (version,),
                         )
-                    if latest_version < SCHEMA_VERSION:
-                        # Future: implement migrations
-                        raise SchemaVersionError(
-                            f"Database schema version {latest_version} is older than "
-                            f"current version {SCHEMA_VERSION}. Migration not implemented."
-                        )
-                    # Version matches - schema already initialized
+                    self._validate_schema_contract(connection)
+                    self._validate_stored_rows(connection)
                     return
 
-                # New database - apply migrations
-                for version, sql in self.MIGRATIONS:
-                    if version > SCHEMA_VERSION:
-                        # Skip future migrations
-                        continue
-                    connection.executescript(sql)
-                    # Use INSERT OR IGNORE to handle concurrent schema initialization
-                    connection.execute(
-                        "INSERT OR IGNORE INTO effect_store_schema(version) VALUES (?)",
-                        (version,),
-                    )
+    def _validate_schema_contract(self, connection: sqlite3.Connection) -> None:
+        """Fail closed if required schema objects are absent or malformed."""
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        missing_tables = set(_EXPECTED_SCHEMA_TABLES) - tables
+        if missing_tables:
+            raise SchemaVersionError(
+                f"Database schema is incomplete; missing tables: {sorted(missing_tables)}"
+            )
+
+        for table_name, expected_columns in _EXPECTED_SCHEMA_TABLES.items():
+            columns = tuple(
+                row[1]
+                for row in connection.execute(f"PRAGMA table_info({table_name})")
+            )
+            if columns != expected_columns:
+                raise SchemaVersionError(
+                    f"Database schema table {table_name} has incompatible columns: {columns!r}"
+                )
+
+        for index_name, (table_name, expected_columns) in _EXPECTED_INDEXES.items():
+            index_row = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name = ?",
+                (index_name,),
+            ).fetchone()
+            if index_row is None:
+                raise SchemaVersionError(f"Database schema is incomplete; missing index {index_name}")
+            indexed_columns = tuple(
+                row[2]
+                for row in connection.execute(f"PRAGMA index_info({index_name})")
+            )
+            if indexed_columns != expected_columns:
+                raise SchemaVersionError(
+                    f"Database index {index_name} on {table_name} has incompatible columns: "
+                    f"{indexed_columns!r}"
+                )
+
+        version_rows = [
+            int(row[0])
+            for row in connection.execute("SELECT version FROM effect_store_schema ORDER BY version")
+        ]
+        if version_rows != [SCHEMA_VERSION]:
+            raise SchemaVersionError(
+                f"Database schema version metadata must contain exactly [{SCHEMA_VERSION}], "
+                f"found {version_rows!r}"
+            )
+
+    def _validate_stored_rows(self, connection: sqlite3.Connection) -> None:
+        """Fail closed if authoritative stored rows contain invalid domain bindings."""
+        for table_name in (
+            "effect_intents",
+            "effect_dispatches",
+            "authority_reservations",
+            "reconciliation_obligations",
+            "reservation_bindings",
+            "reservation_releases",
+        ):
+            for (stored_domain,) in connection.execute(
+                f"SELECT control_domain FROM {table_name}"
+            ):
+                try:
+                    validate_domain_id(stored_domain, "control_domain")
+                except ValueError as exc:
+                    raise StorageIntegrityError(
+                        f"Stored control_domain in {table_name} failed validation: {stored_domain!r}"
+                    ) from exc
+
+        for (
+            stored_domain,
+            reservation_id,
+            disposition,
+            disposition_evidence_json,
+        ) in connection.execute(
+            """
+            SELECT control_domain, reservation_id, disposition, disposition_evidence_json
+            FROM authority_reservations
+            """
+        ):
+            if disposition_evidence_json is None:
+                continue
+            try:
+                pointer = _deserialize_evidence_pointer(disposition_evidence_json)
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                raise StorageIntegrityError(
+                    f"Stored reservation {reservation_id} failed evidence pointer validation"
+                ) from exc
+            if pointer is not None and pointer.key.domain_id is not None and pointer.key.domain_id != stored_domain:
+                raise StorageIntegrityError(
+                    f"Stored reservation {reservation_id} has mismatched evidence control_domain"
+                )
+
+            if disposition not in {
+                AuthorityDisposition.RESERVED.value,
+                AuthorityDisposition.CONSUMED.value,
+                AuthorityDisposition.RELEASED.value,
+                AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED.value,
+            }:
+                raise StorageIntegrityError(
+                    f"Stored reservation {reservation_id} has invalid disposition {disposition!r}"
+                )
 
     def commit_intent(self, intent: EffectIntent) -> None:
         """Commit a write-ahead intent atomically.
@@ -883,7 +1121,69 @@ class DurableEffectStore:
                             f"not 'no_operation_committed' (NOTHING_LANDED)"
                         )
 
-                    # Delete from active reservations
+                    current_row = connection.execute(
+                        """
+                        SELECT disposition, disposition_evidence_json
+                        FROM authority_reservations
+                        WHERE control_domain = ? AND reservation_id = ?
+                        """,
+                        (domain, reservation_id),
+                    ).fetchone()
+                    serialized_evidence = _serialize_evidence_pointer(evidence_pointer)
+                    if current_row is not None:
+                        if current_row[0] == AuthorityDisposition.RELEASED.value:
+                            if current_row[1] == serialized_evidence:
+                                return
+                            raise ValueError(
+                                f"Reservation {reservation_id} already released with different evidence"
+                            )
+                        if current_row[0] != AuthorityDisposition.RESERVED.value:
+                            raise ValueError(
+                                f"Reservation {reservation_id} in domain {domain} cannot regress from "
+                                f"{current_row[0]!r} to {AuthorityDisposition.RELEASED.value!r}"
+                            )
+
+                        updated = connection.execute(
+                            """
+                            UPDATE authority_reservations
+                               SET disposition = ?,
+                                   disposition_at = ?,
+                                   disposition_evidence_json = ?
+                             WHERE control_domain = ?
+                               AND reservation_id = ?
+                               AND disposition = ?
+                            """,
+                            (
+                                AuthorityDisposition.RELEASED.value,
+                                _serialize_timestamp(record.reference.observed_at),
+                                serialized_evidence,
+                                domain,
+                                reservation_id,
+                                AuthorityDisposition.RESERVED.value,
+                            ),
+                        )
+                        if updated.rowcount != 1:
+                            after_row = connection.execute(
+                                """
+                                SELECT disposition, disposition_evidence_json
+                                FROM authority_reservations
+                                WHERE control_domain = ? AND reservation_id = ?
+                                """,
+                                (domain, reservation_id),
+                            ).fetchone()
+                            if after_row is not None and after_row[0] == AuthorityDisposition.RELEASED.value:
+                                if after_row[1] == serialized_evidence:
+                                    return
+                                raise ValueError(
+                                    f"Reservation {reservation_id} already released with different evidence"
+                                )
+                            if after_row is not None:
+                                raise ValueError(
+                                    f"Reservation {reservation_id} in domain {domain} cannot regress from "
+                                    f"{after_row[0]!r} to {AuthorityDisposition.RELEASED.value!r}"
+                                )
+
+                    # Delete from active reservations only after the state transition succeeds.
                     connection.execute(
                         """
                         DELETE FROM reservation_bindings
@@ -903,6 +1203,8 @@ class DurableEffectStore:
                         (domain, reservation_id, effect_intent_id, evidence_pointer.record_fingerprint),
                     )
 
+        except sqlite3.IntegrityError as e:
+            raise StorageIntegrityError(f"Failed to release reservation: {e}") from e
         except sqlite3.OperationalError as e:
             if "locked" in str(e).lower():
                 raise ConcurrencyConflictError(
@@ -1092,7 +1394,7 @@ class DurableEffectStore:
                                 f"reservation {reservation.reservation_id} in domain {domain} "
                                 f"cannot regress from {existing[3]!r} to {reservation.disposition.value!r}"
                             )
-                        connection.execute(
+                        updated = connection.execute(
                             """
                             UPDATE authority_reservations
                                SET effect_intent_id = ?,
@@ -1103,6 +1405,7 @@ class DurableEffectStore:
                                    disposition_at = ?,
                                    disposition_evidence_json = ?
                              WHERE control_domain = ? AND reservation_id = ?
+                               AND disposition = ?
                             """,
                             (
                                 reservation.effect_intent_id,
@@ -1114,8 +1417,44 @@ class DurableEffectStore:
                                 serialized_evidence,
                                 domain,
                                 reservation.reservation_id,
+                                AuthorityDisposition.RESERVED.value,
                             ),
                         )
+                        if updated.rowcount != 1:
+                            after_row = connection.execute(
+                                """
+                                SELECT effect_intent_id, capability_type, amount, disposition,
+                                       reserved_at, disposition_at, disposition_evidence_json
+                                FROM authority_reservations
+                                WHERE control_domain = ? AND reservation_id = ?
+                                """,
+                                (domain, reservation.reservation_id),
+                            ).fetchone()
+                            if after_row is None:
+                                raise ValueError(
+                                    f"reservation {reservation.reservation_id} in domain {domain} "
+                                    "was removed during update"
+                                )
+                            after_payload = (
+                                after_row[0],
+                                after_row[1],
+                                after_row[2],
+                                after_row[3],
+                                after_row[4],
+                                after_row[5],
+                                after_row[6],
+                            )
+                            if after_payload == incoming_payload:
+                                return
+                            if after_row[3] != AuthorityDisposition.RESERVED.value:
+                                raise ValueError(
+                                    f"reservation {reservation.reservation_id} in domain {domain} "
+                                    f"cannot regress from {after_row[3]!r} to {reservation.disposition.value!r}"
+                                )
+                            raise ValueError(
+                                f"reservation {reservation.reservation_id} in domain {domain} "
+                                "was concurrently modified"
+                            )
                     else:
                         connection.execute(
                             """
