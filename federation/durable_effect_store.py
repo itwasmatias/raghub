@@ -77,6 +77,10 @@ class ConcurrencyConflictError(DurableEffectStoreError):
     """Raised when concurrent operations conflict."""
 
 
+class PermitAlreadyIssuedError(DurableEffectStoreError):
+    """Raised when a gateway claim has already issued its sole permit."""
+
+
 _FILE_JOURNAL_MODE = "wal"
 _MAX_BUSY_TIMEOUT_MS = 30000
 
@@ -1118,6 +1122,45 @@ class DurableEffectStore:
             ):
                 raise StorageIntegrityError(
                     f"Stored permit {permit_id} has invalid credential scope JSON"
+                )
+
+        for (
+            stored_domain,
+            gateway_claim_id,
+            claim_permit_verifier,
+            permit_count,
+            matching_verifier_count,
+        ) in connection.execute(
+            """
+            SELECT claims.control_domain,
+                   claims.gateway_claim_id,
+                   claims.permit_verifier,
+                   COUNT(permits.permit_id),
+                   SUM(
+                       CASE
+                           WHEN permits.permit_verifier = claims.permit_verifier THEN 1
+                           ELSE 0
+                       END
+                   )
+            FROM effect_gateway_claims AS claims
+            LEFT JOIN effect_gateway_permits AS permits
+              ON permits.control_domain = claims.control_domain
+             AND permits.gateway_claim_id = claims.gateway_claim_id
+            GROUP BY claims.control_domain, claims.gateway_claim_id, claims.permit_verifier
+            """
+        ):
+            unissued_claim_is_consistent = (
+                claim_permit_verifier is None and permit_count == 0
+            )
+            issued_claim_is_consistent = (
+                claim_permit_verifier is not None
+                and permit_count == 1
+                and matching_verifier_count == 1
+            )
+            if not (unissued_claim_is_consistent or issued_claim_is_consistent):
+                raise StorageIntegrityError(
+                    f"Stored gateway claim {gateway_claim_id!r} in domain "
+                    f"{stored_domain!r} has inconsistent permit assignment"
                 )
 
     def commit_intent(self, intent: EffectIntent) -> None:
@@ -2531,7 +2574,8 @@ class DurableEffectStore:
 
         Raises:
             ValueError: If claim not found or not eligible
-            ConcurrencyConflictError: If permit already exists
+            PermitAlreadyIssuedError: If the claim has already issued its permit
+            ConcurrencyConflictError: If the writer lock cannot be acquired
             StorageIntegrityError: If transaction fails
         """
         domain = validate_domain_id(control_domain, "control_domain")
@@ -2540,10 +2584,13 @@ class DurableEffectStore:
         try:
             with self._connection() as connection:
                 with connection:
-                    # Verify claim exists and is in CLAIMED state
+                    connection.execute("BEGIN IMMEDIATE")
+
+                    # The durable marker is checked before lifecycle state so every
+                    # post-issuance retry receives the same strict single-issuance result.
                     claim_row = connection.execute(
                         """
-                        SELECT state, request_fingerprint, effect_intent_id,
+                        SELECT state, permit_verifier, request_fingerprint, effect_intent_id,
                                effect_dispatch_id, authority_reservation_id
                         FROM effect_gateway_claims
                         WHERE control_domain = ? AND gateway_claim_id = ?
@@ -2554,43 +2601,47 @@ class DurableEffectStore:
                         raise ValueError(
                             f"gateway_claim_id {gateway_claim_id!r} not found in domain {domain}"
                         )
+                    if claim_row[1] is not None:
+                        raise PermitAlreadyIssuedError(
+                            f"gateway_claim_id {gateway_claim_id!r} has already issued a permit"
+                        )
                     if claim_row[0] != "claimed":
                         raise ValueError(
                             f"gateway_claim_id {gateway_claim_id!r} has state {claim_row[0]!r}, "
                             "must be 'claimed'"
                         )
-                    if claim_row[1] != request_fingerprint:
+                    if claim_row[2] != request_fingerprint:
                         raise ValueError(
                             f"request_fingerprint mismatch for claim {gateway_claim_id!r}"
                         )
-                    if claim_row[2] != effect_intent_id:
+                    if claim_row[3] != effect_intent_id:
                         raise ValueError(f"effect_intent_id mismatch for claim {gateway_claim_id!r}")
-                    if claim_row[3] != effect_dispatch_id:
+                    if claim_row[4] != effect_dispatch_id:
                         raise ValueError(
                             f"effect_dispatch_id mismatch for claim {gateway_claim_id!r}"
                         )
-                    if claim_row[4] != authority_reservation_id:
+                    if claim_row[5] != authority_reservation_id:
                         raise ValueError(
                             f"authority_reservation_id mismatch for claim {gateway_claim_id!r}"
                         )
 
-                    # Check for idempotent retry
-                    existing = connection.execute(
+                    issuance_slot = connection.execute(
                         """
-                        SELECT permit_verifier
-                        FROM effect_gateway_permits
-                        WHERE control_domain = ? AND permit_id = ?
+                        UPDATE effect_gateway_claims
+                        SET permit_verifier = ?
+                        WHERE control_domain = ?
+                          AND gateway_claim_id = ?
+                          AND state = 'claimed'
+                          AND permit_verifier IS NULL
                         """,
-                        (domain, permit_id),
-                    ).fetchone()
-                    if existing is not None:
-                        if existing[0] == permit_verifier:
-                            return
-                        raise ConcurrencyConflictError(
-                            f"permit_id {permit_id!r} already exists with different verifier"
+                        (permit_verifier, domain, gateway_claim_id),
+                    )
+                    if issuance_slot.rowcount != 1:
+                        raise StorageIntegrityError(
+                            f"Failed to claim the permit issuance slot for "
+                            f"gateway_claim_id {gateway_claim_id!r}"
                         )
 
-                    # Insert permit
                     credential_scope_json = json.dumps(list(credential_scope))
                     connection.execute(
                         """
@@ -2624,16 +2675,6 @@ class DurableEffectStore:
                             _serialize_timestamp(issued_at),
                             _serialize_timestamp(expires_at),
                         ),
-                    )
-
-                    # Store permit_verifier in claim
-                    connection.execute(
-                        """
-                        UPDATE effect_gateway_claims
-                        SET permit_verifier = ?
-                        WHERE control_domain = ? AND gateway_claim_id = ?
-                        """,
-                        (permit_verifier, domain, gateway_claim_id),
                     )
 
                     # Test-only: allow crash simulation before commit
@@ -3076,5 +3117,6 @@ __all__ = [
     "SchemaVersionError",
     "StorageIntegrityError",
     "ConcurrencyConflictError",
+    "PermitAlreadyIssuedError",
     "SCHEMA_VERSION",
 ]

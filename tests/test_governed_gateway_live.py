@@ -35,6 +35,7 @@ from federation.durable_effect_store import (
     DurableEffectStore,
     EffectDispatch,
     EffectIntent,
+    StorageIntegrityError,
 )
 from federation.effect_gateway import (
     DenialReason,
@@ -179,6 +180,22 @@ def _create_request(
         request_expiry=request_expiry,
         credential_scope=credential_scope,
     )
+
+
+def _count_permits_for_claim(db_path: Path, gateway_claim_id: str) -> int:
+    """Return the durable permit count for one canonical claim."""
+    connection = sqlite3.connect(db_path)
+    try:
+        return connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM effect_gateway_permits
+            WHERE control_domain = ? AND gateway_claim_id = ?
+            """,
+            ("domain-a", gateway_claim_id),
+        ).fetchone()[0]
+    finally:
+        connection.close()
 
 
 # Test 0: Happy path - complete flow
@@ -678,6 +695,258 @@ def test_exact_expiry_boundary_denied(tmp_path: Path) -> None:
     with pytest.raises(GatewayDenied) as exc_info:
         gateway.verify_and_consume_permit(permit_token, control_domain="domain-a")
     assert exc_info.value.reason == DenialReason.PERMIT_EXPIRED
+
+
+def test_single_issuance_denies_sequential_unused_reissuance(tmp_path: Path) -> None:
+    """A claim cannot mint a second permit while its first permit is unused."""
+    db_path = tmp_path / "store.sqlite3"
+    store = DurableEffectStore(db_path)
+    clock = FrozenClock(_utc(1, 10, 0))
+    gateway = GovernedEffectGateway(store, clock=clock)
+
+    _create_authoritative_records(store)
+    request = _create_request()
+    gateway_claim_id, _ = gateway.claim_dispatch(request, owner_identity="owner-1")
+
+    gateway.issue_dispatch_permit(request, gateway_claim_id)
+    with pytest.raises(GatewayDenied) as exc_info:
+        gateway.issue_dispatch_permit(request, gateway_claim_id)
+
+    assert exc_info.value.reason is DenialReason.PERMIT_ALREADY_ISSUED
+    assert _count_permits_for_claim(db_path, gateway_claim_id) == 1
+
+
+def test_single_issuance_denies_reissuance_after_consumption(tmp_path: Path) -> None:
+    """A consumed permit permanently exhausts its claim's issuance slot."""
+    db_path = tmp_path / "store.sqlite3"
+    store = DurableEffectStore(db_path)
+    clock = FrozenClock(_utc(1, 10, 0))
+    gateway = GovernedEffectGateway(store, clock=clock)
+
+    _create_authoritative_records(store)
+    request = _create_request()
+    gateway_claim_id, _ = gateway.claim_dispatch(request, owner_identity="owner-1")
+    _, permit_token = gateway.issue_dispatch_permit(request, gateway_claim_id)
+    gateway.verify_and_consume_permit(permit_token, control_domain="domain-a")
+
+    with pytest.raises(GatewayDenied) as exc_info:
+        gateway.issue_dispatch_permit(request, gateway_claim_id)
+
+    assert exc_info.value.reason is DenialReason.PERMIT_ALREADY_ISSUED
+    assert _count_permits_for_claim(db_path, gateway_claim_id) == 1
+
+
+def test_single_issuance_denies_reissuance_after_revocation(tmp_path: Path) -> None:
+    """A revoked permit permanently exhausts its claim's issuance slot."""
+    db_path = tmp_path / "store.sqlite3"
+    store = DurableEffectStore(db_path)
+    clock = FrozenClock(_utc(1, 10, 0))
+    gateway = GovernedEffectGateway(store, clock=clock)
+
+    _create_authoritative_records(store)
+    request = _create_request()
+    gateway_claim_id, _ = gateway.claim_dispatch(request, owner_identity="owner-1")
+    permit_id, _ = gateway.issue_dispatch_permit(request, gateway_claim_id)
+    store.revoke_permit(permit_id, control_domain="domain-a", now=clock.now)
+
+    with pytest.raises(GatewayDenied) as exc_info:
+        gateway.issue_dispatch_permit(request, gateway_claim_id)
+
+    assert exc_info.value.reason is DenialReason.PERMIT_ALREADY_ISSUED
+    assert _count_permits_for_claim(db_path, gateway_claim_id) == 1
+
+
+def test_single_issuance_denies_reissuance_after_expiry(tmp_path: Path) -> None:
+    """An expired permit permanently exhausts its claim's issuance slot."""
+    db_path = tmp_path / "store.sqlite3"
+    store = DurableEffectStore(db_path)
+    clock = FrozenClock(_utc(1, 10, 0))
+    gateway = GovernedEffectGateway(store, clock=clock)
+
+    _create_authoritative_records(store)
+    request = _create_request(request_expiry=_utc(1, 11, 0))
+    gateway_claim_id, _ = gateway.claim_dispatch(request, owner_identity="owner-1")
+    gateway.issue_dispatch_permit(request, gateway_claim_id)
+    clock.now = request.request_expiry
+
+    with pytest.raises(GatewayDenied) as exc_info:
+        gateway.issue_dispatch_permit(request, gateway_claim_id)
+
+    assert exc_info.value.reason is DenialReason.PERMIT_ALREADY_ISSUED
+    assert _count_permits_for_claim(db_path, gateway_claim_id) == 1
+
+
+def test_single_issuance_survives_reopen(tmp_path: Path) -> None:
+    """A committed issuance remains single-assignment after store reopen."""
+    db_path = tmp_path / "store.sqlite3"
+    store = DurableEffectStore(db_path)
+    clock = FrozenClock(_utc(1, 10, 0))
+    gateway = GovernedEffectGateway(store, clock=clock)
+
+    _create_authoritative_records(store)
+    request = _create_request()
+    gateway_claim_id, _ = gateway.claim_dispatch(request, owner_identity="owner-1")
+    gateway.issue_dispatch_permit(request, gateway_claim_id)
+    store.close()
+
+    reopened_store = DurableEffectStore(db_path)
+    reopened_gateway = GovernedEffectGateway(reopened_store, clock=clock)
+    with pytest.raises(GatewayDenied) as exc_info:
+        reopened_gateway.issue_dispatch_permit(request, gateway_claim_id)
+
+    assert exc_info.value.reason is DenialReason.PERMIT_ALREADY_ISSUED
+    assert _count_permits_for_claim(db_path, gateway_claim_id) == 1
+
+
+def _issue_permit_worker(
+    db_path: str,
+    gateway_claim_id: str,
+    iteration: int,
+    result_queue: mp.Queue,
+    barrier: mp.Barrier,
+) -> None:
+    """Race one issuance attempt from an independently opened store."""
+    try:
+        store = DurableEffectStore(db_path)
+        clock = FrozenClock(_utc(1, 10, 0))
+        gateway = GovernedEffectGateway(store, clock=clock)
+        request = _create_request(
+            effect_intent_id=f"issuance-intent-{iteration}",
+            effect_dispatch_id=f"issuance-dispatch-{iteration}",
+            authority_reservation_id=f"issuance-reservation-{iteration}",
+            idempotency_key=f"issuance-idem-{iteration}",
+        )
+        barrier.wait(timeout=10)
+
+        try:
+            permit_id, _ = gateway.issue_dispatch_permit(request, gateway_claim_id)
+            result_queue.put(("success", permit_id))
+        except GatewayDenied as exc:
+            if exc.reason is DenialReason.PERMIT_ALREADY_ISSUED:
+                result_queue.put(("duplicate", exc.reason.value))
+            else:
+                result_queue.put(("unexpected_denial", exc.reason.value))
+        except Exception as exc:
+            result_queue.put(("error", type(exc).__name__, str(exc)))
+    except Exception as exc:
+        result_queue.put(("setup_error", type(exc).__name__, str(exc)))
+
+
+def test_single_issuance_multiprocess_race_50_iterations(tmp_path: Path) -> None:
+    """Two spawned issuers produce one permit and one exact duplicate denial."""
+    db_path = tmp_path / "store.sqlite3"
+    store = DurableEffectStore(db_path)
+    clock = FrozenClock(_utc(1, 10, 0))
+    gateway = GovernedEffectGateway(store, clock=clock)
+    context = mp.get_context("spawn")
+
+    for iteration in range(50):
+        _create_authoritative_records(
+            store,
+            effect_intent_id=f"issuance-intent-{iteration}",
+            effect_dispatch_id=f"issuance-dispatch-{iteration}",
+            authority_reservation_id=f"issuance-reservation-{iteration}",
+            idempotency_key=f"issuance-idem-{iteration}",
+        )
+        request = _create_request(
+            effect_intent_id=f"issuance-intent-{iteration}",
+            effect_dispatch_id=f"issuance-dispatch-{iteration}",
+            authority_reservation_id=f"issuance-reservation-{iteration}",
+            idempotency_key=f"issuance-idem-{iteration}",
+        )
+        gateway_claim_id, _ = gateway.claim_dispatch(
+            request,
+            owner_identity=f"issuance-owner-{iteration}",
+        )
+        result_queue: mp.Queue = context.Queue()
+        barrier: mp.Barrier = context.Barrier(2)
+        process_a = context.Process(
+            target=_issue_permit_worker,
+            args=(str(db_path), gateway_claim_id, iteration, result_queue, barrier),
+        )
+        process_b = context.Process(
+            target=_issue_permit_worker,
+            args=(str(db_path), gateway_claim_id, iteration, result_queue, barrier),
+        )
+
+        process_a.start()
+        process_b.start()
+        process_a.join(timeout=15)
+        process_b.join(timeout=15)
+
+        assert process_a.exitcode == 0, f"Process A failed in iteration {iteration}"
+        assert process_b.exitcode == 0, f"Process B failed in iteration {iteration}"
+        results = [result_queue.get(timeout=5) for _ in range(2)]
+        result_queue.close()
+        result_queue.join_thread()
+
+        successes = [result for result in results if result[0] == "success"]
+        duplicates = [result for result in results if result[0] == "duplicate"]
+        assert len(successes) == 1, f"Iteration {iteration}: {results}"
+        assert duplicates == [("duplicate", "permit_already_issued")], (
+            f"Iteration {iteration}: {results}"
+        )
+        assert _count_permits_for_claim(db_path, gateway_claim_id) == 1
+
+
+def test_single_issuance_reopen_rejects_pre_fix_duplicate_permits(tmp_path: Path) -> None:
+    """Reopen fails closed when a pre-fix database has two permits for one claim."""
+    db_path = tmp_path / "store.sqlite3"
+    store = DurableEffectStore(db_path)
+    clock = FrozenClock(_utc(1, 10, 0))
+    gateway = GovernedEffectGateway(store, clock=clock)
+
+    _create_authoritative_records(store)
+    request = _create_request()
+    gateway_claim_id, _ = gateway.claim_dispatch(request, owner_identity="owner-1")
+    gateway.issue_dispatch_permit(request, gateway_claim_id)
+    store.close()
+
+    connection = sqlite3.connect(db_path)
+    try:
+        (first_verifier,) = connection.execute(
+            """
+            SELECT permit_verifier
+            FROM effect_gateway_permits
+            WHERE control_domain = ? AND gateway_claim_id = ?
+            """,
+            ("domain-a", gateway_claim_id),
+        ).fetchone()
+        duplicate_verifier = "0" * 64 if first_verifier != "0" * 64 else "1" * 64
+        cursor = connection.execute(
+            """
+            INSERT INTO effect_gateway_permits (
+                control_domain, permit_id, permit_verifier, request_fingerprint,
+                effect_intent_id, effect_dispatch_id, authority_reservation_id,
+                gateway_claim_id, delegation_grant_id, delegation_grant_fingerprint,
+                requested_capability, operation_digest, idempotency_key, provider_id,
+                adapter_id, credential_scope_json, owner_identity, issued_at, expires_at,
+                consumed_at, revoked_at
+            )
+            SELECT control_domain, ?, ?, request_fingerprint,
+                   effect_intent_id, effect_dispatch_id, authority_reservation_id,
+                   gateway_claim_id, delegation_grant_id, delegation_grant_fingerprint,
+                   requested_capability, operation_digest, idempotency_key, provider_id,
+                   adapter_id, credential_scope_json, owner_identity, issued_at, expires_at,
+                   consumed_at, revoked_at
+            FROM effect_gateway_permits
+            WHERE control_domain = ? AND gateway_claim_id = ?
+            """,
+            (
+                "gateway-permit-pre-fix-duplicate",
+                duplicate_verifier,
+                "domain-a",
+                gateway_claim_id,
+            ),
+        )
+        assert cursor.rowcount == 1
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert _count_permits_for_claim(db_path, gateway_claim_id) == 2
+    with pytest.raises(StorageIntegrityError):
+        DurableEffectStore(db_path)
 
 
 # Multiprocess concurrency tests
@@ -1611,6 +1880,7 @@ def test_crash_during_permit_issuance_no_durable_permit(tmp_path: Path) -> None:
         # Verify claim is still in CLAIMED state (not updated)
         claim = store2.get_gateway_claim(claim_id, "domain-a")
         assert claim["state"] == "claimed", "Claim should remain in CLAIMED state after permit issuance crash"
+        assert claim["permit_verifier"] is None
     finally:
         conn.close()
 
@@ -1619,6 +1889,7 @@ def test_crash_during_permit_issuance_no_durable_permit(tmp_path: Path) -> None:
     permit_id, permit_token = gateway2.issue_dispatch_permit(request, claim_id)
     assert permit_id.startswith("gateway-permit-")
     assert len(permit_token) >= 43
+    assert _count_permits_for_claim(db_path, claim_id) == 1
 
 
 def _crash_before_consumption_commit(db_path: str, permit_token: str, result_queue: mp.Queue) -> None:

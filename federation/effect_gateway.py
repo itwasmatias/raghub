@@ -102,6 +102,7 @@ class DenialReason(str, Enum):
     PERMIT_EXPIRED = "permit_expired"
     PERMIT_REVOKED = "permit_revoked"
     PERMIT_ALREADY_CONSUMED = "permit_already_consumed"
+    PERMIT_ALREADY_ISSUED = "permit_already_issued"
 
     # State machine
     ILLEGAL_STATE_TRANSITION = "illegal_state_transition"
@@ -760,6 +761,8 @@ class GovernedEffectGateway:
         # Permit inherits request expiry
         expires_at = request.request_expiry
 
+        from federation.durable_effect_store import PermitAlreadyIssuedError
+
         try:
             self._store.issue_gateway_permit(
                 permit_id=permit_id,
@@ -783,6 +786,8 @@ class GovernedEffectGateway:
                 control_domain=request.control_domain,
             )
             return (permit_id, permit_token)
+        except PermitAlreadyIssuedError as e:
+            raise GatewayDenied(DenialReason.PERMIT_ALREADY_ISSUED, str(e)) from e
         except ValueError as e:
             raise GatewayDenied(DenialReason.CLAIM_NOT_FOUND, str(e)) from e
 
