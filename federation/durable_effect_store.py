@@ -58,7 +58,7 @@ from federation.effect_safety import (
 
 
 # Schema version for fail-closed compatibility checking
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class DurableEffectStoreError(Exception):
@@ -148,6 +148,40 @@ _EXPECTED_SCHEMA_TABLES: dict[str, tuple[str, ...]] = {
         "evidence_fingerprint",
         "released_at",
     ),
+    "effect_gateway_claims": (
+        "control_domain",
+        "gateway_claim_id",
+        "effect_intent_id",
+        "idempotency_key",
+        "operation_digest",
+        "provider_id",
+        "adapter_id",
+        "owner_identity",
+        "state",
+        "permit_verifier",
+        "claimed_at",
+        "expires_at",
+        "handoff_started_at",
+        "receipt_recorded_at",
+        "terminal_at",
+    ),
+    "effect_gateway_permits": (
+        "control_domain",
+        "permit_id",
+        "gateway_claim_id",
+        "permit_verifier",
+        "effect_intent_id",
+        "operation_digest",
+        "idempotency_key",
+        "provider_id",
+        "adapter_id",
+        "credential_scope_json",
+        "owner_identity",
+        "issued_at",
+        "expires_at",
+        "consumed_at",
+        "revoked_at",
+    ),
 }
 
 _EXPECTED_INDEXES: dict[str, tuple[str, tuple[str, ...]]] = {
@@ -156,6 +190,9 @@ _EXPECTED_INDEXES: dict[str, tuple[str, tuple[str, ...]]] = {
     "idx_reservations_intent": ("authority_reservations", ("control_domain", "effect_intent_id")),
     "idx_reservations_disposition": ("authority_reservations", ("control_domain", "disposition")),
     "idx_obligations_state": ("reconciliation_obligations", ("control_domain", "state", "next_probe_at")),
+    "idx_gateway_claims_intent": ("effect_gateway_claims", ("control_domain", "effect_intent_id")),
+    "idx_gateway_claims_idempotency": ("effect_gateway_claims", ("control_domain", "idempotency_key", "operation_digest")),
+    "idx_gateway_permits_claim": ("effect_gateway_permits", ("control_domain", "gateway_claim_id")),
 }
 
 
@@ -339,6 +376,67 @@ class DurableEffectStore:
                 ON reconciliation_obligations(control_domain, state, next_probe_at);
             """,
         ),
+        (
+            2,
+            """
+            -- Gateway v0.1: Durable single-winner dispatch claims and single-use permits
+
+            -- Gateway dispatch claims: enforce single-winner dispatch ownership
+            CREATE TABLE IF NOT EXISTS effect_gateway_claims (
+                control_domain TEXT NOT NULL,
+                gateway_claim_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                operation_digest TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                adapter_id TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                state TEXT NOT NULL,
+                permit_verifier TEXT,
+                claimed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                handoff_started_at TEXT,
+                receipt_recorded_at TEXT,
+                terminal_at TEXT,
+                PRIMARY KEY (control_domain, gateway_claim_id),
+                FOREIGN KEY (control_domain, effect_intent_id)
+                    REFERENCES effect_intents(control_domain, effect_intent_id),
+                UNIQUE (control_domain, idempotency_key, operation_digest)
+            );
+
+            -- Gateway dispatch permits: cryptographic single-use adapter authorization
+            CREATE TABLE IF NOT EXISTS effect_gateway_permits (
+                control_domain TEXT NOT NULL,
+                permit_id TEXT NOT NULL,
+                gateway_claim_id TEXT NOT NULL,
+                permit_verifier TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                operation_digest TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                adapter_id TEXT NOT NULL,
+                credential_scope_json TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                issued_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                consumed_at TEXT,
+                revoked_at TEXT,
+                PRIMARY KEY (control_domain, permit_id),
+                FOREIGN KEY (control_domain, gateway_claim_id)
+                    REFERENCES effect_gateway_claims(control_domain, gateway_claim_id),
+                FOREIGN KEY (control_domain, effect_intent_id)
+                    REFERENCES effect_intents(control_domain, effect_intent_id)
+            );
+
+            -- Indexes for gateway operations
+            CREATE INDEX IF NOT EXISTS idx_gateway_claims_intent
+                ON effect_gateway_claims(control_domain, effect_intent_id);
+            CREATE INDEX IF NOT EXISTS idx_gateway_claims_idempotency
+                ON effect_gateway_claims(control_domain, idempotency_key, operation_digest);
+            CREATE INDEX IF NOT EXISTS idx_gateway_permits_claim
+                ON effect_gateway_permits(control_domain, gateway_claim_id);
+            """,
+        ),
     )
 
     def __init__(self, database_path: str | Path, *, busy_timeout_ms: int = _MAX_BUSY_TIMEOUT_MS) -> None:
@@ -495,25 +593,51 @@ class DurableEffectStore:
                         ]
 
                         if existing_versions:
-                            # Database exists - verify compatibility
-                            distinct_versions = set(existing_versions)
-                            if len(existing_versions) != 1 or len(distinct_versions) != 1:
+                            # Database exists - verify compatibility and apply migrations if needed
+                            latest_version = max(existing_versions)
+                            min_version = min(existing_versions)
+
+                            # Check for contradictory version sets (version 0 mixed with others, non-sequential, gaps)
+                            if 0 in existing_versions and len(existing_versions) > 1:
                                 raise SchemaVersionError(
                                     f"Database schema metadata contains contradictory versions: "
-                                    f"{sorted(distinct_versions)}"
+                                    f"{sorted(set(existing_versions))}"
                                 )
-                            latest_version = max(existing_versions)
+
+                            # Check for incompatible legacy version (version 0 alone, or min < 1)
+                            if 0 in existing_versions or min_version < 1:
+                                raise SchemaVersionError(
+                                    f"Database schema version {min_version} is older than current "
+                                    f"version {SCHEMA_VERSION} and is not compatible with automatic migration"
+                                )
+
+                            # Check for non-sequential version sets (gaps, duplicates, missing versions)
+                            if sorted(set(existing_versions)) != list(range(min_version, latest_version + 1)):
+                                raise SchemaVersionError(
+                                    f"Database schema metadata contains contradictory versions: "
+                                    f"{sorted(set(existing_versions))}"
+                                )
+
                             if latest_version > SCHEMA_VERSION:
                                 raise SchemaVersionError(
                                     f"Database schema version {latest_version} is newer than "
                                     f"supported version {SCHEMA_VERSION}. Upgrade required."
                                 )
                             if latest_version < SCHEMA_VERSION:
-                                # Future: implement migrations
-                                raise SchemaVersionError(
-                                    f"Database schema version {latest_version} is older than "
-                                    f"current version {SCHEMA_VERSION}. Migration not implemented."
-                                )
+                                # Apply missing migrations
+                                for version, sql in self.MIGRATIONS:
+                                    if version <= latest_version:
+                                        # Already applied
+                                        continue
+                                    if version > SCHEMA_VERSION:
+                                        # Skip future migrations
+                                        continue
+                                    # Apply migration
+                                    connection.executescript(sql)
+                                    connection.execute(
+                                        "INSERT OR IGNORE INTO effect_store_schema(version) VALUES (?)",
+                                        (version,),
+                                    )
                             self._validate_schema_contract(connection)
                             self._validate_stored_rows(connection)
                             return
@@ -586,10 +710,21 @@ class DurableEffectStore:
             int(row[0])
             for row in connection.execute("SELECT version FROM effect_store_schema ORDER BY version")
         ]
-        if version_rows != [SCHEMA_VERSION]:
+        # After migration, version table contains all applied versions [1, 2, ...]
+        # Verify the maximum version equals current SCHEMA_VERSION
+        if not version_rows:
+            raise SchemaVersionError("Database schema version metadata is empty")
+        if max(version_rows) != SCHEMA_VERSION:
             raise SchemaVersionError(
-                f"Database schema version metadata must contain exactly [{SCHEMA_VERSION}], "
-                f"found {version_rows!r}"
+                f"Database schema version {max(version_rows)} does not match "
+                f"current version {SCHEMA_VERSION}"
+            )
+        # Verify all versions are sequential and present
+        expected_versions = list(range(1, SCHEMA_VERSION + 1))
+        if sorted(set(version_rows)) != expected_versions:
+            raise SchemaVersionError(
+                f"Database schema version metadata should contain {expected_versions}, "
+                f"found {sorted(set(version_rows))}"
             )
 
     def _validate_stored_rows(self, connection: sqlite3.Connection) -> None:
@@ -601,7 +736,17 @@ class DurableEffectStore:
             "reconciliation_obligations",
             "reservation_bindings",
             "reservation_releases",
+            "effect_gateway_claims",
+            "effect_gateway_permits",
         ):
+            # Check if table exists (for v1 databases before migration to v2)
+            table_exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,)
+            ).fetchone()
+            if not table_exists:
+                continue
+
             for (stored_domain,) in connection.execute(
                 f"SELECT control_domain FROM {table_name}"
             ):
