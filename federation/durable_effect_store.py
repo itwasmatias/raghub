@@ -99,8 +99,21 @@ def _deserialize_evidence_pointer(value: str | None) -> EvidencePointer | None:
     """Deserialize JSON to EvidencePointer."""
     if value is None:
         return None
-    from research_mission.evidence_spine import EvidencePointer
-    return EvidencePointer.from_dict(json.loads(value))
+    from research_mission.evidence_spine import EvidencePointer, EvidenceCorrelationKey
+    data = json.loads(value)
+    key_data = data["key"]
+    key = EvidenceCorrelationKey(
+        source=key_data["source"],
+        record_id=key_data["record_id"],
+        mission_id=key_data.get("mission_id"),
+        task_id=key_data.get("task_id"),
+        domain_id=key_data.get("domain_id"),
+    )
+    return EvidencePointer(
+        key=key,
+        reference_fingerprint=data["reference_fingerprint"],
+        record_fingerprint=data["record_fingerprint"],
+    )
 
 
 def _serialize_probe_history(history: tuple[dict[str, Any], ...]) -> str:
