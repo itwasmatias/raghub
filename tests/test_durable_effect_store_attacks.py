@@ -326,7 +326,7 @@ class TestAdditionalDurabilityAttacks:
             with pytest.raises(SchemaVersionError, match="incomplete|partial|missing"):
                 DurableEffectStore(db_path)
             after = db_path.read_bytes()
-            assert len(after) >= len(before)
+            assert after == before
             conn = sqlite3.connect(db_path)
             try:
                 tables = {
@@ -335,14 +335,11 @@ class TestAdditionalDurabilityAttacks:
                         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
                     )
                 }
-                # After v2 migration attempt, gateway tables exist but v1 tables missing → fail
-                assert "effect_store_schema" in tables
-                assert "effect_gateway_claims" in tables or len(tables) == 1
+                assert tables == {"effect_store_schema"}
                 version_rows = conn.execute(
                     "SELECT version FROM effect_store_schema ORDER BY version"
                 ).fetchall()
-                # Either [1] if migration didn't run, or [1, 2] if it partially ran
-                assert version_rows in ([(1,)], [(1,), (2,)])
+                assert version_rows == [(1,)]
             finally:
                 conn.close()
 

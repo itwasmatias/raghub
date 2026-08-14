@@ -151,7 +151,13 @@ _EXPECTED_SCHEMA_TABLES: dict[str, tuple[str, ...]] = {
     "effect_gateway_claims": (
         "control_domain",
         "gateway_claim_id",
+        "request_fingerprint",
         "effect_intent_id",
+        "effect_dispatch_id",
+        "authority_reservation_id",
+        "delegation_grant_id",
+        "delegation_grant_fingerprint",
+        "requested_capability",
         "idempotency_key",
         "operation_digest",
         "provider_id",
@@ -168,9 +174,15 @@ _EXPECTED_SCHEMA_TABLES: dict[str, tuple[str, ...]] = {
     "effect_gateway_permits": (
         "control_domain",
         "permit_id",
-        "gateway_claim_id",
         "permit_verifier",
+        "request_fingerprint",
         "effect_intent_id",
+        "effect_dispatch_id",
+        "authority_reservation_id",
+        "gateway_claim_id",
+        "delegation_grant_id",
+        "delegation_grant_fingerprint",
+        "requested_capability",
         "operation_digest",
         "idempotency_key",
         "provider_id",
@@ -191,8 +203,22 @@ _EXPECTED_INDEXES: dict[str, tuple[str, tuple[str, ...]]] = {
     "idx_reservations_disposition": ("authority_reservations", ("control_domain", "disposition")),
     "idx_obligations_state": ("reconciliation_obligations", ("control_domain", "state", "next_probe_at")),
     "idx_gateway_claims_intent": ("effect_gateway_claims", ("control_domain", "effect_intent_id")),
-    "idx_gateway_claims_idempotency": ("effect_gateway_claims", ("control_domain", "idempotency_key", "operation_digest")),
+    "idx_gateway_claims_idempotency": ("effect_gateway_claims", ("control_domain", "idempotency_key")),
+    "idx_gateway_claims_request": ("effect_gateway_claims", ("control_domain", "request_fingerprint")),
     "idx_gateway_permits_claim": ("effect_gateway_permits", ("control_domain", "gateway_claim_id")),
+    "idx_gateway_permits_verifier": ("effect_gateway_permits", ("control_domain", "permit_verifier")),
+}
+
+_EXPECTED_SCHEMA_TABLES_V1: dict[str, tuple[str, ...]] = {
+    name: columns
+    for name, columns in _EXPECTED_SCHEMA_TABLES.items()
+    if name not in {"effect_gateway_claims", "effect_gateway_permits"}
+}
+
+_EXPECTED_INDEXES_V1: dict[str, tuple[str, tuple[str, ...]]] = {
+    name: spec
+    for name, spec in _EXPECTED_INDEXES.items()
+    if not name.startswith("idx_gateway_")
 }
 
 
@@ -244,6 +270,14 @@ def _serialize_probe_history(history: tuple[dict[str, Any], ...]) -> str:
 def _deserialize_probe_history(value: str) -> tuple[dict[str, Any], ...]:
     """Deserialize JSON to probe history tuple."""
     return tuple(json.loads(value))
+
+
+def _execute_sql_script(connection: sqlite3.Connection, sql: str) -> None:
+    """Execute a migration script statement-by-statement within the caller transaction."""
+    for statement in sql.split(";"):
+        statement = statement.strip()
+        if statement:
+            connection.execute(statement)
 
 
 class DurableEffectStore:
@@ -385,32 +419,61 @@ class DurableEffectStore:
             CREATE TABLE IF NOT EXISTS effect_gateway_claims (
                 control_domain TEXT NOT NULL,
                 gateway_claim_id TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
                 effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT NOT NULL,
+                authority_reservation_id TEXT NOT NULL,
+                delegation_grant_id TEXT NOT NULL,
+                delegation_grant_fingerprint TEXT NOT NULL,
+                requested_capability TEXT NOT NULL,
                 idempotency_key TEXT NOT NULL,
                 operation_digest TEXT NOT NULL,
                 provider_id TEXT NOT NULL,
                 adapter_id TEXT NOT NULL,
                 owner_identity TEXT NOT NULL,
-                state TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (
+                    state IN (
+                        'prepared',
+                        'claimed',
+                        'handoff_started',
+                        'receipt_recorded',
+                        'terminal',
+                        'indeterminate'
+                    )
+                ),
                 permit_verifier TEXT,
                 claimed_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL CHECK (expires_at > claimed_at),
                 handoff_started_at TEXT,
                 receipt_recorded_at TEXT,
                 terminal_at TEXT,
                 PRIMARY KEY (control_domain, gateway_claim_id),
                 FOREIGN KEY (control_domain, effect_intent_id)
                     REFERENCES effect_intents(control_domain, effect_intent_id),
-                UNIQUE (control_domain, idempotency_key, operation_digest)
+                FOREIGN KEY (control_domain, effect_dispatch_id)
+                    REFERENCES effect_dispatches(control_domain, dispatch_id),
+                FOREIGN KEY (control_domain, authority_reservation_id)
+                    REFERENCES authority_reservations(control_domain, reservation_id),
+                UNIQUE (control_domain, effect_intent_id),
+                UNIQUE (control_domain, effect_dispatch_id),
+                UNIQUE (control_domain, authority_reservation_id),
+                UNIQUE (control_domain, idempotency_key),
+                UNIQUE (control_domain, request_fingerprint)
             );
 
             -- Gateway dispatch permits: cryptographic single-use adapter authorization
             CREATE TABLE IF NOT EXISTS effect_gateway_permits (
                 control_domain TEXT NOT NULL,
                 permit_id TEXT NOT NULL,
-                gateway_claim_id TEXT NOT NULL,
                 permit_verifier TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
                 effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT NOT NULL,
+                authority_reservation_id TEXT NOT NULL,
+                gateway_claim_id TEXT NOT NULL,
+                delegation_grant_id TEXT NOT NULL,
+                delegation_grant_fingerprint TEXT NOT NULL,
+                requested_capability TEXT NOT NULL,
                 operation_digest TEXT NOT NULL,
                 idempotency_key TEXT NOT NULL,
                 provider_id TEXT NOT NULL,
@@ -418,23 +481,33 @@ class DurableEffectStore:
                 credential_scope_json TEXT NOT NULL,
                 owner_identity TEXT NOT NULL,
                 issued_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL CHECK (expires_at > issued_at),
                 consumed_at TEXT,
                 revoked_at TEXT,
                 PRIMARY KEY (control_domain, permit_id),
                 FOREIGN KEY (control_domain, gateway_claim_id)
                     REFERENCES effect_gateway_claims(control_domain, gateway_claim_id),
                 FOREIGN KEY (control_domain, effect_intent_id)
-                    REFERENCES effect_intents(control_domain, effect_intent_id)
+                    REFERENCES effect_intents(control_domain, effect_intent_id),
+                FOREIGN KEY (control_domain, effect_dispatch_id)
+                    REFERENCES effect_dispatches(control_domain, dispatch_id),
+                FOREIGN KEY (control_domain, authority_reservation_id)
+                    REFERENCES authority_reservations(control_domain, reservation_id),
+                CHECK (length(permit_verifier) = 64 AND permit_verifier GLOB '[0-9a-f]*'),
+                CHECK (NOT (consumed_at IS NOT NULL AND revoked_at IS NOT NULL))
             );
 
             -- Indexes for gateway operations
             CREATE INDEX IF NOT EXISTS idx_gateway_claims_intent
                 ON effect_gateway_claims(control_domain, effect_intent_id);
             CREATE INDEX IF NOT EXISTS idx_gateway_claims_idempotency
-                ON effect_gateway_claims(control_domain, idempotency_key, operation_digest);
+                ON effect_gateway_claims(control_domain, idempotency_key);
+            CREATE INDEX IF NOT EXISTS idx_gateway_claims_request
+                ON effect_gateway_claims(control_domain, request_fingerprint);
             CREATE INDEX IF NOT EXISTS idx_gateway_permits_claim
                 ON effect_gateway_permits(control_domain, gateway_claim_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_gateway_permits_verifier
+                ON effect_gateway_permits(control_domain, permit_verifier);
             """,
         ),
     )
@@ -462,7 +535,7 @@ class DurableEffectStore:
 
         self._ensure_schema()
 
-    def _create_connection(self, database_path: str) -> sqlite3.Connection:
+    def _create_connection(self, database_path: str, *, require_wal: bool = True) -> sqlite3.Connection:
         """Create a new database connection with proper configuration.
 
         Args:
@@ -478,7 +551,7 @@ class DurableEffectStore:
         """
         connection = sqlite3.connect(database_path, timeout=self._busy_timeout_ms / 1000.0)
         # WAL mode only works for file-based databases
-        if database_path != ":memory:":
+        if database_path != ":memory:" and require_wal:
             self._ensure_wal_mode(connection, database_path)
         connection.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
         connection.execute("PRAGMA foreign_keys=ON")
@@ -548,7 +621,7 @@ class DurableEffectStore:
         return self._create_connection(self.database_path)
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
+    def _connection(self, *, require_wal: bool = True) -> Iterator[sqlite3.Connection]:
         """Context manager for database connections.
 
         For in-memory databases, yields the persistent connection without closing.
@@ -563,7 +636,7 @@ class DurableEffectStore:
             yield self._memory_connection
         else:
             # File-based: create new connection, close when done
-            with closing(self._create_connection(self.database_path)) as conn:
+            with closing(self._create_connection(self.database_path, require_wal=require_wal)) as conn:
                 yield conn
 
     def _ensure_schema(self) -> None:
@@ -573,15 +646,25 @@ class DurableEffectStore:
             SchemaVersionError: If schema version is unknown or incompatible
         """
         self._ensure_open()
-        with self._connection() as connection:
+        with self._connection(require_wal=False) as connection:
             with connection:
                 for attempt in range(5):
-                    existing_objects = {
-                        row[0]
-                        for row in connection.execute(
-                            "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
-                        )
-                    }
+                    try:
+                        existing_objects = {
+                            row[0]
+                            for row in connection.execute(
+                                "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
+                            )
+                        }
+                    except sqlite3.OperationalError as exc:
+                        if "locked" in str(exc).lower():
+                            if attempt < 4:
+                                time.sleep(0.01 * (attempt + 1))
+                                continue
+                            raise ConcurrencyConflictError(
+                                "Database lock timeout while initializing schema (locked)"
+                            ) from exc
+                        raise
 
                     has_schema_table = "effect_store_schema" in existing_objects
                     if has_schema_table:
@@ -593,53 +676,82 @@ class DurableEffectStore:
                         ]
 
                         if existing_versions:
-                            # Database exists - verify compatibility and apply migrations if needed
-                            latest_version = max(existing_versions)
-                            min_version = min(existing_versions)
-
-                            # Check for contradictory version sets (version 0 mixed with others, non-sequential, gaps)
-                            if 0 in existing_versions and len(existing_versions) > 1:
+                            distinct_versions = sorted(set(existing_versions))
+                            if len(distinct_versions) != 1:
                                 raise SchemaVersionError(
                                     f"Database schema metadata contains contradictory versions: "
-                                    f"{sorted(set(existing_versions))}"
+                                    f"{distinct_versions}"
                                 )
 
-                            # Check for incompatible legacy version (version 0 alone, or min < 1)
-                            if 0 in existing_versions or min_version < 1:
+                            current_version = distinct_versions[0]
+                            if current_version < 1:
                                 raise SchemaVersionError(
-                                    f"Database schema version {min_version} is older than current "
-                                    f"version {SCHEMA_VERSION} and is not compatible with automatic migration"
+                                    f"Database schema version {current_version} is older than "
+                                    f"current version {SCHEMA_VERSION} and is not compatible with "
+                                    "automatic migration"
                                 )
-
-                            # Check for non-sequential version sets (gaps, duplicates, missing versions)
-                            if sorted(set(existing_versions)) != list(range(min_version, latest_version + 1)):
+                            if current_version > SCHEMA_VERSION:
                                 raise SchemaVersionError(
-                                    f"Database schema metadata contains contradictory versions: "
-                                    f"{sorted(set(existing_versions))}"
-                                )
-
-                            if latest_version > SCHEMA_VERSION:
-                                raise SchemaVersionError(
-                                    f"Database schema version {latest_version} is newer than "
+                                    f"Database schema version {current_version} is newer than "
                                     f"supported version {SCHEMA_VERSION}. Upgrade required."
                                 )
-                            if latest_version < SCHEMA_VERSION:
-                                # Apply missing migrations
-                                for version, sql in self.MIGRATIONS:
-                                    if version <= latest_version:
-                                        # Already applied
+                            if current_version == 1:
+                                self._validate_schema_contract(
+                                    connection,
+                                    expected_tables=_EXPECTED_SCHEMA_TABLES_V1,
+                                    expected_indexes=_EXPECTED_INDEXES_V1,
+                                    expected_version=1,
+                                )
+                                try:
+                                    connection.execute("BEGIN IMMEDIATE")
+                                except sqlite3.OperationalError as exc:
+                                    if "locked" in str(exc).lower() and attempt < 4:
+                                        time.sleep(0.01 * (attempt + 1))
                                         continue
-                                    if version > SCHEMA_VERSION:
-                                        # Skip future migrations
-                                        continue
-                                    # Apply migration
-                                    connection.executescript(sql)
-                                    connection.execute(
-                                        "INSERT OR IGNORE INTO effect_store_schema(version) VALUES (?)",
-                                        (version,),
+                                    if "locked" in str(exc).lower():
+                                        raise ConcurrencyConflictError(
+                                            "Database lock timeout while initializing schema (locked)"
+                                        ) from exc
+                                    raise
+                                refreshed_versions = [
+                                    int(row[0])
+                                    for row in connection.execute(
+                                        "SELECT version FROM effect_store_schema ORDER BY version"
                                     )
+                                ]
+                                if refreshed_versions != [1]:
+                                    connection.rollback()
+                                    if refreshed_versions == [SCHEMA_VERSION]:
+                                        self._validate_schema_contract(connection)
+                                        self._validate_stored_rows(connection)
+                                        connection.commit()
+                                        if self.database_path != ":memory:":
+                                            with closing(
+                                                self._create_connection(
+                                                    self.database_path,
+                                                    require_wal=False,
+                                                )
+                                            ) as wal_connection:
+                                                self._ensure_wal_mode(wal_connection, self.database_path)
+                                        return
+                                    continue
+                                _execute_sql_script(connection, self.MIGRATIONS[1][1])
+                                connection.execute("DELETE FROM effect_store_schema")
+                                connection.execute(
+                                    "INSERT INTO effect_store_schema(version) VALUES (?)",
+                                    (SCHEMA_VERSION,),
+                                )
                             self._validate_schema_contract(connection)
                             self._validate_stored_rows(connection)
+                            connection.commit()
+                            if self.database_path != ":memory:":
+                                with closing(
+                                    self._create_connection(
+                                        self.database_path,
+                                        require_wal=False,
+                                    )
+                                ) as wal_connection:
+                                    self._ensure_wal_mode(wal_connection, self.database_path)
                             return
 
                     if existing_objects:
@@ -651,21 +763,57 @@ class DurableEffectStore:
                         )
 
                     # New database - apply migrations
+                    try:
+                        connection.execute("BEGIN IMMEDIATE")
+                    except sqlite3.OperationalError as exc:
+                        if "locked" in str(exc).lower() and attempt < 4:
+                            time.sleep(0.01 * (attempt + 1))
+                            continue
+                        if "locked" in str(exc).lower():
+                            raise ConcurrencyConflictError(
+                                "Database lock timeout while initializing schema (locked)"
+                            ) from exc
+                        raise
+                    refreshed_objects = {
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
+                        )
+                    }
+                    if "effect_store_schema" in refreshed_objects:
+                        connection.rollback()
+                        continue
                     for version, sql in self.MIGRATIONS:
                         if version > SCHEMA_VERSION:
                             # Skip future migrations
                             continue
-                        connection.executescript(sql)
-                        # Use INSERT OR IGNORE to handle concurrent schema initialization
-                        connection.execute(
-                            "INSERT OR IGNORE INTO effect_store_schema(version) VALUES (?)",
-                            (version,),
-                        )
+                        _execute_sql_script(connection, sql)
+                    connection.execute("DELETE FROM effect_store_schema")
+                    connection.execute(
+                        "INSERT INTO effect_store_schema(version) VALUES (?)",
+                        (SCHEMA_VERSION,),
+                    )
                     self._validate_schema_contract(connection)
                     self._validate_stored_rows(connection)
+                    connection.commit()
+                    if self.database_path != ":memory:":
+                        with closing(
+                            self._create_connection(
+                                self.database_path,
+                                require_wal=False,
+                            )
+                        ) as wal_connection:
+                            self._ensure_wal_mode(wal_connection, self.database_path)
                     return
 
-    def _validate_schema_contract(self, connection: sqlite3.Connection) -> None:
+    def _validate_schema_contract(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        expected_tables: dict[str, tuple[str, ...]] = _EXPECTED_SCHEMA_TABLES,
+        expected_indexes: dict[str, tuple[str, tuple[str, ...]]] = _EXPECTED_INDEXES,
+        expected_version: int = SCHEMA_VERSION,
+    ) -> None:
         """Fail closed if required schema objects are absent or malformed."""
         tables = {
             row[0]
@@ -673,13 +821,17 @@ class DurableEffectStore:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             )
         }
-        missing_tables = set(_EXPECTED_SCHEMA_TABLES) - tables
-        if missing_tables:
+        expected_table_names = set(expected_tables)
+        missing_tables = expected_table_names - tables
+        unexpected_tables = tables - expected_table_names
+        if missing_tables or unexpected_tables:
             raise SchemaVersionError(
-                f"Database schema is incomplete; missing tables: {sorted(missing_tables)}"
+                "Database schema is incomplete; "
+                f"missing tables: {sorted(missing_tables)}; "
+                f"unexpected tables: {sorted(unexpected_tables)}"
             )
 
-        for table_name, expected_columns in _EXPECTED_SCHEMA_TABLES.items():
+        for table_name, expected_columns in expected_tables.items():
             columns = tuple(
                 row[1]
                 for row in connection.execute(f"PRAGMA table_info({table_name})")
@@ -689,7 +841,7 @@ class DurableEffectStore:
                     f"Database schema table {table_name} has incompatible columns: {columns!r}"
                 )
 
-        for index_name, (table_name, expected_columns) in _EXPECTED_INDEXES.items():
+        for index_name, (table_name, expected_columns) in expected_indexes.items():
             index_row = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='index' AND name = ?",
                 (index_name,),
@@ -710,21 +862,12 @@ class DurableEffectStore:
             int(row[0])
             for row in connection.execute("SELECT version FROM effect_store_schema ORDER BY version")
         ]
-        # After migration, version table contains all applied versions [1, 2, ...]
-        # Verify the maximum version equals current SCHEMA_VERSION
         if not version_rows:
             raise SchemaVersionError("Database schema version metadata is empty")
-        if max(version_rows) != SCHEMA_VERSION:
+        if version_rows != [expected_version]:
             raise SchemaVersionError(
-                f"Database schema version {max(version_rows)} does not match "
-                f"current version {SCHEMA_VERSION}"
-            )
-        # Verify all versions are sequential and present
-        expected_versions = list(range(1, SCHEMA_VERSION + 1))
-        if sorted(set(version_rows)) != expected_versions:
-            raise SchemaVersionError(
-                f"Database schema version metadata should contain {expected_versions}, "
-                f"found {sorted(set(version_rows))}"
+                f"Database schema version metadata must contain exactly [{expected_version}], "
+                f"found {version_rows!r}"
             )
 
     def _validate_stored_rows(self, connection: sqlite3.Connection) -> None:
@@ -789,6 +932,171 @@ class DurableEffectStore:
             }:
                 raise StorageIntegrityError(
                     f"Stored reservation {reservation_id} has invalid disposition {disposition!r}"
+                )
+
+        for (
+            stored_domain,
+            gateway_claim_id,
+            request_fingerprint,
+            effect_intent_id,
+            effect_dispatch_id,
+            authority_reservation_id,
+            delegation_grant_id,
+            delegation_grant_fingerprint,
+            requested_capability,
+            idempotency_key,
+            operation_digest,
+            provider_id,
+            adapter_id,
+            owner_identity,
+            state,
+            permit_verifier,
+            claimed_at,
+            expires_at,
+        ) in connection.execute(
+            """
+            SELECT control_domain, gateway_claim_id, request_fingerprint, effect_intent_id,
+                   effect_dispatch_id, authority_reservation_id, delegation_grant_id,
+                   delegation_grant_fingerprint, requested_capability, idempotency_key,
+                   operation_digest, provider_id, adapter_id, owner_identity, state,
+                   permit_verifier, claimed_at, expires_at
+            FROM effect_gateway_claims
+            """
+        ):
+            if state not in {
+                "prepared",
+                "claimed",
+                "handoff_started",
+                "receipt_recorded",
+                "terminal",
+                "indeterminate",
+            }:
+                raise StorageIntegrityError(
+                    f"Stored gateway claim {gateway_claim_id} has invalid state {state!r}"
+                )
+            if permit_verifier is not None and (
+                not isinstance(permit_verifier, str)
+                or len(permit_verifier) != 64
+                or not all(c in "0123456789abcdef" for c in permit_verifier)
+            ):
+                raise StorageIntegrityError(
+                    f"Stored gateway claim {gateway_claim_id} has invalid permit_verifier"
+                )
+            claimed_at_dt = _deserialize_timestamp(claimed_at)
+            expires_at_dt = _deserialize_timestamp(expires_at)
+            if (
+                claimed_at_dt is None
+                or expires_at_dt is None
+                or expires_at_dt <= claimed_at_dt
+            ):
+                raise StorageIntegrityError(
+                    f"Stored gateway claim {gateway_claim_id} has invalid timestamps"
+                )
+            if not all(
+                isinstance(value, str) and value.strip()
+                for value in (
+                    request_fingerprint,
+                    effect_intent_id,
+                    effect_dispatch_id,
+                    authority_reservation_id,
+                    delegation_grant_id,
+                    delegation_grant_fingerprint,
+                    requested_capability,
+                    idempotency_key,
+                    operation_digest,
+                    provider_id,
+                    adapter_id,
+                    owner_identity,
+                )
+            ):
+                raise StorageIntegrityError(
+                    f"Stored gateway claim {gateway_claim_id} has invalid binding fields"
+                )
+            if state == "indeterminate" and permit_verifier is None:
+                raise StorageIntegrityError(
+                    f"Stored gateway claim {gateway_claim_id} is missing permit verifier"
+                )
+
+        for (
+            stored_domain,
+            permit_id,
+            permit_verifier,
+            request_fingerprint,
+            effect_intent_id,
+            effect_dispatch_id,
+            authority_reservation_id,
+            gateway_claim_id,
+            delegation_grant_id,
+            delegation_grant_fingerprint,
+            requested_capability,
+            operation_digest,
+            idempotency_key,
+            provider_id,
+            adapter_id,
+            credential_scope_json,
+            owner_identity,
+            issued_at,
+            expires_at,
+            consumed_at,
+            revoked_at,
+        ) in connection.execute(
+            """
+            SELECT control_domain, permit_id, permit_verifier, request_fingerprint,
+                   effect_intent_id, effect_dispatch_id, authority_reservation_id,
+                   gateway_claim_id, delegation_grant_id, delegation_grant_fingerprint,
+                   requested_capability, operation_digest, idempotency_key, provider_id,
+                   adapter_id, credential_scope_json, owner_identity, issued_at, expires_at,
+                   consumed_at, revoked_at
+            FROM effect_gateway_permits
+            """
+        ):
+            if not isinstance(permit_verifier, str) or len(permit_verifier) != 64:
+                raise StorageIntegrityError(
+                    f"Stored permit {permit_id} has invalid verifier"
+                )
+            if not all(
+                isinstance(value, str) and value.strip()
+                for value in (
+                    request_fingerprint,
+                    effect_intent_id,
+                    effect_dispatch_id,
+                    authority_reservation_id,
+                    gateway_claim_id,
+                    delegation_grant_id,
+                    delegation_grant_fingerprint,
+                    requested_capability,
+                    operation_digest,
+                    idempotency_key,
+                    provider_id,
+                    adapter_id,
+                    credential_scope_json,
+                    owner_identity,
+                )
+            ):
+                raise StorageIntegrityError(
+                    f"Stored permit {permit_id} has invalid binding fields"
+                )
+            issued_at_dt = _deserialize_timestamp(issued_at)
+            expires_at_dt = _deserialize_timestamp(expires_at)
+            if issued_at_dt is None or expires_at_dt is None or expires_at_dt <= issued_at_dt:
+                raise StorageIntegrityError(
+                    f"Stored permit {permit_id} has invalid timestamps"
+                )
+            if consumed_at is not None and revoked_at is not None:
+                raise StorageIntegrityError(
+                    f"Stored permit {permit_id} has contradictory lifecycle state"
+                )
+            try:
+                scopes = json.loads(credential_scope_json)
+            except json.JSONDecodeError as exc:
+                raise StorageIntegrityError(
+                    f"Stored permit {permit_id} has invalid credential scope JSON"
+                ) from exc
+            if not isinstance(scopes, list) or any(
+                not isinstance(scope, str) or not scope.strip() for scope in scopes
+            ):
+                raise StorageIntegrityError(
+                    f"Stored permit {permit_id} has invalid credential scope JSON"
                 )
 
     def commit_intent(self, intent: EffectIntent) -> None:

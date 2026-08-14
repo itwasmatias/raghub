@@ -27,7 +27,7 @@ import hmac
 import json
 import secrets
 import threading
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Mapping
@@ -45,6 +45,7 @@ MAX_PROVIDER_ID_LENGTH = 255
 MAX_ADAPTER_ID_LENGTH = 255
 MAX_OPERATION_DIGEST_LENGTH = 64  # SHA-256 hex
 MIN_PERMIT_ENTROPY_BYTES = 32  # 256 bits
+MIN_PERMIT_TOKEN_LENGTH = 43  # token_urlsafe(32) minimum length
 
 
 class GatewayError(Exception):
@@ -137,7 +138,9 @@ def _generate_permit_token() -> str:
 
 def _permit_verifier(permit_token: str) -> str:
     """Derive storage verifier from permit token (one-way hash)."""
-    if not isinstance(permit_token, str) or len(permit_token) < 32:
+    if not isinstance(permit_token, str) or len(permit_token) < MIN_PERMIT_TOKEN_LENGTH:
+        raise ValueError("permit_token must be high-entropy string")
+    if len(set(permit_token)) < 2:
         raise ValueError("permit_token must be high-entropy string")
     return hashlib.sha256(permit_token.encode("utf-8")).hexdigest()
 
@@ -164,7 +167,7 @@ class GatewayEffectRequest:
     # Identity and scope
     control_domain: str
     principal_identity: str
-    agent_identity: str | None
+    agent_identity: str
     mission_id: str
     task_id: str
     attempt_id: str
@@ -224,12 +227,11 @@ class GatewayEffectRequest:
                 _require_text(getattr(self, name), name, max_length=255),
             )
 
-        if self.agent_identity is not None:
-            object.__setattr__(
-                self,
-                "agent_identity",
-                _require_text(self.agent_identity, "agent_identity", max_length=255),
-            )
+        object.__setattr__(
+            self,
+            "agent_identity",
+            _require_text(self.agent_identity, "agent_identity", max_length=255),
+        )
 
         object.__setattr__(
             self,
@@ -286,7 +288,9 @@ class GatewayEffectRequest:
         validated_scopes = []
         for scope in self.credential_scope:
             validated_scopes.append(_require_text(scope, "credential scope", max_length=255))
-        object.__setattr__(self, "credential_scope", tuple(sorted(set(validated_scopes))))
+        if len(validated_scopes) != len(set(validated_scopes)):
+            raise ValueError("credential_scope must not contain duplicates")
+        object.__setattr__(self, "credential_scope", tuple(sorted(validated_scopes)))
 
     def request_fingerprint(self) -> str:
         """Compute stable fingerprint of gateway request."""
@@ -325,10 +329,15 @@ class GatewayDispatchPermit:
     """
 
     permit_id: str
-    permit_token: str  # High-entropy secret, single-use
     control_domain: str
+    request_fingerprint: str
     effect_intent_id: str
+    effect_dispatch_id: str
+    authority_reservation_id: str
     gateway_claim_id: str
+    delegation_grant_id: str
+    delegation_grant_fingerprint: str
+    requested_capability: str
     operation_digest: str
     idempotency_key: str
     provider_id: str
@@ -337,14 +346,21 @@ class GatewayDispatchPermit:
     owner_identity: str
     issued_at: datetime
     expires_at: datetime
+    permit_token: InitVar[str]
+    permit_verifier: str = field(init=False, repr=False)
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, permit_token: str) -> None:
         """Validate permit invariants."""
         for name in (
             "permit_id",
-            "permit_token",
+            "request_fingerprint",
             "effect_intent_id",
+            "effect_dispatch_id",
+            "authority_reservation_id",
             "gateway_claim_id",
+            "delegation_grant_id",
+            "delegation_grant_fingerprint",
+            "requested_capability",
             "idempotency_key",
             "provider_id",
             "adapter_id",
@@ -362,8 +378,7 @@ class GatewayDispatchPermit:
             validate_domain_id(self.control_domain, "control_domain"),
         )
 
-        if len(self.permit_token) < 32:
-            raise ValueError("permit_token must have sufficient entropy")
+        object.__setattr__(self, "permit_verifier", _permit_verifier(permit_token))
 
         if (
             not isinstance(self.operation_digest, str)
@@ -376,6 +391,12 @@ class GatewayDispatchPermit:
             if isinstance(self.credential_scope, str):
                 raise TypeError("credential_scope must be tuple of strings")
             object.__setattr__(self, "credential_scope", tuple(self.credential_scope))
+        validated_scopes = []
+        for scope in self.credential_scope:
+            validated_scopes.append(_require_text(scope, "credential scope", max_length=255))
+        if len(validated_scopes) != len(set(validated_scopes)):
+            raise ValueError("credential_scope must not contain duplicates")
+        object.__setattr__(self, "credential_scope", tuple(sorted(validated_scopes)))
 
         object.__setattr__(
             self, "issued_at", _normalize_timestamp(self.issued_at, "issued_at")
@@ -389,7 +410,7 @@ class GatewayDispatchPermit:
 
     def verifier(self) -> str:
         """Derive one-way verifier for storage (NOT the permit itself)."""
-        return _permit_verifier(self.permit_token)
+        return self.permit_verifier
 
     def __repr__(self) -> str:
         """Safe representation excluding secret token."""
@@ -397,7 +418,7 @@ class GatewayDispatchPermit:
             f"GatewayDispatchPermit(permit_id={self.permit_id!r}, "
             f"control_domain={self.control_domain!r}, "
             f"gateway_claim_id={self.gateway_claim_id!r}, "
-            f"permit_token=<REDACTED>)"
+            f"permit_verifier={self.permit_verifier!r})"
         )
 
 
@@ -433,6 +454,13 @@ class GatewayEffectResult:
         """Validate result invariants."""
         if not isinstance(self.task_succeeded, bool):
             raise TypeError("task_succeeded must be bool")
+        if self.task_error is not None:
+            if not isinstance(self.task_error, str) or not self.task_error.strip():
+                raise ValueError("task_error must be a non-empty string when present")
+        if self.task_succeeded and self.task_error is not None:
+            raise GatewayStateError("successful task cannot carry task_error")
+        if not self.task_succeeded and self.task_error is None:
+            raise GatewayStateError("failed task must carry task_error")
         if not isinstance(self.dispatch_attempted, bool):
             raise TypeError("dispatch_attempted must be bool")
         if not isinstance(self.handoff_started, bool):
@@ -450,6 +478,24 @@ class GatewayEffectResult:
         ):
             raise TypeError("authority_disposition must be AuthorityDisposition or None")
 
+        for name in ("gateway_claim_id", "effect_intent_id", "effect_dispatch_id"):
+            object.__setattr__(
+                self,
+                name,
+                _require_text(getattr(self, name), name, max_length=255),
+            )
+
+        if self.reconciliation_obligation_id is not None:
+            object.__setattr__(
+                self,
+                "reconciliation_obligation_id",
+                _require_text(
+                    self.reconciliation_obligation_id,
+                    "reconciliation_obligation_id",
+                    max_length=255,
+                ),
+            )
+
         # Invariant: handoff_started implies dispatch_attempted
         if self.handoff_started and not self.dispatch_attempted:
             raise GatewayStateError("handoff_started requires dispatch_attempted")
@@ -460,24 +506,47 @@ class GatewayEffectResult:
 
         # Effect status semantics
         if self.effect_status is EffectState.NOTHING_LANDED:
-            # nothing_landed requires either no handoff OR verified provider rejection
             if self.handoff_started and not self.receipt_recorded:
                 raise GatewayStateError(
                     "nothing_landed after handoff requires receipt evidence"
                 )
+            if self.authority_disposition not in (None, AuthorityDisposition.RELEASED):
+                raise GatewayStateError("nothing_landed releases authority when terminal")
+            if self.reconciliation_required:
+                raise GatewayStateError("nothing_landed cannot require reconciliation")
+            if self.reconciliation_obligation_id is not None:
+                raise GatewayStateError("nothing_landed cannot carry reconciliation_obligation_id")
 
         if self.effect_status is EffectState.SOMETHING_LANDED:
-            # something_landed requires receipt
+            if not self.handoff_started:
+                raise GatewayStateError("something_landed requires handoff_started")
             if not self.receipt_recorded:
                 raise GatewayStateError("something_landed requires receipt_recorded")
+            if self.authority_disposition not in (
+                AuthorityDisposition.CONSUMED,
+                AuthorityDisposition.ASSUMED_CONSUMED_UNRECONCILED,
+            ):
+                raise GatewayStateError("something_landed requires consumed authority when terminal")
+            if self.reconciliation_required:
+                raise GatewayStateError("something_landed cannot require reconciliation")
+            if self.reconciliation_obligation_id is not None:
+                raise GatewayStateError("something_landed cannot carry reconciliation_obligation_id")
 
         if self.effect_status is EffectState.INDETERMINATE:
-            # indeterminate requires handoff without conclusive receipt
             if not self.handoff_started:
                 raise GatewayStateError("indeterminate requires handoff_started")
-            # Reconciliation must be required for indeterminate
+            if self.receipt_recorded:
+                raise GatewayStateError("indeterminate cannot record a verified receipt")
             if not self.reconciliation_required:
                 raise GatewayStateError("indeterminate requires reconciliation_required")
+            if self.reconciliation_obligation_id is None:
+                raise GatewayStateError("indeterminate requires reconciliation_obligation_id")
+            if self.authority_disposition is not AuthorityDisposition.RESERVED:
+                raise GatewayStateError("indeterminate retains RESERVED authority")
+
+        if self.effect_status is not EffectState.INDETERMINATE:
+            if self.authority_disposition is AuthorityDisposition.RESERVED and self.reconciliation_required:
+                raise GatewayStateError("resolved results cannot retain reserved authority")
 
 
 __all__ = [
