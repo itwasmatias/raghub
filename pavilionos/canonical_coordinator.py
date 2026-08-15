@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from federation.canonical_digest import operation_digest
 from federation.delegation_grant import AuthoritativeDelegationGrant, DelegationGrantStatus
 from federation.delegation_grant_registry import DelegationGrantRegistry
 from federation.durable_effect_store import DurableEffectStore
@@ -96,18 +97,6 @@ class CoordinatorResult:
     gateway_claim_id: str
     receipt_id: str | None
     detail: str
-
-
-def _operation_digest(operation_params: dict[str, Any]) -> str:
-    """Compute stable digest of operation parameters."""
-    canonical = json.dumps(
-        operation_params,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()
 
 
 class CanonicalPavilionCoordinator:
@@ -199,7 +188,7 @@ class CanonicalPavilionCoordinator:
             "action": request.action,
             "provider_id": PAVILION_PROVIDER_ID,
         }
-        operation_digest = _operation_digest(operation_params)
+        op_digest = operation_digest(operation_params)
 
         intent = EffectIntent(
             effect_intent_id=effect_intent_id,
@@ -207,7 +196,7 @@ class CanonicalPavilionCoordinator:
             mission_id=request.mission_id,
             task_id=request.task_id,
             attempt_id=request.attempt_id,
-            operation_digest=operation_digest,
+            operation_digest=op_digest,
             idempotency_key=idempotency_key,
             provider_scope=PAVILION_PROVIDER_ID,
             authority_reservation_id=authority_reservation_id,
@@ -250,7 +239,7 @@ class CanonicalPavilionCoordinator:
             idempotency_key=idempotency_key,
             provider_adapter=PAVILION_ADAPTER_ID,
             capability_profile_version="v0.1",
-            transport_digest=operation_digest,
+            transport_digest=op_digest,
             posture="attempting",
             provider_operation_id=None,
             evidence_reference=f"pavilion-dispatch-{effect_dispatch_id}",
@@ -278,7 +267,7 @@ class CanonicalPavilionCoordinator:
             effect_intent_id=effect_intent_id,
             effect_dispatch_id=effect_dispatch_id,
             authority_reservation_id=authority_reservation_id,
-            operation_digest=operation_digest,
+            operation_digest=op_digest,
             idempotency_key=idempotency_key,
             provider_id=PAVILION_PROVIDER_ID,
             adapter_id=PAVILION_ADAPTER_ID,
@@ -320,7 +309,7 @@ class CanonicalPavilionCoordinator:
             delegation_grant_id=request.delegation_grant_id,
             delegation_grant_fingerprint=grant.grant_fingerprint,
             requested_capability=request.requested_capability,
-            operation_digest=operation_digest,
+            operation_digest=op_digest,
             idempotency_key=idempotency_key,
             credential_scope=PAVILION_CREDENTIAL_SCOPE,
             permit_token=permit_token,

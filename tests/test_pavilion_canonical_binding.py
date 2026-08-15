@@ -530,7 +530,9 @@ def test_no_permit_denies_execution(
         permit_token="COMPLETELY-BOGUS-TOKEN-12345",
     )
 
-    with pytest.raises(AdapterDenied, match="Gateway.*permit"):
+    # Adapter now denies during pre-consumption verification (claim not found in durable store)
+    # This is correct - bogus envelope is rejected before any permit consumption attempt
+    with pytest.raises(AdapterDenied, match="Gateway claim.*not found"):
         adapter.dispatch(bogus_envelope)
 
     # Provider NEVER called
@@ -1754,6 +1756,610 @@ def test_adapter_id_substitution_denied(
     # Adapter MUST deny - adapter_id doesn't match
     with pytest.raises(AdapterDenied, match="adapter_id"):
         adapter.dispatch(attack_envelope)
-    
+
     # Provider NEVER called
+    assert fake_provider.execution_count.get("restart-firefox", 0) == 0
+
+
+# =============================================================================
+# PRE-CONSUMPTION VERIFICATION REGRESSION TESTS
+# =============================================================================
+
+
+def test_forged_envelope_denied_before_permit_consumption(
+    active_delegation_grant: AuthoritativeDelegationGrant,
+    fake_provider: FakeProviderRegistry,
+    gateway: GovernedEffectGateway,
+    durable_store: DurableEffectStore,
+    adapter: CanonicalPavilionAdapter,
+):
+    """REGRESSION TEST: Forged envelope denied BEFORE permit consumption.
+
+    This test proves the correction for the MEDIUM security finding where
+    forged envelopes could burn legitimate permits before being rejected.
+
+    Attack scenario:
+    - Create legitimate authorization for action A
+    - Capture the valid permit token
+    - Create FORGED envelope for action B with REAL permit for A
+    - Adapter MUST verify envelope against durable claim BEFORE consuming permit
+    - Adapter MUST deny WITHOUT consuming the permit
+    - Verify claim remains in PERMIT_ISSUED state (NOT HANDOFF_STARTED)
+    - Verify permit remains unconsumed and usable
+
+    Proves:
+    - Forged envelope rejected BEFORE permit consumption
+    - Valid permit remains usable after forgery rejection
+    - Authority is NOT burned by forged envelopes
+    - Provider execution count == 0
+    """
+    import hashlib
+    import json
+    from federation.effect_gateway import GatewayEffectRequest, EffectConsequence
+    from federation.effect_safety import ProviderReconcilability, EffectIntent, AuthorityReservation, AuthorityDisposition, EffectDispatch
+    from pavilionos.canonical_coordinator import PAVILION_PROVIDER_ID, PAVILION_ADAPTER_ID
+
+    now = datetime.now(timezone.utc)
+
+    # Step 1: Create REAL authorization for "restart-firefox"
+    real_action = "restart-firefox"
+    real_operation_params = {"action": real_action, "provider_id": PAVILION_PROVIDER_ID}
+    real_digest = hashlib.sha256(
+        json.dumps(real_operation_params, ensure_ascii=False, sort_keys=True,
+                  separators=(",", ":"), allow_nan=False).encode("utf-8")
+    ).hexdigest()
+
+    effect_intent_id = f"preconsumption-test-intent-{secrets.token_urlsafe(16)}"
+    effect_dispatch_id = f"preconsumption-test-dispatch-{secrets.token_urlsafe(16)}"
+    authority_reservation_id = f"preconsumption-test-reservation-{secrets.token_urlsafe(16)}"
+    idempotency_key = f"preconsumption:test:{secrets.token_urlsafe(16)}"
+
+    # Create real canonical structures for "restart-firefox"
+    intent = EffectIntent(
+        effect_intent_id=effect_intent_id,
+        decision_id=f"preconsumption-decision-{secrets.token_urlsafe(8)}",
+        mission_id=active_delegation_grant.mission_id,
+        task_id=f"preconsumption-task-{secrets.token_urlsafe(8)}",
+        attempt_id=f"preconsumption-attempt-{secrets.token_urlsafe(8)}",
+        operation_digest=real_digest,
+        idempotency_key=idempotency_key,
+        provider_scope=PAVILION_PROVIDER_ID,
+        authority_reservation_id=authority_reservation_id,
+        compensation_strategy=None,
+        evidence_reference=f"preconsumption-evidence-{effect_intent_id}",
+        state="committed_not_dispatched",
+        created_at=now,
+        control_domain=PAVILION_CONTROL_DOMAIN,
+    )
+    durable_store.commit_intent(intent)
+
+    reservation = AuthorityReservation(
+        reservation_id=authority_reservation_id,
+        effect_intent_id=effect_intent_id,
+        capability_type="local_process_restart",
+        amount=1.0,
+        disposition=AuthorityDisposition.RESERVED,
+        reserved_at=now,
+        disposition_at=None,
+        disposition_evidence=None,
+        control_domain=PAVILION_CONTROL_DOMAIN,
+    )
+    durable_store.store_reservation(reservation)
+
+    dispatch = EffectDispatch(
+        dispatch_id=effect_dispatch_id,
+        effect_intent_id=effect_intent_id,
+        attempt_id=intent.attempt_id,
+        idempotency_key=idempotency_key,
+        provider_adapter=PAVILION_ADAPTER_ID,
+        capability_profile_version="v0.1",
+        transport_digest=real_digest,
+        posture="attempting",
+        provider_operation_id=None,
+        evidence_reference=f"preconsumption-dispatch-{effect_dispatch_id}",
+        dispatched_at=now,
+        control_domain=PAVILION_CONTROL_DOMAIN,
+    )
+    durable_store.commit_dispatch(dispatch)
+
+    # Create gateway request and issue REAL permit
+    gateway_request = GatewayEffectRequest(
+        control_domain=PAVILION_CONTROL_DOMAIN,
+        principal_identity="test-principal",
+        agent_identity="test-agent",
+        mission_id=active_delegation_grant.mission_id,
+        task_id=intent.task_id,
+        attempt_id=intent.attempt_id,
+        delegation_grant_id=active_delegation_grant.grant_id,
+        delegation_grant_fingerprint=active_delegation_grant.grant_fingerprint,
+        requested_capability="local_process_restart",
+        effect_intent_id=effect_intent_id,
+        effect_dispatch_id=effect_dispatch_id,
+        authority_reservation_id=authority_reservation_id,
+        operation_digest=real_digest,
+        idempotency_key=idempotency_key,
+        provider_id=PAVILION_PROVIDER_ID,
+        adapter_id=PAVILION_ADAPTER_ID,
+        effect_consequence=EffectConsequence.PRIVILEGED_EXECUTION,
+        provider_reconcilability=ProviderReconcilability.NONE,
+        request_timestamp=now,
+        request_expiry=now + timedelta(minutes=5),
+        credential_scope=PAVILION_CREDENTIAL_SCOPE,
+    )
+
+    gateway_claim_id, _ = gateway.claim_dispatch(gateway_request, owner_identity="test-principal")
+    _, real_permit_token = gateway.issue_dispatch_permit(gateway_request, gateway_claim_id)
+
+    # Verify claim is in CLAIMED state before forgery attempt (after permit issued)
+    claim_before = durable_store.get_gateway_claim(gateway_claim_id, PAVILION_CONTROL_DOMAIN)
+    assert claim_before["state"] == "claimed"  # State after permit issued
+    assert claim_before["handoff_started_at"] is None  # NOT yet in HANDOFF_STARTED
+
+    # Step 2: FORGE self-consistent envelope for DIFFERENT operation
+    # Attack: use valid permit for "restart-firefox" to try executing "reload-desktop"
+    forged_action = "reload-desktop"
+    forged_operation_params = {"action": forged_action, "provider_id": PAVILION_PROVIDER_ID}
+    forged_digest = hashlib.sha256(
+        json.dumps(forged_operation_params, ensure_ascii=False, sort_keys=True,
+                  separators=(",", ":"), allow_nan=False).encode("utf-8")
+    ).hexdigest()
+
+    # Create FORGED envelope that is internally self-consistent
+    # BUT uses the REAL permit meant for "restart-firefox"
+    forged_envelope = PavilionAuthorizationEnvelope(
+        control_domain=PAVILION_CONTROL_DOMAIN,
+        provider_id=PAVILION_PROVIDER_ID,
+        adapter_id=PAVILION_ADAPTER_ID,
+        action=forged_action,  # FORGED: different action
+        effect_intent_id=effect_intent_id,  # Same (reusing real IDs)
+        effect_dispatch_id=effect_dispatch_id,  # Same
+        authority_reservation_id=authority_reservation_id,  # Same
+        gateway_claim_id=gateway_claim_id,  # Same (real claim ID)
+        delegation_grant_id=active_delegation_grant.grant_id,
+        delegation_grant_fingerprint=active_delegation_grant.grant_fingerprint,
+        requested_capability="local_process_restart",
+        operation_digest=forged_digest,  # FORGED: self-consistent with forged action
+        idempotency_key=idempotency_key,
+        credential_scope=PAVILION_CREDENTIAL_SCOPE,
+        permit_token=real_permit_token,  # REAL permit (but authorized different operation)
+    )
+
+    # Step 3: Attempt to dispatch forged envelope
+    # Adapter MUST reject BEFORE consuming permit
+    with pytest.raises(AdapterDenied, match="operation_digest"):
+        adapter.dispatch(forged_envelope)
+
+    # Step 4: CRITICAL VERIFICATION - Permit was NOT consumed
+    # Claim MUST still be in CLAIMED state (NOT HANDOFF_STARTED)
+    claim_after_forgery = durable_store.get_gateway_claim(gateway_claim_id, PAVILION_CONTROL_DOMAIN)
+    assert claim_after_forgery["state"] == "claimed"  # STILL in claimed (permit NOT consumed)
+    assert claim_after_forgery["handoff_started_at"] is None  # NEVER reached HANDOFF_STARTED
+
+    # This proves the permit was NOT consumed - authority NOT burned
+    # The permit remains usable for legitimate envelope
+
+    # Provider NEVER called
+    assert fake_provider.execution_count.get("reload-desktop", 0) == 0
+    assert fake_provider.execution_count.get("restart-firefox", 0) == 0
+
+
+def test_legitimate_execution_after_forged_envelope_rejection(
+    active_delegation_grant: AuthoritativeDelegationGrant,
+    fake_provider: FakeProviderRegistry,
+    gateway: GovernedEffectGateway,
+    durable_store: DurableEffectStore,
+    adapter: CanonicalPavilionAdapter,
+):
+    """REGRESSION TEST: Legitimate envelope can reuse permit after forgery rejection.
+
+    This test proves that after a forged envelope is rejected BEFORE permit
+    consumption, the SAME permit can successfully authorize the legitimate envelope.
+
+    Sequence:
+    1. Issue permit for action A (restart-firefox)
+    2. Attempt forged envelope for action B (reload-desktop) with SAME permit
+    3. Verify forged envelope denied WITHOUT consuming permit
+    4. Submit LEGITIMATE envelope for action A with SAME permit
+    5. Verify exactly ONE provider execution (the legitimate one)
+    6. Verify permit consumed ONLY during legitimate dispatch
+
+    Proves:
+    - Forged envelope rejection does not consume authority
+    - Same permit authorizes legitimate envelope after forgery attempt
+    - Provider executes exactly once (for legitimate envelope only)
+    - Claim reaches HANDOFF_STARTED only after legitimate consumption
+    """
+    import hashlib
+    import json
+    from federation.effect_gateway import GatewayEffectRequest, EffectConsequence
+    from federation.effect_safety import ProviderReconcilability, EffectIntent, AuthorityReservation, AuthorityDisposition, EffectDispatch
+    from pavilionos.canonical_coordinator import PAVILION_PROVIDER_ID, PAVILION_ADAPTER_ID
+
+    now = datetime.now(timezone.utc)
+
+    # Step 1: Create legitimate authorization for "restart-firefox"
+    legit_action = "restart-firefox"
+    legit_operation_params = {"action": legit_action, "provider_id": PAVILION_PROVIDER_ID}
+    legit_digest = hashlib.sha256(
+        json.dumps(legit_operation_params, ensure_ascii=False, sort_keys=True,
+                  separators=(",", ":"), allow_nan=False).encode("utf-8")
+    ).hexdigest()
+
+    effect_intent_id = f"reuse-test-intent-{secrets.token_urlsafe(16)}"
+    effect_dispatch_id = f"reuse-test-dispatch-{secrets.token_urlsafe(16)}"
+    authority_reservation_id = f"reuse-test-reservation-{secrets.token_urlsafe(16)}"
+    idempotency_key = f"reuse:test:{secrets.token_urlsafe(16)}"
+
+    # Create canonical structures
+    intent = EffectIntent(
+        effect_intent_id=effect_intent_id,
+        decision_id=f"reuse-decision-{secrets.token_urlsafe(8)}",
+        mission_id=active_delegation_grant.mission_id,
+        task_id=f"reuse-task-{secrets.token_urlsafe(8)}",
+        attempt_id=f"reuse-attempt-{secrets.token_urlsafe(8)}",
+        operation_digest=legit_digest,
+        idempotency_key=idempotency_key,
+        provider_scope=PAVILION_PROVIDER_ID,
+        authority_reservation_id=authority_reservation_id,
+        compensation_strategy=None,
+        evidence_reference=f"reuse-evidence-{effect_intent_id}",
+        state="committed_not_dispatched",
+        created_at=now,
+        control_domain=PAVILION_CONTROL_DOMAIN,
+    )
+    durable_store.commit_intent(intent)
+
+    reservation = AuthorityReservation(
+        reservation_id=authority_reservation_id,
+        effect_intent_id=effect_intent_id,
+        capability_type="local_process_restart",
+        amount=1.0,
+        disposition=AuthorityDisposition.RESERVED,
+        reserved_at=now,
+        disposition_at=None,
+        disposition_evidence=None,
+        control_domain=PAVILION_CONTROL_DOMAIN,
+    )
+    durable_store.store_reservation(reservation)
+
+    dispatch = EffectDispatch(
+        dispatch_id=effect_dispatch_id,
+        effect_intent_id=effect_intent_id,
+        attempt_id=intent.attempt_id,
+        idempotency_key=idempotency_key,
+        provider_adapter=PAVILION_ADAPTER_ID,
+        capability_profile_version="v0.1",
+        transport_digest=legit_digest,
+        posture="attempting",
+        provider_operation_id=None,
+        evidence_reference=f"reuse-dispatch-{effect_dispatch_id}",
+        dispatched_at=now,
+        control_domain=PAVILION_CONTROL_DOMAIN,
+    )
+    durable_store.commit_dispatch(dispatch)
+
+    # Issue permit
+    gateway_request = GatewayEffectRequest(
+        control_domain=PAVILION_CONTROL_DOMAIN,
+        principal_identity="test-principal",
+        agent_identity="test-agent",
+        mission_id=active_delegation_grant.mission_id,
+        task_id=intent.task_id,
+        attempt_id=intent.attempt_id,
+        delegation_grant_id=active_delegation_grant.grant_id,
+        delegation_grant_fingerprint=active_delegation_grant.grant_fingerprint,
+        requested_capability="local_process_restart",
+        effect_intent_id=effect_intent_id,
+        effect_dispatch_id=effect_dispatch_id,
+        authority_reservation_id=authority_reservation_id,
+        operation_digest=legit_digest,
+        idempotency_key=idempotency_key,
+        provider_id=PAVILION_PROVIDER_ID,
+        adapter_id=PAVILION_ADAPTER_ID,
+        effect_consequence=EffectConsequence.PRIVILEGED_EXECUTION,
+        provider_reconcilability=ProviderReconcilability.NONE,
+        request_timestamp=now,
+        request_expiry=now + timedelta(minutes=5),
+        credential_scope=PAVILION_CREDENTIAL_SCOPE,
+    )
+
+    gateway_claim_id, _ = gateway.claim_dispatch(gateway_request, owner_identity="test-principal")
+    _, permit_token = gateway.issue_dispatch_permit(gateway_request, gateway_claim_id)
+
+    # Verify claim in CLAIMED state (after permit issued)
+    claim_before = durable_store.get_gateway_claim(gateway_claim_id, PAVILION_CONTROL_DOMAIN)
+    assert claim_before["state"] == "claimed"
+    assert claim_before["handoff_started_at"] is None
+
+    # Step 2: Attempt FORGED envelope for different action
+    forged_action = "reload-desktop"
+    forged_operation_params = {"action": forged_action, "provider_id": PAVILION_PROVIDER_ID}
+    forged_digest = hashlib.sha256(
+        json.dumps(forged_operation_params, ensure_ascii=False, sort_keys=True,
+                  separators=(",", ":"), allow_nan=False).encode("utf-8")
+    ).hexdigest()
+
+    forged_envelope = PavilionAuthorizationEnvelope(
+        control_domain=PAVILION_CONTROL_DOMAIN,
+        provider_id=PAVILION_PROVIDER_ID,
+        adapter_id=PAVILION_ADAPTER_ID,
+        action=forged_action,  # FORGED action
+        effect_intent_id=effect_intent_id,
+        effect_dispatch_id=effect_dispatch_id,
+        authority_reservation_id=authority_reservation_id,
+        gateway_claim_id=gateway_claim_id,
+        delegation_grant_id=active_delegation_grant.grant_id,
+        delegation_grant_fingerprint=active_delegation_grant.grant_fingerprint,
+        requested_capability="local_process_restart",
+        operation_digest=forged_digest,  # FORGED digest
+        idempotency_key=idempotency_key,
+        credential_scope=PAVILION_CREDENTIAL_SCOPE,
+        permit_token=permit_token,  # SAME permit
+    )
+
+    # Step 3: Verify forged envelope denied WITHOUT consuming permit
+    with pytest.raises(AdapterDenied, match="operation_digest"):
+        adapter.dispatch(forged_envelope)
+
+    # Verify claim STILL in claimed (permit NOT consumed)
+    claim_after_forgery = durable_store.get_gateway_claim(gateway_claim_id, PAVILION_CONTROL_DOMAIN)
+    assert claim_after_forgery["state"] == "claimed"
+    assert claim_after_forgery["handoff_started_at"] is None  # NOT consumed
+
+    # Step 4: Now dispatch LEGITIMATE envelope with SAME permit
+    legitimate_envelope = PavilionAuthorizationEnvelope(
+        control_domain=PAVILION_CONTROL_DOMAIN,
+        provider_id=PAVILION_PROVIDER_ID,
+        adapter_id=PAVILION_ADAPTER_ID,
+        action=legit_action,  # CORRECT action matching claim
+        effect_intent_id=effect_intent_id,
+        effect_dispatch_id=effect_dispatch_id,
+        authority_reservation_id=authority_reservation_id,
+        gateway_claim_id=gateway_claim_id,
+        delegation_grant_id=active_delegation_grant.grant_id,
+        delegation_grant_fingerprint=active_delegation_grant.grant_fingerprint,
+        requested_capability="local_process_restart",
+        operation_digest=legit_digest,  # CORRECT digest matching claim
+        idempotency_key=idempotency_key,
+        credential_scope=PAVILION_CREDENTIAL_SCOPE,
+        permit_token=permit_token,  # SAME permit token
+    )
+
+    # Dispatch legitimate envelope - should succeed
+    receipt = adapter.dispatch(legitimate_envelope)
+
+    # Step 5: Verify exactly ONE provider execution (legitimate only)
+    assert fake_provider.execution_count.get("restart-firefox") == 1
+    assert fake_provider.execution_count.get("reload-desktop", 0) == 0
+
+    # Step 6: Verify permit was consumed ONLY during legitimate dispatch
+    claim_after_legit = durable_store.get_gateway_claim(gateway_claim_id, PAVILION_CONTROL_DOMAIN)
+    assert claim_after_legit["handoff_started_at"] is not None  # NOW consumed
+    # Note: Adapter dispatch reaches HANDOFF_STARTED, but receipt recording happens in coordinator
+    assert claim_after_legit["state"] == "handoff_started"
+
+    # Verify receipt
+    assert receipt.task_succeeded is True
+    assert receipt.gateway_claim_id == gateway_claim_id
+
+
+def test_real_provider_substitution_attack_with_valid_permit_denied(
+    active_delegation_grant: AuthoritativeDelegationGrant,
+    fake_provider: FakeProviderRegistry,
+    gateway: GovernedEffectGateway,
+    durable_store: DurableEffectStore,
+    adapter: CanonicalPavilionAdapter,
+):
+    """SECURITY TEST: Real provider substitution attack with valid permit DENIED.
+
+    This is the REAL provider substitution attack test, unlike the earlier
+    test_provider_substitution_with_valid_permit_denied which only verified
+    the claim stores provider_id.
+
+    Attack scenario:
+    - Create legitimate authorization for provider_id A
+    - Capture the valid permit token
+    - Create forged envelope with DIFFERENT provider_id B
+    - Keep same action but change provider (operation_digest will differ)
+    - Adapter MUST verify provider_id against claim and deny BEFORE consumption
+
+    Proves:
+    - Valid permit for provider A cannot authorize provider B
+    - Provider_id substitution detected and rejected
+    - Provider execution count == 0
+    """
+    import hashlib
+    import json
+    from federation.effect_gateway import GatewayEffectRequest, EffectConsequence
+    from federation.effect_safety import ProviderReconcilability, EffectIntent, AuthorityReservation, AuthorityDisposition, EffectDispatch
+    from pavilionos.canonical_coordinator import PAVILION_PROVIDER_ID, PAVILION_ADAPTER_ID
+
+    now = datetime.now(timezone.utc)
+
+    # Step 1: Create REAL authorization for correct provider_id
+    real_action = "restart-firefox"
+    real_provider_id = PAVILION_PROVIDER_ID  # "pavilionos.local-provider-v0.1"
+    real_operation_params = {"action": real_action, "provider_id": real_provider_id}
+    real_digest = hashlib.sha256(
+        json.dumps(real_operation_params, ensure_ascii=False, sort_keys=True,
+                  separators=(",", ":"), allow_nan=False).encode("utf-8")
+    ).hexdigest()
+
+    effect_intent_id = f"provider-attack-intent-{secrets.token_urlsafe(16)}"
+    effect_dispatch_id = f"provider-attack-dispatch-{secrets.token_urlsafe(16)}"
+    authority_reservation_id = f"provider-attack-reservation-{secrets.token_urlsafe(16)}"
+    idempotency_key = f"provider:attack:{secrets.token_urlsafe(16)}"
+
+    # Create canonical structures with REAL provider_id
+    intent = EffectIntent(
+        effect_intent_id=effect_intent_id,
+        decision_id=f"provider-attack-decision-{secrets.token_urlsafe(8)}",
+        mission_id=active_delegation_grant.mission_id,
+        task_id=f"provider-attack-task-{secrets.token_urlsafe(8)}",
+        attempt_id=f"provider-attack-attempt-{secrets.token_urlsafe(8)}",
+        operation_digest=real_digest,
+        idempotency_key=idempotency_key,
+        provider_scope=real_provider_id,
+        authority_reservation_id=authority_reservation_id,
+        compensation_strategy=None,
+        evidence_reference=f"provider-attack-evidence-{effect_intent_id}",
+        state="committed_not_dispatched",
+        created_at=now,
+        control_domain=PAVILION_CONTROL_DOMAIN,
+    )
+    durable_store.commit_intent(intent)
+
+    reservation = AuthorityReservation(
+        reservation_id=authority_reservation_id,
+        effect_intent_id=effect_intent_id,
+        capability_type="local_process_restart",
+        amount=1.0,
+        disposition=AuthorityDisposition.RESERVED,
+        reserved_at=now,
+        disposition_at=None,
+        disposition_evidence=None,
+        control_domain=PAVILION_CONTROL_DOMAIN,
+    )
+    durable_store.store_reservation(reservation)
+
+    dispatch = EffectDispatch(
+        dispatch_id=effect_dispatch_id,
+        effect_intent_id=effect_intent_id,
+        attempt_id=intent.attempt_id,
+        idempotency_key=idempotency_key,
+        provider_adapter=PAVILION_ADAPTER_ID,
+        capability_profile_version="v0.1",
+        transport_digest=real_digest,
+        posture="attempting",
+        provider_operation_id=None,
+        evidence_reference=f"provider-attack-dispatch-{effect_dispatch_id}",
+        dispatched_at=now,
+        control_domain=PAVILION_CONTROL_DOMAIN,
+    )
+    durable_store.commit_dispatch(dispatch)
+
+    # Issue permit for REAL provider_id
+    gateway_request = GatewayEffectRequest(
+        control_domain=PAVILION_CONTROL_DOMAIN,
+        principal_identity="test-principal",
+        agent_identity="test-agent",
+        mission_id=active_delegation_grant.mission_id,
+        task_id=intent.task_id,
+        attempt_id=intent.attempt_id,
+        delegation_grant_id=active_delegation_grant.grant_id,
+        delegation_grant_fingerprint=active_delegation_grant.grant_fingerprint,
+        requested_capability="local_process_restart",
+        effect_intent_id=effect_intent_id,
+        effect_dispatch_id=effect_dispatch_id,
+        authority_reservation_id=authority_reservation_id,
+        operation_digest=real_digest,
+        idempotency_key=idempotency_key,
+        provider_id=real_provider_id,  # REAL provider
+        adapter_id=PAVILION_ADAPTER_ID,
+        effect_consequence=EffectConsequence.PRIVILEGED_EXECUTION,
+        provider_reconcilability=ProviderReconcilability.NONE,
+        request_timestamp=now,
+        request_expiry=now + timedelta(minutes=5),
+        credential_scope=PAVILION_CREDENTIAL_SCOPE,
+    )
+
+    gateway_claim_id, _ = gateway.claim_dispatch(gateway_request, owner_identity="test-principal")
+    _, permit_token = gateway.issue_dispatch_permit(gateway_request, gateway_claim_id)
+
+    # Step 2: FORGE envelope with DIFFERENT provider_id
+    forged_provider_id = "FORGED-PROVIDER-ID-v999"
+    forged_operation_params = {"action": real_action, "provider_id": forged_provider_id}
+    forged_digest = hashlib.sha256(
+        json.dumps(forged_operation_params, ensure_ascii=False, sort_keys=True,
+                  separators=(",", ":"), allow_nan=False).encode("utf-8")
+    ).hexdigest()
+
+    forged_envelope = PavilionAuthorizationEnvelope(
+        control_domain=PAVILION_CONTROL_DOMAIN,
+        provider_id=forged_provider_id,  # FORGED provider_id
+        adapter_id=PAVILION_ADAPTER_ID,
+        action=real_action,  # SAME action
+        effect_intent_id=effect_intent_id,
+        effect_dispatch_id=effect_dispatch_id,
+        authority_reservation_id=authority_reservation_id,
+        gateway_claim_id=gateway_claim_id,
+        delegation_grant_id=active_delegation_grant.grant_id,
+        delegation_grant_fingerprint=active_delegation_grant.grant_fingerprint,
+        requested_capability="local_process_restart",
+        operation_digest=forged_digest,  # Digest for FORGED provider
+        idempotency_key=idempotency_key,
+        credential_scope=PAVILION_CREDENTIAL_SCOPE,
+        permit_token=permit_token,  # VALID permit (but for different provider)
+    )
+
+    # Adapter MUST deny - operation_digest mismatch (different provider_id causes different digest)
+    # The operation_digest check catches this first since forged_digest != real_digest
+    # This proves provider_id substitution is caught during pre-consumption verification
+    with pytest.raises(AdapterDenied, match="operation_digest"):
+        adapter.dispatch(forged_envelope)
+
+    # Verify claim STILL in claimed (NOT consumed by forged envelope)
+    claim_after = durable_store.get_gateway_claim(gateway_claim_id, PAVILION_CONTROL_DOMAIN)
+    assert claim_after["state"] == "claimed"
+    assert claim_after["handoff_started_at"] is None  # Permit NOT consumed
+
+    # Provider NEVER called
+    assert fake_provider.execution_count.get("restart-firefox", 0) == 0
+
+
+def test_direct_adapter_construction_without_durable_store_fails_closed(
+    gateway: GovernedEffectGateway,
+    fake_provider: FakeProviderRegistry,
+):
+    """SECURITY TEST: Adapter construction without durable_store fails closed.
+
+    This test verifies that if an adapter is incorrectly constructed without
+    a durable_store reference (implementation error), it fails closed by
+    raising an error when attempting pre-consumption verification.
+
+    Attack scenario:
+    - Attacker constructs adapter with None/missing durable_store
+    - Attacker attempts to dispatch with valid-looking envelope
+    - Adapter MUST fail closed (raise error) during pre-consumption check
+    - Provider NEVER executes
+
+    Proves:
+    - Missing durable_store causes fail-closed behavior
+    - Pre-consumption verification enforces durable_store requirement
+    - System cannot be degraded to skip durable claim verification
+    """
+    # Construct adapter with None durable_store (implementation error/attack)
+    broken_adapter = CanonicalPavilionAdapter(
+        gateway=gateway,
+        durable_store=None,  # MISSING/None durable_store
+        provider_registry=fake_provider.get_registry(),
+    )
+
+    # Create a valid-looking envelope
+    fake_envelope = PavilionAuthorizationEnvelope(
+        control_domain=PAVILION_CONTROL_DOMAIN,
+        provider_id=PAVILION_PROVIDER_ID,
+        adapter_id=PAVILION_ADAPTER_ID,
+        action="restart-firefox",
+        effect_intent_id=f"failclosed-intent-{secrets.token_urlsafe(8)}",
+        effect_dispatch_id=f"failclosed-dispatch-{secrets.token_urlsafe(8)}",
+        authority_reservation_id=f"failclosed-reservation-{secrets.token_urlsafe(8)}",
+        gateway_claim_id=f"failclosed-claim-{secrets.token_urlsafe(8)}",
+        delegation_grant_id=f"failclosed-grant-{secrets.token_urlsafe(8)}",
+        delegation_grant_fingerprint=secrets.token_hex(32),
+        requested_capability="local_process_restart",
+        operation_digest=compute_operation_digest("restart-firefox"),
+        idempotency_key=f"failclosed:key:{secrets.token_urlsafe(8)}",
+        credential_scope=PAVILION_CREDENTIAL_SCOPE,
+        permit_token=f"fake-permit-{secrets.token_urlsafe(32)}",
+    )
+
+    # Adapter dispatch MUST fail when attempting pre-consumption verification
+    # The code at canonical_adapter.py:162-169 calls:
+    #   self.durable_store.get_gateway_claim(...)
+    # With durable_store=None, this will raise AttributeError
+    with pytest.raises((AttributeError, AdapterDenied, Exception)):
+        broken_adapter.dispatch(fake_envelope)
+
+    # Provider NEVER called - fail-closed behavior
     assert fake_provider.execution_count.get("restart-firefox", 0) == 0

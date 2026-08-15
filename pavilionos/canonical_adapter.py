@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from federation.canonical_digest import operation_digest
 from federation.effect_gateway import (
     DenialReason,
     GatewayDenied,
@@ -133,18 +134,10 @@ class CanonicalPavilionAdapter:
         # Step 2: Validate envelope internal consistency
         # Verify that envelope.operation_digest actually corresponds to
         # envelope.action and envelope.provider_id (prevents action substitution)
-        import hashlib
-        import json
-
-        expected_operation_digest = hashlib.sha256(
-            json.dumps(
-                {"action": envelope.action, "provider_id": envelope.provider_id},
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
-        ).hexdigest()
+        expected_operation_digest = operation_digest({
+            "action": envelope.action,
+            "provider_id": envelope.provider_id,
+        })
 
         if envelope.operation_digest != expected_operation_digest:
             raise AdapterDenied(
@@ -160,7 +153,53 @@ class CanonicalPavilionAdapter:
                 f"Action {envelope.action!r} has no registered provider"
             )
 
-        # Step 4: CRITICAL - Consume canonical permit before provider execution
+        # Step 4: CRITICAL - Pre-consumption durable claim verification
+        # Fetch authoritative durable claim BEFORE consuming authority.
+        # This prevents forged envelopes from burning legitimate permits.
+        # Enforces: THE EFFECT THAT ESCAPES TO THE PROVIDER MUST BE EXACTLY
+        # THE EFFECT AUTHORIZED BY THE DURABLE CLAIM AND CONSUMED PERMIT.
+        try:
+            pre_consumption_claim = self.durable_store.get_gateway_claim(
+                gateway_claim_id=envelope.gateway_claim_id,
+                control_domain=envelope.control_domain,
+            )
+        except Exception as exc:
+            raise AdapterDenied(
+                f"Failed to retrieve gateway claim for pre-consumption verification: {exc}"
+            ) from exc
+
+        if pre_consumption_claim is None:
+            raise AdapterDenied(
+                f"Gateway claim {envelope.gateway_claim_id!r} not found in durable store"
+            )
+
+        # Verify envelope operation binding against authoritative durable claim
+        # These checks occur BEFORE permit consumption to prevent authority burning
+
+        # Verify operation_digest binding (covers action + provider binding)
+        if pre_consumption_claim["operation_digest"] != envelope.operation_digest:
+            raise AdapterDenied(
+                f"Envelope operation_digest {envelope.operation_digest!r} does not match "
+                f"authorized claim operation_digest {pre_consumption_claim['operation_digest']!r}"
+            )
+
+        # Verify provider_id binding (explicit check for defense-in-depth)
+        if pre_consumption_claim["provider_id"] != envelope.provider_id:
+            raise AdapterDenied(
+                f"Envelope provider_id {envelope.provider_id!r} does not match "
+                f"authorized claim provider_id {pre_consumption_claim['provider_id']!r}"
+            )
+
+        # Verify adapter_id binding (prevent adapter substitution)
+        if pre_consumption_claim["adapter_id"] != envelope.adapter_id:
+            raise AdapterDenied(
+                f"Envelope adapter_id {envelope.adapter_id!r} does not match "
+                f"authorized claim adapter_id {pre_consumption_claim['adapter_id']!r}"
+            )
+
+        # Step 5: CRITICAL - Consume canonical permit and establish HANDOFF_STARTED
+        # Pre-consumption verification passed - envelope matches durable claim.
+        # Now atomically consume permit and transition to HANDOFF_STARTED.
         try:
             authorized_claim_id = self.gateway.verify_and_consume_permit(
                 permit_token=envelope.permit_token,
@@ -177,51 +216,12 @@ class CanonicalPavilionAdapter:
                 f"Gateway permit consumption failed: {exc}"
             ) from exc
 
-        # Step 5: Verify returned claim matches envelope
+        # Step 6: Verify returned claim ID matches envelope
         if authorized_claim_id != envelope.gateway_claim_id:
             # This should never happen unless there's a serious bug or attack
             raise AdapterError(
                 f"Gateway authorized claim {authorized_claim_id!r} "
                 f"does not match envelope claim {envelope.gateway_claim_id!r}"
-            )
-
-        # Step 6: CRITICAL - Verify envelope operation binding against durable claim
-        # This enforces: THE EFFECT THAT ESCAPES TO THE PROVIDER MUST BE EXACTLY
-        # THE EFFECT AUTHORIZED BY THE DURABLE CLAIM AND CONSUMED PERMIT.
-        try:
-            authorized_claim = self.durable_store.get_gateway_claim(
-                gateway_claim_id=authorized_claim_id,
-                control_domain=envelope.control_domain,
-            )
-        except Exception as exc:
-            raise AdapterError(
-                f"Failed to retrieve authorized claim for verification: {exc}"
-            ) from exc
-
-        if authorized_claim is None:
-            raise AdapterError(
-                f"Authorized claim {authorized_claim_id!r} not found after permit consumption"
-            )
-
-        # Verify operation_digest binding (covers action + provider binding)
-        if authorized_claim["operation_digest"] != envelope.operation_digest:
-            raise AdapterDenied(
-                f"Envelope operation_digest {envelope.operation_digest!r} does not match "
-                f"authorized claim operation_digest {authorized_claim['operation_digest']!r}"
-            )
-
-        # Verify provider_id binding (explicit check for defense-in-depth)
-        if authorized_claim["provider_id"] != envelope.provider_id:
-            raise AdapterDenied(
-                f"Envelope provider_id {envelope.provider_id!r} does not match "
-                f"authorized claim provider_id {authorized_claim['provider_id']!r}"
-            )
-
-        # Verify adapter_id binding (prevent adapter substitution)
-        if authorized_claim["adapter_id"] != envelope.adapter_id:
-            raise AdapterDenied(
-                f"Envelope adapter_id {envelope.adapter_id!r} does not match "
-                f"authorized claim adapter_id {authorized_claim['adapter_id']!r}"
             )
 
         # Step 7: Generate receipt ID
@@ -230,10 +230,11 @@ class CanonicalPavilionAdapter:
 
         # At this point:
         # - Envelope internal consistency verified
+        # - Envelope operation binding verified against durable claim (BEFORE consumption)
         # - Canonical permit has been successfully consumed
         # - Gateway claim is durably in HANDOFF_STARTED state
-        # - Envelope operation binding verified against durable claim
         # - Provider execution is now authorized
+        # - Forged envelopes are rejected WITHOUT burning legitimate authority
 
         # Step 8: Execute provider
         try:
