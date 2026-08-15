@@ -392,6 +392,7 @@ class CanonicalPavilionCoordinator:
             # Create adapter instance for testing
             adapter = CanonicalPavilionAdapter(
                 gateway=self.gateway,
+                durable_store=self.store,
                 provider_registry=provider_registry,
                 adapter_id=PAVILION_ADAPTER_ID,
             )
