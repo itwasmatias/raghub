@@ -101,6 +101,9 @@ class CanonicalPavilionAdapter:
         self.gateway = gateway
         self.provider_registry = provider_registry
         self.adapter_id = adapter_id
+        # Private fault injection hooks (test-only, default disabled)
+        self._test_crash_before_permit_consumption: Callable[[], None] | None = None
+        self._test_crash_after_permit_consumption: Callable[[], None] | None = None
 
     def dispatch(
         self,
@@ -135,6 +138,10 @@ class CanonicalPavilionAdapter:
             )
 
         # Step 3: CRITICAL - Consume canonical permit before provider execution
+        # Fault injection: crash BEFORE permit consumption (test-only)
+        if self._test_crash_before_permit_consumption is not None:
+            self._test_crash_before_permit_consumption()
+
         try:
             authorized_claim_id = self.gateway.verify_and_consume_permit(
                 permit_token=envelope.permit_token,
@@ -167,6 +174,10 @@ class CanonicalPavilionAdapter:
         # - Canonical permit has been successfully consumed
         # - Gateway claim is durably in HANDOFF_STARTED state
         # - Provider execution is now authorized
+
+        # Fault injection: crash AFTER permit consumption but BEFORE provider (test-only)
+        if self._test_crash_after_permit_consumption is not None:
+            self._test_crash_after_permit_consumption()
 
         # Step 6: Execute provider
         try:

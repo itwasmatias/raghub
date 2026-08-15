@@ -563,6 +563,8 @@ class DurableEffectStore:
         # Private test-only hooks for fault injection (TESTING ONLY)
         self._test_crash_before_permit_issuance_commit: Any = None
         self._test_crash_before_consumption_commit: Any = None
+        self._test_crash_before_consumption_start: Any = None
+        self._test_crash_after_consumption_commit: Any = None
 
     def _create_connection(self, database_path: str, *, require_wal: bool = True) -> sqlite3.Connection:
         """Create a new database connection with proper configuration.
@@ -2714,6 +2716,10 @@ class DurableEffectStore:
         domain = validate_domain_id(control_domain, "control_domain")
         self._ensure_open()
 
+        # Test-only: allow crash simulation BEFORE consumption
+        if self._test_crash_before_consumption_start is not None:
+            self._test_crash_before_consumption_start()
+
         try:
             with self._connection() as connection:
                 # Use BEGIN IMMEDIATE for writer ownership
@@ -2790,6 +2796,11 @@ class DurableEffectStore:
                         self._test_crash_before_consumption_commit()
 
                     connection.commit()
+
+                    # Test-only: allow crash simulation AFTER consumption commit
+                    if self._test_crash_after_consumption_commit is not None:
+                        self._test_crash_after_consumption_commit()
+
                     return gateway_claim_id
 
                 except Exception:

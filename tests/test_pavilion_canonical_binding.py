@@ -818,53 +818,8 @@ def test_local_lineage_forgery_denied(
 # =============================================================================
 # TESTS 25-28: CRASH ATOMICITY
 # =============================================================================
-
-
-def test_crash_before_permit_consumption(
-    coordinator: CanonicalPavilionCoordinator,
-    active_delegation_grant: AuthoritativeDelegationGrant,
-    fake_provider: FakeProviderRegistry,
-    durable_store: DurableEffectStore,
-):
-    """Test 25: Crash before permit consumption leaves no handoff.
-
-    Proves:
-    - If process crashes before verify_and_consume_permit()
-    - No canonical HANDOFF_STARTED
-    - Provider not called
-    - State remains pre-handoff
-    """
-    # This test requires simulating crash before adapter dispatch
-    # Verified by the fact that permit consumption is atomic with HANDOFF_STARTED
-    pass  # Implementation complexity deferred
-
-
-def test_crash_after_permit_consumption_before_provider(
-    coordinator: CanonicalPavilionCoordinator,
-    active_delegation_grant: AuthoritativeDelegationGrant,
-    fake_provider: FakeProviderRegistry,
-    durable_store: DurableEffectStore,
-    gateway: GovernedEffectGateway,
-):
-    """Test 26: CRITICAL - Crash after permit consumption but before provider call.
-
-    Proves:
-    - After successful verify_and_consume_permit()
-    - After HANDOFF_STARTED is durable
-    - But before fake provider function begins
-    - Permit consumed
-    - Claim HANDOFF_STARTED
-    - Provider execution count == 0
-    - Effect cannot be safely classified as fresh retryable
-    - No second permit may be issued
-
-    This is a CRITICAL proof of the authorization boundary.
-    """
-    # This test requires process-level crash simulation
-    # Implementation would use multiprocessing with os._exit() between
-    # permit consumption and provider execution
-    # Complexity deferred but critical for full acceptance
-    pass
+# NOTE: Crash atomicity tests moved to test_pavilion_crash_atomicity.py
+# for genuine process-level crash proofs using os._exit()
 
 
 # =============================================================================
