@@ -403,6 +403,15 @@ class AuthoritativeDelegationGrant:
     def is_active(self, now: datetime | None = None) -> bool:
         return self.current_status(now) is DelegationGrantStatus.ACTIVE
 
+    @property
+    def authority_scope(self) -> tuple[str, ...]:
+        """Backward compatibility property for legacy code.
+
+        Returns capabilities as a tuple for code expecting authority_scope.
+        This maintains compatibility with code at 721f756.
+        """
+        return tuple(sorted(self.capabilities.capabilities))
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "grant_id": self.grant_id,

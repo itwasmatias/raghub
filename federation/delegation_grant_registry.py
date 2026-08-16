@@ -198,6 +198,84 @@ def _resource_scope_non_widening(child: DelegationScope, parent: DelegationScope
     return child.is_subset_of(parent)
 
 
+def _resolve_parent_deterministic(
+    domain_id: str,
+    parent_grant_id: str,
+    parent_grant_fingerprint: str,
+    child_mission_id: str | None,
+    current_by_key: dict[tuple[str, str | None, str], AuthoritativeDelegationGrant],
+) -> tuple[tuple[str, str | None, str], AuthoritativeDelegationGrant]:
+    """Resolve parent grant deterministically using exact lineage evidence.
+
+    Resolution order:
+    1. Try exact match with child mission_id
+    2. Try unbound parent (mission_id=None)
+    3. If neither found, search all to detect ambiguity and fail closed
+
+    Returns:
+        (parent_key, parent_grant) tuple
+
+    Raises:
+        DelegationGrantNotFoundError: Parent not found
+        DelegationGrantCorruptionError: Parent fingerprint mismatch or ambiguous lineage
+    """
+    # Try exact match with child mission_id
+    parent_key = (domain_id, child_mission_id, parent_grant_id)
+    parent = current_by_key.get(parent_key)
+
+    if parent is not None:
+        if parent.grant_fingerprint != parent_grant_fingerprint:
+            raise DelegationGrantCorruptionError(
+                f"parent grant {parent_grant_id!r} fingerprint mismatch: "
+                f"expected {parent_grant_fingerprint!r}, got {parent.grant_fingerprint!r}"
+            )
+        return (parent_key, parent)
+
+    # Try unbound parent (mission_id=None) if child is mission-bound
+    if child_mission_id is not None:
+        parent_key = (domain_id, None, parent_grant_id)
+        parent = current_by_key.get(parent_key)
+
+        if parent is not None:
+            if parent.grant_fingerprint != parent_grant_fingerprint:
+                raise DelegationGrantCorruptionError(
+                    f"parent grant {parent_grant_id!r} fingerprint mismatch: "
+                    f"expected {parent_grant_fingerprint!r}, got {parent.grant_fingerprint!r}"
+                )
+            return (parent_key, parent)
+
+    # Neither direct match found - search all to detect ambiguity
+    # Collect ALL matching parents by domain + grant_id
+    candidates: list[tuple[tuple[str, str | None, str], AuthoritativeDelegationGrant]] = []
+    for key, potential_parent in current_by_key.items():
+        if key[0] == domain_id and key[2] == parent_grant_id:
+            candidates.append((key, potential_parent))
+
+    if not candidates:
+        raise DelegationGrantNotFoundError(
+            f"parent grant {parent_grant_id!r} not found in domain {domain_id!r}"
+        )
+
+    # If multiple candidates exist, this is ambiguous - fail closed
+    if len(candidates) > 1:
+        mission_ids = sorted({str(key[1]) for key, _ in candidates})
+        raise DelegationGrantCorruptionError(
+            f"parent grant {parent_grant_id!r} in domain {domain_id!r} is ambiguous: "
+            f"found {len(candidates)} candidates with mission_ids {mission_ids}"
+        )
+
+    # Single candidate found
+    parent_key, parent = candidates[0]
+
+    if parent.grant_fingerprint != parent_grant_fingerprint:
+        raise DelegationGrantCorruptionError(
+            f"parent grant {parent_grant_id!r} fingerprint mismatch: "
+            f"expected {parent_grant_fingerprint!r}, got {parent.grant_fingerprint!r}"
+        )
+
+    return (parent_key, parent)
+
+
 class DelegationGrantRegistry:
     """Append-only authenticated registry of mission-scoped delegation grants."""
 
@@ -395,31 +473,18 @@ class DelegationGrantRegistry:
                 DelegationGrantStatus.ACTIVE,
                 DelegationGrantStatus.PENDING,
             } and grant.parent_grant_id is not None:
-                # Try to find parent with same mission_id first
-                parent_key = (grant.domain_id, grant.mission_id, grant.parent_grant_id)
-                parent = current_by_key.get(parent_key)
-
-                # If not found and child has a mission_id, try unbound parent (mission_id=None)
-                if parent is None and grant.mission_id is not None:
-                    parent_key = (grant.domain_id, None, grant.parent_grant_id)
-                    parent = current_by_key.get(parent_key)
-
-                # If still not found, search across all missions (for mission binding validation)
-                if parent is None:
-                    for key, potential_parent in current_by_key.items():
-                        if (key[0] == grant.domain_id and
-                            key[2] == grant.parent_grant_id):
-                            parent = potential_parent
-                            parent_key = key
-                            break
-
-                if parent is None:
+                # Resolve parent deterministically
+                try:
+                    parent_key, parent = _resolve_parent_deterministic(
+                        grant.domain_id,
+                        grant.parent_grant_id,
+                        grant.parent_grant_fingerprint,
+                        grant.mission_id,
+                        current_by_key,
+                    )
+                except DelegationGrantNotFoundError:
                     raise DelegationGrantCorruptionError(
                         "delegation grant history references a missing parent grant",
-                    )
-                if parent.grant_fingerprint != grant.parent_grant_fingerprint:
-                    raise DelegationGrantCorruptionError(
-                        "delegation grant parent fingerprint is invalid",
                     )
                 if grant.grantor_identity != parent.grantee_identity:
                     raise DelegationGrantCorruptionError(
@@ -492,6 +557,8 @@ class DelegationGrantRegistry:
     ) -> AuthoritativeDelegationGrant:
         parent_grant_fingerprint = None
         if grant.parent_grant_id is not None:
+            # Compute expected fingerprint for parent lookup
+            # We don't have it yet, so we need to find parent first then validate
             # Try to find parent with same mission_id first
             parent_key = (grant.domain_id, grant.mission_id, grant.parent_grant_id)
             parent = current_by_key.get(parent_key)
@@ -501,19 +568,26 @@ class DelegationGrantRegistry:
                 parent_key = (grant.domain_id, None, grant.parent_grant_id)
                 parent = current_by_key.get(parent_key)
 
-            # If still not found, search across all missions (for any mission_id mismatch detection)
+            # If still not found, collect all matching to detect ambiguity
             if parent is None:
+                candidates: list[AuthoritativeDelegationGrant] = []
                 for key, potential_parent in current_by_key.items():
-                    if (key[0] == grant.domain_id and
-                        key[2] == grant.parent_grant_id):
-                        parent = potential_parent
-                        parent_key = key
-                        break
+                    if key[0] == grant.domain_id and key[2] == grant.parent_grant_id:
+                        candidates.append(potential_parent)
 
-            if parent is None:
-                raise DelegationGrantNotFoundError(
-                    f"parent grant {grant.parent_grant_id!r} is not registered",
-                )
+                if not candidates:
+                    raise DelegationGrantNotFoundError(
+                        f"parent grant {grant.parent_grant_id!r} is not registered",
+                    )
+
+                if len(candidates) > 1:
+                    raise DelegationGrantNotFoundError(
+                        f"parent grant {grant.parent_grant_id!r} is ambiguous: "
+                        f"found {len(candidates)} candidates across missions"
+                    )
+
+                parent = candidates[0]
+
             parent_grant_fingerprint = parent.grant_fingerprint
 
         return AuthoritativeDelegationGrant(
@@ -634,28 +708,14 @@ class DelegationGrantRegistry:
                         cache={},
                     )
                     if grant.parent_grant_id is not None:
-                        # Try to find parent with same mission_id first
-                        parent_key = (grant.domain_id, grant.mission_id, grant.parent_grant_id)
-                        parent = current_by_key.get(parent_key)
-
-                        # If not found and child has a mission_id, try unbound parent (mission_id=None)
-                        if parent is None and grant.mission_id is not None:
-                            parent_key = (grant.domain_id, None, grant.parent_grant_id)
-                            parent = current_by_key.get(parent_key)
-
-                        # If still not found, search across all missions (for mission binding validation)
-                        if parent is None:
-                            for key, potential_parent in current_by_key.items():
-                                if (key[0] == grant.domain_id and
-                                    key[2] == grant.parent_grant_id):
-                                    parent = potential_parent
-                                    parent_key = key
-                                    break
-
-                        if parent is None:
-                            raise DelegationGrantNotFoundError(
-                                f"parent grant {grant.parent_grant_id!r} is not registered",
-                            )
+                        # Resolve parent deterministically
+                        parent_key, parent = _resolve_parent_deterministic(
+                            grant.domain_id,
+                            grant.parent_grant_id,
+                            candidate.parent_grant_fingerprint,
+                            grant.mission_id,
+                            current_by_key,
+                        )
                         parent_status = self._effective_status(
                             parent_key,
                             current_by_key,
@@ -1054,31 +1114,18 @@ class DelegationGrantRegistry:
                         )
 
             if grant.parent_grant_id is not None:
-                # Try to find parent with same mission_id first
-                parent_key = (grant.domain_id, grant.mission_id, grant.parent_grant_id)
-                parent = current_by_key.get(parent_key)
-
-                # If not found and child has a mission_id, try unbound parent (mission_id=None)
-                if parent is None and grant.mission_id is not None:
-                    parent_key = (grant.domain_id, None, grant.parent_grant_id)
-                    parent = current_by_key.get(parent_key)
-
-                # If still not found, search across all missions (for mission binding validation)
-                if parent is None:
-                    for key, potential_parent in current_by_key.items():
-                        if (key[0] == grant.domain_id and
-                            key[2] == grant.parent_grant_id):
-                            parent = potential_parent
-                            parent_key = key
-                            break
-
-                if parent is None:
+                # Resolve parent deterministically
+                try:
+                    parent_key, parent = _resolve_parent_deterministic(
+                        grant.domain_id,
+                        grant.parent_grant_id,
+                        grant.parent_grant_fingerprint,
+                        grant.mission_id,
+                        current_by_key,
+                    )
+                except DelegationGrantNotFoundError:
                     raise DelegationGrantCorruptionError(
                         "delegation grant history references a missing parent grant",
-                    )
-                if parent.grant_fingerprint != grant.parent_grant_fingerprint:
-                    raise DelegationGrantCorruptionError(
-                        "delegation grant parent fingerprint is invalid",
                     )
                 if grant.grantor_identity != parent.grantee_identity:
                     raise DelegationGrantCorruptionError(

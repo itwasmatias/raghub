@@ -360,7 +360,7 @@ def test_local_refusal_remains_authoritative_after_authorization(tmp_path):
     [
         ("domain-b", "agent-a", {"domain_id": "domain-a"}, "not found|not registered"),
         ("domain-b", "agent-b", {"domain_id": "domain-a"}, "not registered"),
-        ("domain-a", "agent-a", {"domain_id": "domain-a", "authority_scope": ("display_on",)}, "capabilities"),
+        ("domain-a", "agent-a", {"domain_id": "domain-a", "authority_scope": ("display_on",)}, "scope does not cover"),
     ],
 )
 def test_cross_domain_or_scope_mismatch_fails_closed(
