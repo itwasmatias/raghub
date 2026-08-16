@@ -13,11 +13,13 @@ All mission identity and state is ControlDomain-scoped.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from types import MappingProxyType
 from typing import Any
 
 
@@ -83,10 +85,13 @@ def _normalize_timestamp(value: datetime, field_name: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _validate_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
-    """Validate metadata is bounded and serializable."""
+def _validate_metadata(metadata: dict[str, Any] | None) -> MappingProxyType:
+    """Validate metadata is bounded, serializable, and return immutable proxy.
+
+    Deep copies input and wraps in MappingProxyType to prevent mutation after construction.
+    """
     if metadata is None:
-        return {}
+        return MappingProxyType({})
     if not isinstance(metadata, dict):
         raise TypeError("metadata must be a dictionary")
 
@@ -99,7 +104,8 @@ def _validate_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
     if len(serialized) > MAX_METADATA_SIZE:
         raise ValueError(f"metadata exceeds {MAX_METADATA_SIZE} bytes")
 
-    return metadata
+    # Deep copy to prevent caller mutation, then wrap in immutable proxy
+    return MappingProxyType(copy.deepcopy(metadata))
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,7 +127,7 @@ class MissionSpecification:
     success_criteria: str | None = None
     constraints: str | None = None
     deadline: datetime | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: MappingProxyType = field(default_factory=lambda: MappingProxyType({}))
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def __post_init__(self) -> None:
@@ -212,7 +218,7 @@ class MissionSpecification:
             "success_criteria": self.success_criteria,
             "constraints": self.constraints,
             "deadline": self.deadline.isoformat() if self.deadline else None,
-            "metadata": self.metadata,
+            "metadata": dict(self.metadata),  # Convert MappingProxyType to dict for serialization
             "created_at": self.created_at.isoformat(),
         }
         return hashlib.sha256(_canonical_json(payload)).hexdigest()
@@ -274,7 +280,7 @@ class MissionCheckpoint:
     control_domain: str
     sequence: int
     mission_state: MissionLifecycle
-    progress_data: dict[str, Any] = field(default_factory=dict)
+    progress_data: MappingProxyType = field(default_factory=lambda: MappingProxyType({}))
     reason: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 

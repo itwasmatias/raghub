@@ -19,6 +19,7 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from federation.control_domain import validate_domain_id
@@ -77,10 +78,16 @@ def _deserialize_timestamp(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value)
 
 
-def _serialize_json(data: dict[str, Any] | None) -> str | None:
-    """Serialize dictionary to JSON."""
+def _serialize_json(data: dict[str, Any] | MappingProxyType | None) -> str | None:
+    """Serialize dictionary to JSON.
+
+    Accepts dict or MappingProxyType (converts proxy to dict for serialization).
+    """
     if data is None or data == {}:
         return None
+    # Convert MappingProxyType to dict for JSON serialization
+    if isinstance(data, MappingProxyType):
+        data = dict(data)
     return json.dumps(data, ensure_ascii=False, sort_keys=True)
 
 
@@ -103,18 +110,26 @@ def _is_terminal_state(state: MissionLifecycle) -> bool:
 def _validate_transition(from_state: MissionLifecycle, to_state: MissionLifecycle) -> None:
     """Validate state machine transition rules.
 
-    Terminal states are irreversible.
+    Terminal states are irreversible and immutable.
     Specific transitions are explicitly allowed or denied.
     """
-    if from_state == to_state:
-        # Idempotent transitions are allowed
-        return
-
-    # Terminal states cannot transition
+    # Terminal states cannot transition - not even to themselves
+    # This preserves terminal evidence immutability
     if _is_terminal_state(from_state):
-        raise IllegalMissionTransitionError(
-            f"Cannot transition from terminal state {from_state.value} to {to_state.value}"
-        )
+        if from_state == to_state:
+            # Reject same-state terminal attempts to preserve immutability
+            raise IllegalMissionTransitionError(
+                f"Terminal state {from_state.value} is immutable - cannot re-transition to preserve evidence integrity"
+            )
+        else:
+            # Reject terminal resurrection
+            raise IllegalMissionTransitionError(
+                f"Cannot transition from terminal state {from_state.value} to {to_state.value}"
+            )
+
+    # Non-terminal idempotent transitions are allowed
+    if from_state == to_state:
+        return
 
     # Define allowed transitions
     allowed_transitions = {
@@ -502,8 +517,12 @@ class MissionRuntimeStore:
 
         conn = self._connect()
         try:
-            with conn:
-                # Get current state with lock
+            # Execute BEGIN IMMEDIATE explicitly to acquire write lock
+            # This blocks other writers until we commit, preventing revision races
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Get current state and revision for validation
+                # This is an early check - the atomic check is UPDATE rowcount
                 cursor = conn.execute(
                     """
                     SELECT current_state, revision
@@ -521,7 +540,8 @@ class MissionRuntimeStore:
                 current_state = MissionLifecycle(row[0])
                 current_revision = row[1]
 
-                # Optimistic concurrency check
+                # Early optimistic concurrency check
+                # The UPDATE rowcount is the final atomic authority
                 if current_revision != expected_revision:
                     raise MissionRevisionConflictError(
                         f"Revision conflict: expected {expected_revision}, current {current_revision}"
@@ -553,16 +573,23 @@ class MissionRuntimeStore:
                     updates.append("terminal_reason = ?")
                     params.extend([_serialize_timestamp(now), reason])
 
-                params.extend([control_domain, mission_id])
+                params.extend([control_domain, mission_id, expected_revision])
 
-                conn.execute(
+                cursor = conn.execute(
                     f"""
                     UPDATE mission_state
                     SET {', '.join(updates)}
-                    WHERE control_domain = ? AND mission_id = ?
+                    WHERE control_domain = ? AND mission_id = ? AND revision = ?
                     """,
                     params,
                 )
+
+                # Atomic optimistic concurrency check: exactly one row must be updated
+                if cursor.rowcount != 1:
+                    # Revision changed between SELECT and UPDATE - another writer won
+                    raise MissionRevisionConflictError(
+                        f"Revision conflict: expected {expected_revision}, but state was modified by concurrent writer"
+                    )
 
                 # Record transition
                 transition_id = f"transition-{secrets.token_urlsafe(16)}"
@@ -586,7 +613,11 @@ class MissionRuntimeStore:
                     ),
                 )
 
+                conn.commit()
                 return new_revision
+            except Exception:
+                conn.rollback()
+                raise
         finally:
             if self._memory_connection is None:
                 conn.close()
@@ -594,12 +625,16 @@ class MissionRuntimeStore:
     def create_checkpoint(self, checkpoint: MissionCheckpoint) -> None:
         """Create a new mission checkpoint.
 
+        Checkpoints can only be created for non-terminal missions, and the
+        checkpoint's claimed mission_state must match the actual current state.
+
         Args:
             checkpoint: Mission checkpoint
 
         Raises:
             MissionNotFoundError: If mission does not exist
             MissionRuntimeStoreError: If checkpoint sequence already exists
+            IllegalMissionTransitionError: If mission is terminal or state mismatch
         """
         if not isinstance(checkpoint, MissionCheckpoint):
             raise TypeError("checkpoint must be a MissionCheckpoint")
@@ -607,17 +642,33 @@ class MissionRuntimeStore:
         conn = self._connect()
         try:
             with conn:
-                # Verify mission exists and domain matches
+                # Verify mission exists and get current state
                 cursor = conn.execute(
                     """
-                    SELECT 1 FROM missions
+                    SELECT current_state FROM mission_state
                     WHERE control_domain = ? AND mission_id = ?
                     """,
                     (checkpoint.control_domain, checkpoint.mission_id),
                 )
-                if cursor.fetchone() is None:
+                row = cursor.fetchone()
+                if row is None:
                     raise MissionNotFoundError(
                         f"Mission {checkpoint.mission_id} not found in domain {checkpoint.control_domain}"
+                    )
+
+                current_state = MissionLifecycle(row[0])
+
+                # Reject checkpoints for terminal missions
+                if _is_terminal_state(current_state):
+                    raise IllegalMissionTransitionError(
+                        f"Cannot create checkpoint for terminal mission in state {current_state.value}"
+                    )
+
+                # Verify checkpoint state matches current state
+                if checkpoint.mission_state != current_state:
+                    raise IllegalMissionTransitionError(
+                        f"Checkpoint mission_state {checkpoint.mission_state.value} does not match "
+                        f"current mission state {current_state.value}"
                     )
 
                 # Insert checkpoint
@@ -743,6 +794,10 @@ class MissionRuntimeStore:
     def add_effect_reference(self, effect_ref: EffectReference, mission_id: str, control_domain: str) -> None:
         """Add an effect reference to a mission.
 
+        Effect references are immutable evidence bindings. If an identical reference
+        already exists (same intent_id), this is a no-op. If a reference with the
+        same intent_id but different dispatch_id or claim_id exists, this fails.
+
         Args:
             effect_ref: Effect reference
             mission_id: Mission identifier
@@ -750,6 +805,7 @@ class MissionRuntimeStore:
 
         Raises:
             MissionNotFoundError: If mission does not exist
+            MissionRuntimeStoreError: If conflicting reference exists
         """
         if not isinstance(effect_ref, EffectReference):
             raise TypeError("effect_ref must be an EffectReference")
@@ -772,10 +828,34 @@ class MissionRuntimeStore:
                         f"Mission {mission_id} not found in domain {control_domain}"
                     )
 
-                # Insert effect reference (idempotent on effect_intent_id)
+                # Check for existing reference
+                cursor = conn.execute(
+                    """
+                    SELECT effect_dispatch_id, gateway_claim_id
+                    FROM mission_effect_references
+                    WHERE control_domain = ? AND mission_id = ? AND effect_intent_id = ?
+                    """,
+                    (control_domain, mission_id, effect_ref.effect_intent_id),
+                )
+                existing = cursor.fetchone()
+
+                if existing is not None:
+                    # Reference exists - verify it's identical (idempotent)
+                    if (existing[0] == effect_ref.effect_dispatch_id and
+                        existing[1] == effect_ref.gateway_claim_id):
+                        # Identical reference - idempotent no-op
+                        return
+                    else:
+                        # Conflicting reference - fail closed
+                        raise MissionRuntimeStoreError(
+                            f"Effect reference {effect_ref.effect_intent_id} already exists with different "
+                            f"dispatch_id or claim_id - effect references are immutable"
+                        )
+
+                # Insert new effect reference
                 conn.execute(
                     """
-                    INSERT OR REPLACE INTO mission_effect_references (
+                    INSERT INTO mission_effect_references (
                         control_domain, mission_id, effect_intent_id,
                         effect_dispatch_id, gateway_claim_id, referenced_at
                     ) VALUES (?, ?, ?, ?, ?, ?)
