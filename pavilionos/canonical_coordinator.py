@@ -170,10 +170,10 @@ class CanonicalPavilionCoordinator:
                 f"Delegation grant {request.delegation_grant_id} is not active: {grant.status.value}"
             )
 
-        if request.requested_capability not in grant.authority_scope:
+        if request.requested_capability not in grant.capabilities.capabilities:
             raise CoordinatorDenied(
                 f"Requested capability {request.requested_capability!r} "
-                f"not in grant authority scope"
+                f"not in grant capabilities"
             )
 
         # Step 2: Generate canonical identifiers

@@ -4,8 +4,10 @@ from datetime import datetime, timedelta, timezone
 
 from federation.delegation_grant import (
     AuthoritativeDelegationGrant,
+    DelegationCapabilities,
     DelegationGrant,
     DelegationGrantStatus,
+    DelegationScope,
     grant_fingerprint,
 )
 
@@ -72,7 +74,8 @@ def test_authoritative_grant_status_tracks_expiry_and_revocation() -> None:
         mission_id="mission-1",
         grantor_identity="agent-1",
         grantee_identity="agent-2",
-        authority_scope=("read",),
+        capabilities=DelegationCapabilities(["read"]),
+        resource_scope=DelegationScope(["read"]),
         parent_grant_id=None,
         parent_grant_fingerprint=None,
         created_at=NOW,
@@ -93,7 +96,8 @@ def test_authoritative_grant_status_tracks_expiry_and_revocation() -> None:
         mission_id="mission-1",
         grantor_identity="agent-1",
         grantee_identity="agent-2",
-        authority_scope=("read",),
+        capabilities=DelegationCapabilities(["read"]),
+        resource_scope=DelegationScope(["read"]),
         parent_grant_id=None,
         parent_grant_fingerprint=None,
         created_at=NOW,
@@ -116,7 +120,8 @@ def test_authoritative_grant_respects_effective_window() -> None:
         mission_id="mission-1",
         grantor_identity="agent-1",
         grantee_identity="agent-2",
-        authority_scope=("read",),
+        capabilities=DelegationCapabilities(["read"]),
+        resource_scope=DelegationScope(["read"]),
         parent_grant_id=None,
         parent_grant_fingerprint=None,
         created_at=NOW,

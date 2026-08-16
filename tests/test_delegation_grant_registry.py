@@ -296,7 +296,8 @@ def test_attenuation_only_never_amplification(grant_registry):
     )
 
     assert child.parent_grant_id == parent.grant_id
-    assert child.authority_scope == ("read",)
+    assert child.capabilities.to_sorted_list() == ["read"]
+    assert child.resource_scope.to_sorted_list() == ["read"]
     assert child.status is DelegationGrantStatus.ACTIVE
 
     with pytest.raises(DelegationGrantScopeError, match="widens"):

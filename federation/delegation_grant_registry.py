@@ -31,8 +31,10 @@ from federation.control_domain_registry import (
 )
 from federation.delegation_grant import (
     AuthoritativeDelegationGrant,
+    DelegationCapabilities,
     DelegationGrant,
     DelegationGrantStatus,
+    DelegationScope,
     _normalize_scope,
     _require_text,
     grant_fingerprint,
@@ -58,7 +60,8 @@ _PAYLOAD_FIELDS = {
     "mission_id",
     "grantor_identity",
     "grantee_identity",
-    "authority_scope",
+    "capabilities",
+    "resource_scope",
     "parent_grant_id",
     "parent_grant_fingerprint",
     "created_at",
@@ -183,6 +186,16 @@ def _grant_key(grant: AuthoritativeDelegationGrant) -> tuple[str, str, str]:
 
 def _scope_subset(child: tuple[str, ...], parent: tuple[str, ...]) -> bool:
     return set(child).issubset(parent)
+
+
+def _capabilities_non_widening(child: DelegationCapabilities, parent: DelegationCapabilities) -> bool:
+    """Return True if child capabilities are a subset of parent capabilities."""
+    return child.is_subset_of(parent)
+
+
+def _resource_scope_non_widening(child: DelegationScope, parent: DelegationScope) -> bool:
+    """Return True if child resource scope is a subset of parent scope."""
+    return child.is_subset_of(parent)
 
 
 class DelegationGrantRegistry:
@@ -382,8 +395,24 @@ class DelegationGrantRegistry:
                 DelegationGrantStatus.ACTIVE,
                 DelegationGrantStatus.PENDING,
             } and grant.parent_grant_id is not None:
+                # Try to find parent with same mission_id first
                 parent_key = (grant.domain_id, grant.mission_id, grant.parent_grant_id)
                 parent = current_by_key.get(parent_key)
+
+                # If not found and child has a mission_id, try unbound parent (mission_id=None)
+                if parent is None and grant.mission_id is not None:
+                    parent_key = (grant.domain_id, None, grant.parent_grant_id)
+                    parent = current_by_key.get(parent_key)
+
+                # If still not found, search across all missions (for mission binding validation)
+                if parent is None:
+                    for key, potential_parent in current_by_key.items():
+                        if (key[0] == grant.domain_id and
+                            key[2] == grant.parent_grant_id):
+                            parent = potential_parent
+                            parent_key = key
+                            break
+
                 if parent is None:
                     raise DelegationGrantCorruptionError(
                         "delegation grant history references a missing parent grant",
@@ -396,9 +425,17 @@ class DelegationGrantRegistry:
                     raise DelegationGrantCorruptionError(
                         "delegation grant attenuation origin is invalid",
                     )
-                if not _scope_subset(grant.authority_scope, parent.authority_scope):
+                if parent.mission_id is not None and grant.mission_id != parent.mission_id:
                     raise DelegationGrantCorruptionError(
-                        "delegation grant scope widens parent authority",
+                        "delegation grant mission binding widens parent authority",
+                    )
+                if not _capabilities_non_widening(grant.capabilities, parent.capabilities):
+                    raise DelegationGrantCorruptionError(
+                        "delegation grant capabilities widen parent authority",
+                    )
+                if not _resource_scope_non_widening(grant.resource_scope, parent.resource_scope):
+                    raise DelegationGrantCorruptionError(
+                        "delegation grant resource scope widens parent authority",
                     )
                 if grant.effective_at < parent.effective_at or grant.expires_at > parent.expires_at:
                     raise DelegationGrantCorruptionError(
@@ -455,8 +492,24 @@ class DelegationGrantRegistry:
     ) -> AuthoritativeDelegationGrant:
         parent_grant_fingerprint = None
         if grant.parent_grant_id is not None:
+            # Try to find parent with same mission_id first
             parent_key = (grant.domain_id, grant.mission_id, grant.parent_grant_id)
             parent = current_by_key.get(parent_key)
+
+            # If not found and child has a mission_id, try unbound parent (mission_id=None)
+            if parent is None and grant.mission_id is not None:
+                parent_key = (grant.domain_id, None, grant.parent_grant_id)
+                parent = current_by_key.get(parent_key)
+
+            # If still not found, search across all missions (for any mission_id mismatch detection)
+            if parent is None:
+                for key, potential_parent in current_by_key.items():
+                    if (key[0] == grant.domain_id and
+                        key[2] == grant.parent_grant_id):
+                        parent = potential_parent
+                        parent_key = key
+                        break
+
             if parent is None:
                 raise DelegationGrantNotFoundError(
                     f"parent grant {grant.parent_grant_id!r} is not registered",
@@ -469,7 +522,8 @@ class DelegationGrantRegistry:
             mission_id=grant.mission_id,
             grantor_identity=grant.grantor_identity,
             grantee_identity=grant.grantee_identity,
-            authority_scope=grant.authority_scope,
+            capabilities=grant.capabilities,
+            resource_scope=grant.resource_scope,
             parent_grant_id=grant.parent_grant_id,
             parent_grant_fingerprint=parent_grant_fingerprint,
             created_at=grant.created_at,
@@ -482,7 +536,8 @@ class DelegationGrantRegistry:
                 mission_id=grant.mission_id,
                 grantor_identity=grant.grantor_identity,
                 grantee_identity=grant.grantee_identity,
-                authority_scope=grant.authority_scope,
+                capabilities=grant.capabilities,
+                resource_scope=grant.resource_scope,
                 created_at=grant.created_at,
                 effective_at=grant.effective_at,
                 expires_at=grant.expires_at,
@@ -504,7 +559,8 @@ class DelegationGrantRegistry:
             "mission_id": grant.mission_id,
             "grantor_identity": grant.grantor_identity,
             "grantee_identity": grant.grantee_identity,
-            "authority_scope": list(grant.authority_scope),
+            "capabilities": grant.capabilities.to_sorted_list(),
+            "resource_scope": grant.resource_scope.to_sorted_list(),
             "parent_grant_id": grant.parent_grant_id,
             "parent_grant_fingerprint": grant.parent_grant_fingerprint,
             "created_at": grant.created_at.astimezone(timezone.utc).isoformat(),
@@ -530,7 +586,8 @@ class DelegationGrantRegistry:
             "mission_id": grant.mission_id,
             "grantor_identity": grant.grantor_identity,
             "grantee_identity": grant.grantee_identity,
-            "authority_scope": list(grant.authority_scope),
+            "capabilities": grant.capabilities.to_sorted_list(),
+            "resource_scope": grant.resource_scope.to_sorted_list(),
             "parent_grant_id": grant.parent_grant_id,
             "parent_grant_fingerprint": grant.parent_grant_fingerprint,
             "created_at": grant.created_at.astimezone(timezone.utc).isoformat(),
@@ -577,8 +634,24 @@ class DelegationGrantRegistry:
                         cache={},
                     )
                     if grant.parent_grant_id is not None:
+                        # Try to find parent with same mission_id first
                         parent_key = (grant.domain_id, grant.mission_id, grant.parent_grant_id)
                         parent = current_by_key.get(parent_key)
+
+                        # If not found and child has a mission_id, try unbound parent (mission_id=None)
+                        if parent is None and grant.mission_id is not None:
+                            parent_key = (grant.domain_id, None, grant.parent_grant_id)
+                            parent = current_by_key.get(parent_key)
+
+                        # If still not found, search across all missions (for mission binding validation)
+                        if parent is None:
+                            for key, potential_parent in current_by_key.items():
+                                if (key[0] == grant.domain_id and
+                                    key[2] == grant.parent_grant_id):
+                                    parent = potential_parent
+                                    parent_key = key
+                                    break
+
                         if parent is None:
                             raise DelegationGrantNotFoundError(
                                 f"parent grant {grant.parent_grant_id!r} is not registered",
@@ -601,9 +674,17 @@ class DelegationGrantRegistry:
                             raise DelegationGrantIdentityError(
                                 "child grantor must match the parent grantee",
                             )
-                        if not _scope_subset(candidate.authority_scope, parent.authority_scope):
+                        if parent.mission_id is not None and candidate.mission_id != parent.mission_id:
                             raise DelegationGrantScopeError(
-                                "child grant authority scope widens the parent grant",
+                                "child grant mission binding widens parent authority",
+                            )
+                        if not _capabilities_non_widening(candidate.capabilities, parent.capabilities):
+                            raise DelegationGrantScopeError(
+                                "child grant capabilities widens the parent grant",
+                            )
+                        if not _resource_scope_non_widening(candidate.resource_scope, parent.resource_scope):
+                            raise DelegationGrantScopeError(
+                                "child grant resource scope widens the parent grant",
                             )
                         if (
                             candidate.effective_at < parent.effective_at
@@ -921,9 +1002,13 @@ class DelegationGrantRegistry:
                     raise DelegationGrantCorruptionError(
                         "delegation grant identity binding changed unexpectedly",
                     )
-                if grant.authority_scope != previous.authority_scope:
+                if grant.capabilities != previous.capabilities:
                     raise DelegationGrantCorruptionError(
-                        "delegation grant authority scope changed unexpectedly",
+                        "delegation grant capabilities changed unexpectedly",
+                    )
+                if grant.resource_scope != previous.resource_scope:
+                    raise DelegationGrantCorruptionError(
+                        "delegation grant resource scope changed unexpectedly",
                     )
                 if grant.parent_grant_id != previous.parent_grant_id:
                     raise DelegationGrantCorruptionError(
@@ -969,8 +1054,24 @@ class DelegationGrantRegistry:
                         )
 
             if grant.parent_grant_id is not None:
+                # Try to find parent with same mission_id first
                 parent_key = (grant.domain_id, grant.mission_id, grant.parent_grant_id)
                 parent = current_by_key.get(parent_key)
+
+                # If not found and child has a mission_id, try unbound parent (mission_id=None)
+                if parent is None and grant.mission_id is not None:
+                    parent_key = (grant.domain_id, None, grant.parent_grant_id)
+                    parent = current_by_key.get(parent_key)
+
+                # If still not found, search across all missions (for mission binding validation)
+                if parent is None:
+                    for key, potential_parent in current_by_key.items():
+                        if (key[0] == grant.domain_id and
+                            key[2] == grant.parent_grant_id):
+                            parent = potential_parent
+                            parent_key = key
+                            break
+
                 if parent is None:
                     raise DelegationGrantCorruptionError(
                         "delegation grant history references a missing parent grant",
@@ -983,9 +1084,17 @@ class DelegationGrantRegistry:
                     raise DelegationGrantCorruptionError(
                         "delegation grant attenuation origin is invalid",
                     )
-                if not _scope_subset(grant.authority_scope, parent.authority_scope):
+                if parent.mission_id is not None and grant.mission_id != parent.mission_id:
                     raise DelegationGrantCorruptionError(
-                        "delegation grant scope widens parent authority",
+                        "delegation grant mission binding widens parent authority",
+                    )
+                if not _capabilities_non_widening(grant.capabilities, parent.capabilities):
+                    raise DelegationGrantCorruptionError(
+                        "delegation grant capabilities widen parent authority",
+                    )
+                if not _resource_scope_non_widening(grant.resource_scope, parent.resource_scope):
+                    raise DelegationGrantCorruptionError(
+                        "delegation grant resource scope widens parent authority",
                     )
                 if grant.effective_at < parent.effective_at or grant.expires_at > parent.expires_at:
                     raise DelegationGrantCorruptionError(
@@ -1024,18 +1133,25 @@ class DelegationGrantRegistry:
     @staticmethod
     def _from_record(record: dict[str, Any]) -> AuthoritativeDelegationGrant:
         payload = record["payload"]
-        authority_scope = _normalize_scope(
-            payload["authority_scope"],
-            "authority_scope",
-        )
-        if list(authority_scope) != list(payload["authority_scope"]):
-            raise DelegationGrantCorruptionError(
-                "delegation grant authority scope is not canonical",
-            )
+
+        if not isinstance(payload.get("capabilities"), list):
+            raise DelegationGrantCorruptionError("capabilities must be a list")
+        if not isinstance(payload.get("resource_scope"), list):
+            raise DelegationGrantCorruptionError("resource_scope must be a list")
+
+        capabilities_list = payload["capabilities"]
+        scope_list = payload["resource_scope"]
+
+        if sorted(capabilities_list) != capabilities_list:
+            raise DelegationGrantCorruptionError("capabilities must be sorted")
+        if sorted(scope_list) != scope_list:
+            raise DelegationGrantCorruptionError("resource_scope must be sorted")
+
+        mission_id_value = payload.get("mission_id")
         grant = AuthoritativeDelegationGrant(
             grant_id=_require_text(payload["grant_id"], "grant_id", max_length=255),
             domain_id=_require_text(payload["domain_id"], "domain_id", max_length=255),
-            mission_id=_require_text(payload["mission_id"], "mission_id", max_length=255),
+            mission_id=None if mission_id_value is None else _require_text(mission_id_value, "mission_id", max_length=255),
             grantor_identity=_require_text(
                 payload["grantor_identity"],
                 "grantor_identity",
@@ -1046,7 +1162,8 @@ class DelegationGrantRegistry:
                 "grantee_identity",
                 max_length=255,
             ),
-            authority_scope=authority_scope,
+            capabilities=DelegationCapabilities(capabilities_list),
+            resource_scope=DelegationScope(scope_list),
             parent_grant_id=(
                 None
                 if payload["parent_grant_id"] is None

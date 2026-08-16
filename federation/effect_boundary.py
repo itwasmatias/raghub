@@ -483,8 +483,8 @@ class EffectBoundary:
             )
         if grant.status is not DelegationGrantStatus.ACTIVE:
             raise EffectAuthorityError("delegation grant is not active")
-        if request.proposal.action.value not in grant.authority_scope:
-            raise EffectAuthorityError("delegation grant scope does not cover requested effect")
+        if request.proposal.action.value not in grant.capabilities.capabilities:
+            raise EffectAuthorityError("delegation grant capabilities do not cover requested effect")
         return domain, identity, grant
 
     @staticmethod

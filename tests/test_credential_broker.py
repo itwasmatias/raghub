@@ -374,7 +374,7 @@ def test_unknown_credential_rejected_without_leaking_secret(tmp_path):
             {"domain_id": "domain-a", "proposal": _proposal(action=PowerAction.DISPLAY_ON)},
             None,
             None,
-            "scope",
+            "capabilities",
         ),
     ],
 )
