@@ -34,6 +34,7 @@ class AuthorityDenialReason(str, Enum):
     DOMAIN_MISMATCH = "domain_mismatch"
     DOMAIN_NOT_ACTIVE = "domain_not_active"
     IDENTITY_NOT_ACTIVE = "identity_not_active"
+    GRANTEE_MISMATCH = "grantee_mismatch"
     CAPABILITY_DENIED = "capability_denied"
     RESOURCE_DENIED = "resource_denied"
     MISSION_DENIED = "mission_denied"
@@ -100,11 +101,12 @@ def evaluate_grant(
         2. ControlDomain must match and be ACTIVE
         3. Grant must not be directly revoked
         4. Grant must be within its validity window
-        5. Requested capability must be in grant.capabilities
-        6. Requested resource must be in grant.resource_scope (exact match, no prefix)
-        7. If grant.mission_id is not None, requested_mission must exactly equal it
-        8. If parent provided, parent must not be revoked/expired
-        9. If identities provided, they must be ACTIVE
+        5. If grantee_identity provided, agent_id must match grant.grantee_identity
+        6. Requested capability must be in grant.capabilities
+        7. Requested resource must be in grant.resource_scope (exact match, no prefix)
+        8. If grant.mission_id is not None, requested_mission must exactly equal it
+        9. If parent provided, parent must not be revoked/expired
+        10. If identities provided, they must be ACTIVE
 
     All checks fail closed - any missing/invalid input results in denial.
     """
@@ -183,6 +185,12 @@ def evaluate_grant(
             return AuthorityDecision.deny(
                 f"grantee identity {grantee_identity.agent_id!r} is not active: {grantee_identity.lifecycle.value}",
                 AuthorityDenialReason.IDENTITY_NOT_ACTIVE,
+            )
+        # Verify grantee identity matches the grant's grantee
+        if grantee_identity.agent_id != grant.grantee_identity:
+            return AuthorityDecision.deny(
+                f"grantee identity {grantee_identity.agent_id!r} does not match grant grantee {grant.grantee_identity!r}",
+                AuthorityDenialReason.GRANTEE_MISMATCH,
             )
 
     # Step 4: Check parent grant if provided

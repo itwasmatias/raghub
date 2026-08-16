@@ -449,6 +449,376 @@ def test_evaluate_grant_unbound_mission_allows_any():
         assert decision.denial_code is None
 
 
+def test_evaluate_grant_correct_grantee_allows():
+    """Grant issued to agent-a + supplied agent-a identity → ALLOW."""
+    domain = AuthoritativeDomain(
+        domain_id="domain-1",
+        domain_fingerprint="df1",
+        owner="owner",
+        name="Domain 1",
+        lifecycle=DomainLifecycle.ACTIVE,
+        created_at=NOW,
+        last_transition_at=NOW,
+    )
+
+    grant = AuthoritativeDelegationGrant(
+        grant_id="grant-1",
+        domain_id="domain-1",
+        mission_id="mission-1",
+        grantor_identity="grantor",
+        grantee_identity="agent-a",  # Grant issued to agent-a
+        capabilities=DelegationCapabilities(["vehicle.registration.renew"]),
+        resource_scope=DelegationScope(["vehicle:ABC123"]),
+        created_at=NOW,
+        effective_at=NOW,
+        expires_at=NOW + timedelta(hours=1),
+        status=DelegationGrantStatus.ACTIVE,
+        grant_fingerprint="fp1",
+    )
+
+    agent_a = AuthoritativeAgentIdentity(
+        agent_id="agent-a",
+        domain_id="domain-1",
+        domain_fingerprint="df1",
+        name="Agent A",
+        identity_fingerprint="if-a",
+        lifecycle=AgentIdentityLifecycle.ACTIVE,
+        created_at=NOW,
+        last_transition_at=NOW,
+    )
+
+    decision = evaluate_grant(
+        control_domain=domain,
+        grant=grant,
+        requested_capability="vehicle.registration.renew",
+        requested_resource="vehicle:ABC123",
+        requested_mission="mission-1",
+        grantee_identity=agent_a,  # Correct grantee
+        evaluation_time=NOW + timedelta(minutes=30),
+    )
+
+    assert decision.allowed is True
+    assert decision.denial_code is None
+
+
+def test_evaluate_grant_wrong_grantee_denies():
+    """Grant issued to agent-a + supplied agent-b identity → DENY."""
+    domain = AuthoritativeDomain(
+        domain_id="domain-1",
+        domain_fingerprint="df1",
+        owner="owner",
+        name="Domain 1",
+        lifecycle=DomainLifecycle.ACTIVE,
+        created_at=NOW,
+        last_transition_at=NOW,
+    )
+
+    grant = AuthoritativeDelegationGrant(
+        grant_id="grant-1",
+        domain_id="domain-1",
+        mission_id="mission-1",
+        grantor_identity="grantor",
+        grantee_identity="agent-a",  # Grant issued to agent-a
+        capabilities=DelegationCapabilities(["vehicle.registration.renew"]),
+        resource_scope=DelegationScope(["vehicle:ABC123"]),
+        created_at=NOW,
+        effective_at=NOW,
+        expires_at=NOW + timedelta(hours=1),
+        status=DelegationGrantStatus.ACTIVE,
+        grant_fingerprint="fp1",
+    )
+
+    agent_b = AuthoritativeAgentIdentity(
+        agent_id="agent-b",  # Different agent!
+        domain_id="domain-1",
+        domain_fingerprint="df1",
+        name="Agent B",
+        identity_fingerprint="if-b",
+        lifecycle=AgentIdentityLifecycle.ACTIVE,
+        created_at=NOW,
+        last_transition_at=NOW,
+    )
+
+    decision = evaluate_grant(
+        control_domain=domain,
+        grant=grant,
+        requested_capability="vehicle.registration.renew",
+        requested_resource="vehicle:ABC123",
+        requested_mission="mission-1",
+        grantee_identity=agent_b,  # Wrong grantee!
+        evaluation_time=NOW + timedelta(minutes=30),
+    )
+
+    assert decision.allowed is False
+    assert decision.denial_code == AuthorityDenialReason.GRANTEE_MISMATCH
+
+
+def test_evaluate_grant_wrong_grantee_all_else_valid():
+    """Grant issued to agent-a + agent-b with same domain/mission/capability/resource → DENY."""
+    domain = AuthoritativeDomain(
+        domain_id="domain-1",
+        domain_fingerprint="df1",
+        owner="owner",
+        name="Domain 1",
+        lifecycle=DomainLifecycle.ACTIVE,
+        created_at=NOW,
+        last_transition_at=NOW,
+    )
+
+    grant = AuthoritativeDelegationGrant(
+        grant_id="grant-1",
+        domain_id="domain-1",
+        mission_id="mission-1",
+        grantor_identity="grantor",
+        grantee_identity="agent-a",
+        capabilities=DelegationCapabilities(["vehicle.registration.renew"]),
+        resource_scope=DelegationScope(["vehicle:ABC123"]),
+        created_at=NOW,
+        effective_at=NOW,
+        expires_at=NOW + timedelta(hours=1),
+        status=DelegationGrantStatus.ACTIVE,
+        grant_fingerprint="fp1",
+    )
+
+    # Agent B is ACTIVE and from same domain
+    agent_b_active = AuthoritativeAgentIdentity(
+        agent_id="agent-b",
+        domain_id="domain-1",  # Same domain
+        domain_fingerprint="df1",
+        name="Agent B",
+        identity_fingerprint="if-b",
+        lifecycle=AgentIdentityLifecycle.ACTIVE,  # ACTIVE
+        created_at=NOW,
+        last_transition_at=NOW,
+    )
+
+    # All other dimensions match, only grantee differs
+    decision = evaluate_grant(
+        control_domain=domain,
+        grant=grant,
+        requested_capability="vehicle.registration.renew",  # Matches grant
+        requested_resource="vehicle:ABC123",  # Matches grant
+        requested_mission="mission-1",  # Matches grant
+        grantee_identity=agent_b_active,  # Wrong grantee but ACTIVE
+        evaluation_time=NOW + timedelta(minutes=30),
+    )
+
+    # Must DENY because grantee doesn't match, even though everything else is valid
+    assert decision.allowed is False
+    assert decision.denial_code == AuthorityDenialReason.GRANTEE_MISMATCH
+
+
+def test_evaluate_grant_inactive_correct_grantee_denies():
+    """Grant issued to agent-a + revoked agent-a identity → DENY (lifecycle check)."""
+    domain = AuthoritativeDomain(
+        domain_id="domain-1",
+        domain_fingerprint="df1",
+        owner="owner",
+        name="Domain 1",
+        lifecycle=DomainLifecycle.ACTIVE,
+        created_at=NOW,
+        last_transition_at=NOW,
+    )
+
+    grant = AuthoritativeDelegationGrant(
+        grant_id="grant-1",
+        domain_id="domain-1",
+        mission_id="mission-1",
+        grantor_identity="grantor",
+        grantee_identity="agent-a",
+        capabilities=DelegationCapabilities(["vehicle.registration.renew"]),
+        resource_scope=DelegationScope(["vehicle:ABC123"]),
+        created_at=NOW,
+        effective_at=NOW,
+        expires_at=NOW + timedelta(hours=1),
+        status=DelegationGrantStatus.ACTIVE,
+        grant_fingerprint="fp1",
+    )
+
+    agent_a_revoked = AuthoritativeAgentIdentity(
+        agent_id="agent-a",
+        domain_id="domain-1",
+        domain_fingerprint="df1",
+        name="Agent A",
+        identity_fingerprint="if-a",
+        lifecycle=AgentIdentityLifecycle.REVOKED,  # Revoked
+        created_at=NOW,
+        last_transition_at=NOW,
+        revoked_at=NOW + timedelta(minutes=15),
+        revocation_reason="test revocation",
+    )
+
+    decision = evaluate_grant(
+        control_domain=domain,
+        grant=grant,
+        requested_capability="vehicle.registration.renew",
+        requested_resource="vehicle:ABC123",
+        requested_mission="mission-1",
+        grantee_identity=agent_a_revoked,
+        evaluation_time=NOW + timedelta(minutes=30),
+    )
+
+    # Revoked grantee must be denied (lifecycle check before grantee binding)
+    assert decision.allowed is False
+    assert decision.denial_code == AuthorityDenialReason.IDENTITY_NOT_ACTIVE
+
+
+def test_evaluate_grant_correct_grantee_wrong_capability_denies():
+    """Correct grantee + wrong capability → DENY (capability check still enforced)."""
+    domain = AuthoritativeDomain(
+        domain_id="domain-1",
+        domain_fingerprint="df1",
+        owner="owner",
+        name="Domain 1",
+        lifecycle=DomainLifecycle.ACTIVE,
+        created_at=NOW,
+        last_transition_at=NOW,
+    )
+
+    grant = AuthoritativeDelegationGrant(
+        grant_id="grant-1",
+        domain_id="domain-1",
+        mission_id="mission-1",
+        grantor_identity="grantor",
+        grantee_identity="agent-a",
+        capabilities=DelegationCapabilities(["vehicle.registration.renew"]),
+        resource_scope=DelegationScope(["vehicle:ABC123"]),
+        created_at=NOW,
+        effective_at=NOW,
+        expires_at=NOW + timedelta(hours=1),
+        status=DelegationGrantStatus.ACTIVE,
+        grant_fingerprint="fp1",
+    )
+
+    agent_a = AuthoritativeAgentIdentity(
+        agent_id="agent-a",
+        domain_id="domain-1",
+        domain_fingerprint="df1",
+        name="Agent A",
+        identity_fingerprint="if-a",
+        lifecycle=AgentIdentityLifecycle.ACTIVE,
+        created_at=NOW,
+        last_transition_at=NOW,
+    )
+
+    decision = evaluate_grant(
+        control_domain=domain,
+        grant=grant,
+        requested_capability="vehicle.registration.cancel",  # Wrong capability
+        requested_resource="vehicle:ABC123",
+        requested_mission="mission-1",
+        grantee_identity=agent_a,  # Correct grantee
+        evaluation_time=NOW + timedelta(minutes=30),
+    )
+
+    assert decision.allowed is False
+    assert decision.denial_code == AuthorityDenialReason.CAPABILITY_DENIED
+
+
+def test_evaluate_grant_correct_grantee_wrong_resource_denies():
+    """Correct grantee + wrong resource → DENY (resource check still enforced)."""
+    domain = AuthoritativeDomain(
+        domain_id="domain-1",
+        domain_fingerprint="df1",
+        owner="owner",
+        name="Domain 1",
+        lifecycle=DomainLifecycle.ACTIVE,
+        created_at=NOW,
+        last_transition_at=NOW,
+    )
+
+    grant = AuthoritativeDelegationGrant(
+        grant_id="grant-1",
+        domain_id="domain-1",
+        mission_id="mission-1",
+        grantor_identity="grantor",
+        grantee_identity="agent-a",
+        capabilities=DelegationCapabilities(["vehicle.registration.renew"]),
+        resource_scope=DelegationScope(["vehicle:ABC123"]),
+        created_at=NOW,
+        effective_at=NOW,
+        expires_at=NOW + timedelta(hours=1),
+        status=DelegationGrantStatus.ACTIVE,
+        grant_fingerprint="fp1",
+    )
+
+    agent_a = AuthoritativeAgentIdentity(
+        agent_id="agent-a",
+        domain_id="domain-1",
+        domain_fingerprint="df1",
+        name="Agent A",
+        identity_fingerprint="if-a",
+        lifecycle=AgentIdentityLifecycle.ACTIVE,
+        created_at=NOW,
+        last_transition_at=NOW,
+    )
+
+    decision = evaluate_grant(
+        control_domain=domain,
+        grant=grant,
+        requested_capability="vehicle.registration.renew",
+        requested_resource="vehicle:XYZ789",  # Wrong resource
+        requested_mission="mission-1",
+        grantee_identity=agent_a,  # Correct grantee
+        evaluation_time=NOW + timedelta(minutes=30),
+    )
+
+    assert decision.allowed is False
+    assert decision.denial_code == AuthorityDenialReason.RESOURCE_DENIED
+
+
+def test_evaluate_grant_correct_grantee_wrong_mission_denies():
+    """Correct grantee + wrong mission → DENY (mission check still enforced)."""
+    domain = AuthoritativeDomain(
+        domain_id="domain-1",
+        domain_fingerprint="df1",
+        owner="owner",
+        name="Domain 1",
+        lifecycle=DomainLifecycle.ACTIVE,
+        created_at=NOW,
+        last_transition_at=NOW,
+    )
+
+    grant = AuthoritativeDelegationGrant(
+        grant_id="grant-1",
+        domain_id="domain-1",
+        mission_id="mission-1",
+        grantor_identity="grantor",
+        grantee_identity="agent-a",
+        capabilities=DelegationCapabilities(["vehicle.registration.renew"]),
+        resource_scope=DelegationScope(["vehicle:ABC123"]),
+        created_at=NOW,
+        effective_at=NOW,
+        expires_at=NOW + timedelta(hours=1),
+        status=DelegationGrantStatus.ACTIVE,
+        grant_fingerprint="fp1",
+    )
+
+    agent_a = AuthoritativeAgentIdentity(
+        agent_id="agent-a",
+        domain_id="domain-1",
+        domain_fingerprint="df1",
+        name="Agent A",
+        identity_fingerprint="if-a",
+        lifecycle=AgentIdentityLifecycle.ACTIVE,
+        created_at=NOW,
+        last_transition_at=NOW,
+    )
+
+    decision = evaluate_grant(
+        control_domain=domain,
+        grant=grant,
+        requested_capability="vehicle.registration.renew",
+        requested_resource="vehicle:ABC123",
+        requested_mission="mission-2",  # Wrong mission
+        grantee_identity=agent_a,  # Correct grantee
+        evaluation_time=NOW + timedelta(minutes=30),
+    )
+
+    assert decision.allowed is False
+    assert decision.denial_code == AuthorityDenialReason.MISSION_DENIED
+
+
 # ============================================================================
 # IMMUTABLE SQLITE TESTS
 # ============================================================================
