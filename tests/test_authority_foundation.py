@@ -7,7 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from federation.agent_authority_store import AgentAuthorityStore
+from federation.agent_authority_store import (
+    AgentAuthorityStore,
+    AuthorityStoreMigrationError,
+)
 from federation.delegation_grant import (
     AuthoritativeDelegationGrant,
     DelegationCapabilities,
@@ -779,24 +782,28 @@ def test_authoritative_grant_frozen():
 # ============================================================================
 
 
-@pytest.mark.skip(reason="Migration test needs verification of legacy JSONL format")
 def test_migration_jsonl_to_sqlite(tmp_path):
-    """Verify JSONL v1 → SQLite v2 migration."""
+    """Verify JSONL v1 → SQLite v2 migration with genuine legacy format.
+
+    Legacy v1 format (before cfc2164) used:
+    - Required mission_id (str, not optional)
+    - Single authority_scope field (list of strings)
+    - No capabilities or resource_scope fields
+    """
     jsonl_path = tmp_path / "grants.jsonl"
     sqlite_path = tmp_path / "authority.db"
 
-    # Create JSONL record with legacy authority_scope format
+    # Create JSONL record with genuine legacy v1 authority_scope format
     legacy_record = {
         "schema_version": 1,
         "sequence": 1,
         "payload": {
             "grant_id": "grant-1",
             "domain_id": "domain-1",
-            "mission_id": "mission-1",
+            "mission_id": "mission-1",  # Required in legacy v1
             "grantor_identity": "agent-1",
             "grantee_identity": "agent-2",
-            "capabilities": ["read", "write"],
-            "resource_scope": ["read", "write"],
+            "authority_scope": ["read", "write"],  # Legacy unified scope
             "parent_grant_id": None,
             "parent_grant_fingerprint": None,
             "created_at": NOW.isoformat(),
@@ -820,8 +827,436 @@ def test_migration_jsonl_to_sqlite(tmp_path):
     # Verify migration created SQLite file
     assert sqlite_path.exists()
 
-    # Verify schema version
-    assert store.schema_version == 2
+    # Verify migrated grant exists and was mapped correctly
+    grant = store.get_grant("grant-1", "domain-1")
+    assert grant is not None
+    assert grant.grant_id == "grant-1"
+    assert grant.domain_id == "domain-1"
+    assert grant.mission_id == "mission-1"
+    assert grant.grantor_identity == "agent-1"
+    assert grant.grantee_identity == "agent-2"
+
+    # Verify legacy authority_scope was conservatively migrated to both fields
+    assert grant.capabilities.to_sorted_list() == ["read", "write"]
+    assert grant.resource_scope.to_sorted_list() == ["read", "write"]
+
+    # Verify timestamps preserved
+    assert grant.created_at == NOW
+    assert grant.effective_at == NOW
+    assert grant.expires_at == NOW + timedelta(hours=1)
+
+    # Verify status preserved
+    assert grant.status == DelegationGrantStatus.ACTIVE
+
+    # Verify parent lineage preserved
+    assert grant.parent_grant_id is None
+    assert grant.parent_grant_fingerprint is None
+
+    # Verify fingerprint preserved
+    assert grant.grant_fingerprint == "f" * 64
+
+    # Verify revocation state preserved
+    assert grant.revoked_at is None
+    assert grant.revocation_reason is None
+
+    # Verify migration is idempotent - running again should succeed
+    store2 = AgentAuthorityStore.migrate_from_jsonl(jsonl_path, sqlite_path)
+    grant2 = store2.get_grant("grant-1", "domain-1")
+    assert grant2 is not None
+    assert grant2.capabilities.to_sorted_list() == ["read", "write"]
+    assert grant2.resource_scope.to_sorted_list() == ["read", "write"]
+
+    # Verify fresh reopen produces identical authority
+    store3 = AgentAuthorityStore(sqlite_path)
+    grant3 = store3.get_grant("grant-1", "domain-1")
+    assert grant3 is not None
+    assert grant3.grant_id == grant.grant_id
+    assert grant3.capabilities == grant.capabilities
+    assert grant3.resource_scope == grant.resource_scope
+    assert grant3.status == grant.status
+
+
+def test_migration_rejects_missing_authority_scope(tmp_path):
+    """Migration fails closed when legacy authority_scope is missing."""
+    jsonl_path = tmp_path / "grants.jsonl"
+    sqlite_path = tmp_path / "authority.db"
+
+    malformed_record = {
+        "schema_version": 1,
+        "sequence": 1,
+        "payload": {
+            "grant_id": "grant-1",
+            "domain_id": "domain-1",
+            "mission_id": "mission-1",
+            "grantor_identity": "agent-1",
+            "grantee_identity": "agent-2",
+            # Missing authority_scope - has new fields instead
+            "capabilities": ["read"],
+            "resource_scope": ["read"],
+            "parent_grant_id": None,
+            "parent_grant_fingerprint": None,
+            "created_at": NOW.isoformat(),
+            "effective_at": NOW.isoformat(),
+            "expires_at": (NOW + timedelta(hours=1)).isoformat(),
+            "status": "active",
+            "grant_fingerprint": "f" * 64,
+        },
+    }
+
+    jsonl_path.write_text(json.dumps(malformed_record, sort_keys=True, separators=(",", ":")) + "\n")
+
+    with pytest.raises(AuthorityStoreMigrationError, match="missing required legacy field 'authority_scope'"):
+        AgentAuthorityStore.migrate_from_jsonl(jsonl_path, sqlite_path)
+
+    # Verify no partial database was created
+    assert not sqlite_path.exists()
+
+
+def test_migration_rejects_wrong_authority_scope_type(tmp_path):
+    """Migration fails closed when authority_scope has wrong type."""
+    jsonl_path = tmp_path / "grants.jsonl"
+    sqlite_path = tmp_path / "authority.db"
+
+    malformed_record = {
+        "schema_version": 1,
+        "sequence": 1,
+        "payload": {
+            "grant_id": "grant-1",
+            "domain_id": "domain-1",
+            "mission_id": "mission-1",
+            "grantor_identity": "agent-1",
+            "grantee_identity": "agent-2",
+            "authority_scope": "read,write",  # String instead of list
+            "parent_grant_id": None,
+            "parent_grant_fingerprint": None,
+            "created_at": NOW.isoformat(),
+            "effective_at": NOW.isoformat(),
+            "expires_at": (NOW + timedelta(hours=1)).isoformat(),
+            "status": "active",
+            "grant_fingerprint": "f" * 64,
+        },
+    }
+
+    jsonl_path.write_text(json.dumps(malformed_record, sort_keys=True, separators=(",", ":")) + "\n")
+
+    with pytest.raises(AuthorityStoreMigrationError, match="authority_scope must be list"):
+        AgentAuthorityStore.migrate_from_jsonl(jsonl_path, sqlite_path)
+
+    assert not sqlite_path.exists()
+
+
+def test_migration_rejects_blank_authority_atom(tmp_path):
+    """Migration fails closed when authority_scope contains blank atom."""
+    jsonl_path = tmp_path / "grants.jsonl"
+    sqlite_path = tmp_path / "authority.db"
+
+    malformed_record = {
+        "schema_version": 1,
+        "sequence": 1,
+        "payload": {
+            "grant_id": "grant-1",
+            "domain_id": "domain-1",
+            "mission_id": "mission-1",
+            "grantor_identity": "agent-1",
+            "grantee_identity": "agent-2",
+            "authority_scope": ["read", ""],  # Blank atom
+            "parent_grant_id": None,
+            "parent_grant_fingerprint": None,
+            "created_at": NOW.isoformat(),
+            "effective_at": NOW.isoformat(),
+            "expires_at": (NOW + timedelta(hours=1)).isoformat(),
+            "status": "active",
+            "grant_fingerprint": "f" * 64,
+        },
+    }
+
+    jsonl_path.write_text(json.dumps(malformed_record, sort_keys=True, separators=(",", ":")) + "\n")
+
+    with pytest.raises(AuthorityStoreMigrationError, match="authority_scope.*must be non-empty"):
+        AgentAuthorityStore.migrate_from_jsonl(jsonl_path, sqlite_path)
+
+    assert not sqlite_path.exists()
+
+
+def test_migration_rejects_null_byte_in_authority_atom(tmp_path):
+    """Migration fails closed when authority_scope contains NULL byte."""
+    jsonl_path = tmp_path / "grants.jsonl"
+    sqlite_path = tmp_path / "authority.db"
+
+    malformed_record = {
+        "schema_version": 1,
+        "sequence": 1,
+        "payload": {
+            "grant_id": "grant-1",
+            "domain_id": "domain-1",
+            "mission_id": "mission-1",
+            "grantor_identity": "agent-1",
+            "grantee_identity": "agent-2",
+            "authority_scope": ["read\x00write"],  # NULL byte
+            "parent_grant_id": None,
+            "parent_grant_fingerprint": None,
+            "created_at": NOW.isoformat(),
+            "effective_at": NOW.isoformat(),
+            "expires_at": (NOW + timedelta(hours=1)).isoformat(),
+            "status": "active",
+            "grant_fingerprint": "f" * 64,
+        },
+    }
+
+    jsonl_path.write_text(json.dumps(malformed_record, sort_keys=True, separators=(",", ":")) + "\n")
+
+    with pytest.raises(AuthorityStoreMigrationError, match="authority_scope.*NULL byte"):
+        AgentAuthorityStore.migrate_from_jsonl(jsonl_path, sqlite_path)
+
+    assert not sqlite_path.exists()
+
+
+def test_migration_rejects_malformed_timestamp(tmp_path):
+    """Migration fails closed when timestamp is malformed."""
+    jsonl_path = tmp_path / "grants.jsonl"
+    sqlite_path = tmp_path / "authority.db"
+
+    malformed_record = {
+        "schema_version": 1,
+        "sequence": 1,
+        "payload": {
+            "grant_id": "grant-1",
+            "domain_id": "domain-1",
+            "mission_id": "mission-1",
+            "grantor_identity": "agent-1",
+            "grantee_identity": "agent-2",
+            "authority_scope": ["read"],
+            "parent_grant_id": None,
+            "parent_grant_fingerprint": None,
+            "created_at": "not-a-timestamp",  # Invalid timestamp
+            "effective_at": NOW.isoformat(),
+            "expires_at": (NOW + timedelta(hours=1)).isoformat(),
+            "status": "active",
+            "grant_fingerprint": "f" * 64,
+        },
+    }
+
+    jsonl_path.write_text(json.dumps(malformed_record, sort_keys=True, separators=(",", ":")) + "\n")
+
+    with pytest.raises(AuthorityStoreMigrationError, match="invalid timestamp format"):
+        AgentAuthorityStore.migrate_from_jsonl(jsonl_path, sqlite_path)
+
+    assert not sqlite_path.exists()
+
+
+def test_migration_rejects_invalid_status(tmp_path):
+    """Migration fails closed when status is invalid."""
+    jsonl_path = tmp_path / "grants.jsonl"
+    sqlite_path = tmp_path / "authority.db"
+
+    malformed_record = {
+        "schema_version": 1,
+        "sequence": 1,
+        "payload": {
+            "grant_id": "grant-1",
+            "domain_id": "domain-1",
+            "mission_id": "mission-1",
+            "grantor_identity": "agent-1",
+            "grantee_identity": "agent-2",
+            "authority_scope": ["read"],
+            "parent_grant_id": None,
+            "parent_grant_fingerprint": None,
+            "created_at": NOW.isoformat(),
+            "effective_at": NOW.isoformat(),
+            "expires_at": (NOW + timedelta(hours=1)).isoformat(),
+            "status": "invalid-status",  # Invalid status
+            "grant_fingerprint": "f" * 64,
+        },
+    }
+
+    jsonl_path.write_text(json.dumps(malformed_record, sort_keys=True, separators=(",", ":")) + "\n")
+
+    with pytest.raises(AuthorityStoreMigrationError, match="invalid status"):
+        AgentAuthorityStore.migrate_from_jsonl(jsonl_path, sqlite_path)
+
+    assert not sqlite_path.exists()
+
+
+def test_migration_rejects_missing_required_field(tmp_path):
+    """Migration fails closed when required field is missing."""
+    jsonl_path = tmp_path / "grants.jsonl"
+    sqlite_path = tmp_path / "authority.db"
+
+    malformed_record = {
+        "schema_version": 1,
+        "sequence": 1,
+        "payload": {
+            "grant_id": "grant-1",
+            "domain_id": "domain-1",
+            # Missing mission_id (required in legacy v1)
+            "grantor_identity": "agent-1",
+            "grantee_identity": "agent-2",
+            "authority_scope": ["read"],
+            "parent_grant_id": None,
+            "parent_grant_fingerprint": None,
+            "created_at": NOW.isoformat(),
+            "effective_at": NOW.isoformat(),
+            "expires_at": (NOW + timedelta(hours=1)).isoformat(),
+            "status": "active",
+            "grant_fingerprint": "f" * 64,
+        },
+    }
+
+    jsonl_path.write_text(json.dumps(malformed_record, sort_keys=True, separators=(",", ":")) + "\n")
+
+    with pytest.raises(AuthorityStoreMigrationError, match="missing required field 'mission_id'"):
+        AgentAuthorityStore.migrate_from_jsonl(jsonl_path, sqlite_path)
+
+    assert not sqlite_path.exists()
+
+
+def test_migration_rejects_duplicate_with_conflicting_authority(tmp_path):
+    """Migration fails closed when duplicate key has conflicting authority."""
+    jsonl_path = tmp_path / "grants.jsonl"
+    sqlite_path = tmp_path / "authority.db"
+
+    # Two records with same key but different authority_scope
+    record1 = {
+        "schema_version": 1,
+        "sequence": 1,
+        "payload": {
+            "grant_id": "grant-1",
+            "domain_id": "domain-1",
+            "mission_id": "mission-1",
+            "grantor_identity": "agent-1",
+            "grantee_identity": "agent-2",
+            "authority_scope": ["read"],  # First authority
+            "parent_grant_id": None,
+            "parent_grant_fingerprint": None,
+            "created_at": NOW.isoformat(),
+            "effective_at": NOW.isoformat(),
+            "expires_at": (NOW + timedelta(hours=1)).isoformat(),
+            "status": "active",
+            "grant_fingerprint": "f" * 64,
+        },
+    }
+
+    record2 = {
+        "schema_version": 1,
+        "sequence": 2,
+        "payload": {
+            "grant_id": "grant-1",
+            "domain_id": "domain-1",
+            "mission_id": "mission-1",
+            "grantor_identity": "agent-1",
+            "grantee_identity": "agent-2",
+            "authority_scope": ["write"],  # Conflicting authority!
+            "parent_grant_id": None,
+            "parent_grant_fingerprint": None,
+            "created_at": NOW.isoformat(),
+            "effective_at": NOW.isoformat(),
+            "expires_at": (NOW + timedelta(hours=1)).isoformat(),
+            "status": "active",
+            "grant_fingerprint": "f" * 64,
+        },
+    }
+
+    jsonl_text = (
+        json.dumps(record1, sort_keys=True, separators=(",", ":")) + "\n" +
+        json.dumps(record2, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    jsonl_path.write_text(jsonl_text)
+
+    with pytest.raises(AuthorityStoreMigrationError, match="duplicate grant key.*conflicting authority"):
+        AgentAuthorityStore.migrate_from_jsonl(jsonl_path, sqlite_path)
+
+    assert not sqlite_path.exists()
+
+
+def test_migration_accepts_exact_duplicate_lifecycle_snapshots(tmp_path):
+    """Migration accepts exact duplicate records as lifecycle snapshots."""
+    jsonl_path = tmp_path / "grants.jsonl"
+    sqlite_path = tmp_path / "authority.db"
+
+    # Two identical records (lifecycle snapshot pattern)
+    record = {
+        "schema_version": 1,
+        "sequence": 1,
+        "payload": {
+            "grant_id": "grant-1",
+            "domain_id": "domain-1",
+            "mission_id": "mission-1",
+            "grantor_identity": "agent-1",
+            "grantee_identity": "agent-2",
+            "authority_scope": ["read", "write"],
+            "parent_grant_id": None,
+            "parent_grant_fingerprint": None,
+            "created_at": NOW.isoformat(),
+            "effective_at": NOW.isoformat(),
+            "expires_at": (NOW + timedelta(hours=1)).isoformat(),
+            "status": "active",
+            "grant_fingerprint": "f" * 64,
+            "revoked_at": None,
+            "revocation_reason": None,
+        },
+    }
+
+    # Write same record twice
+    jsonl_text = (
+        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n" +
+        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    jsonl_path.write_text(jsonl_text)
+
+    # Should succeed - exact duplicates are allowed
+    store = AgentAuthorityStore.migrate_from_jsonl(jsonl_path, sqlite_path)
+
+    grant = store.get_grant("grant-1", "domain-1")
+    assert grant is not None
+    assert grant.capabilities.to_sorted_list() == ["read", "write"]
+
+
+def test_migration_rejects_incomplete_jsonl_tail(tmp_path):
+    """Migration fails closed when JSONL file has incomplete tail."""
+    jsonl_path = tmp_path / "grants.jsonl"
+    sqlite_path = tmp_path / "authority.db"
+
+    record = {
+        "schema_version": 1,
+        "sequence": 1,
+        "payload": {
+            "grant_id": "grant-1",
+            "domain_id": "domain-1",
+            "mission_id": "mission-1",
+            "grantor_identity": "agent-1",
+            "grantee_identity": "agent-2",
+            "authority_scope": ["read"],
+            "parent_grant_id": None,
+            "parent_grant_fingerprint": None,
+            "created_at": NOW.isoformat(),
+            "effective_at": NOW.isoformat(),
+            "expires_at": (NOW + timedelta(hours=1)).isoformat(),
+            "status": "active",
+            "grant_fingerprint": "f" * 64,
+        },
+    }
+
+    # Write without trailing newline
+    jsonl_path.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")))
+
+    with pytest.raises(AuthorityStoreMigrationError, match="incomplete tail"):
+        AgentAuthorityStore.migrate_from_jsonl(jsonl_path, sqlite_path)
+
+    assert not sqlite_path.exists()
+
+
+def test_migration_rejects_invalid_utf8(tmp_path):
+    """Migration fails closed when JSONL contains invalid UTF-8."""
+    jsonl_path = tmp_path / "grants.jsonl"
+    sqlite_path = tmp_path / "authority.db"
+
+    # Write invalid UTF-8 bytes
+    jsonl_path.write_bytes(b"\xff\xfe invalid utf-8 \n")
+
+    with pytest.raises(AuthorityStoreMigrationError, match="not UTF-8"):
+        AgentAuthorityStore.migrate_from_jsonl(jsonl_path, sqlite_path)
+
+    assert not sqlite_path.exists()
 
 
 def test_corruption_unsorted_capabilities_rejected(tmp_path, domain_registry, identity_registry):

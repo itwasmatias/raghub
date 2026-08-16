@@ -683,7 +683,14 @@ class AgentAuthorityStore:
 
     @staticmethod
     def _parse_jsonl_v1(jsonl_path: Path) -> list[dict[str, Any]]:
-        """Parse JSONL schema v1 delegation grants for migration."""
+        """Parse JSONL schema v1 delegation grants for migration.
+
+        Fail-closed validation that rejects malformed legacy authority.
+        Legacy v1 format (before cfc2164) used:
+        - Required mission_id (str, not optional)
+        - Single authority_scope field (list of strings)
+        - No capabilities or resource_scope fields
+        """
         with open(jsonl_path, "rb") as handle:
             raw = handle.read()
 
@@ -699,23 +706,206 @@ class AgentAuthorityStore:
             raise AuthorityStoreMigrationError("JSONL is not UTF-8") from exc
 
         grants_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        seen_exact: dict[tuple[str, str, str], bytes] = {}
 
-        for line in text.splitlines():
+        for line_num, line in enumerate(text.splitlines(), 1):
             if not line:
                 continue
+
+            # Parse JSON
             try:
                 record = json.loads(line)
             except json.JSONDecodeError as exc:
-                raise AuthorityStoreMigrationError("JSONL contains invalid JSON") from exc
+                raise AuthorityStoreMigrationError(f"line {line_num}: invalid JSON") from exc
 
+            # Validate record structure
             if not isinstance(record, dict):
-                raise AuthorityStoreMigrationError("JSONL record is not a dict")
+                raise AuthorityStoreMigrationError(f"line {line_num}: record is not a dict")
+
+            # Validate schema_version
+            if "schema_version" not in record:
+                raise AuthorityStoreMigrationError(f"line {line_num}: missing schema_version")
+            schema_version = record["schema_version"]
+            if not isinstance(schema_version, int) or schema_version != 1:
+                raise AuthorityStoreMigrationError(
+                    f"line {line_num}: unsupported schema_version: {schema_version!r} (expected 1)"
+                )
+
+            # Validate payload exists
             if "payload" not in record:
-                raise AuthorityStoreMigrationError("JSONL record missing payload")
+                raise AuthorityStoreMigrationError(f"line {line_num}: missing payload")
 
             payload = record["payload"]
+            if not isinstance(payload, dict):
+                raise AuthorityStoreMigrationError(f"line {line_num}: payload is not a dict")
+
+            # Validate required identity fields
+            required_text_fields = [
+                ("domain_id", 255),
+                ("grant_id", 255),
+                ("mission_id", 255),  # Legacy v1 required mission_id
+                ("grantor_identity", 255),
+                ("grantee_identity", 255),
+                ("status", 50),
+                ("grant_fingerprint", 64),
+            ]
+
+            for field_name, max_len in required_text_fields:
+                if field_name not in payload:
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: payload missing required field {field_name!r}"
+                    )
+                value = payload[field_name]
+                if not isinstance(value, str):
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: {field_name} must be string, got {type(value).__name__}"
+                    )
+                if not value or not value.strip():
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: {field_name} must be non-empty"
+                    )
+                if value != value.strip():
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: {field_name} contains surrounding whitespace"
+                    )
+                if len(value) > max_len:
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: {field_name} exceeds {max_len} characters"
+                    )
+                if "\x00" in value:
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: {field_name} contains NULL byte"
+                    )
+
+            # Validate legacy authority_scope exists and has correct structure
+            if "authority_scope" not in payload:
+                raise AuthorityStoreMigrationError(
+                    f"line {line_num}: payload missing required legacy field 'authority_scope'"
+                )
+
+            authority_scope = payload["authority_scope"]
+            if not isinstance(authority_scope, list):
+                raise AuthorityStoreMigrationError(
+                    f"line {line_num}: authority_scope must be list, got {type(authority_scope).__name__}"
+                )
+            if not authority_scope:
+                raise AuthorityStoreMigrationError(
+                    f"line {line_num}: authority_scope must be non-empty"
+                )
+
+            for idx, atom in enumerate(authority_scope):
+                if not isinstance(atom, str):
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: authority_scope[{idx}] must be string"
+                    )
+                if not atom or not atom.strip():
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: authority_scope[{idx}] must be non-empty"
+                    )
+                if atom != atom.strip():
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: authority_scope[{idx}] contains surrounding whitespace"
+                    )
+                if "\x00" in atom:
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: authority_scope[{idx}] contains NULL byte"
+                    )
+                if len(atom) > 256:
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: authority_scope[{idx}] exceeds 256 characters"
+                    )
+
+            # Validate status is a valid enum value
+            valid_statuses = {"active", "pending", "revoked", "expired"}
+            if payload["status"] not in valid_statuses:
+                raise AuthorityStoreMigrationError(
+                    f"line {line_num}: invalid status {payload['status']!r}"
+                )
+
+            # Validate timestamps
+            required_timestamps = ["created_at", "effective_at", "expires_at"]
+            for ts_field in required_timestamps:
+                if ts_field not in payload:
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: payload missing required timestamp {ts_field!r}"
+                    )
+                ts_value = payload[ts_field]
+                if not isinstance(ts_value, str):
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: {ts_field} must be string"
+                    )
+                try:
+                    parsed = datetime.fromisoformat(ts_value.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        raise AuthorityStoreMigrationError(
+                            f"line {line_num}: {ts_field} must be timezone-aware"
+                        )
+                except (ValueError, AttributeError) as exc:
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: {ts_field} has invalid timestamp format"
+                    ) from exc
+
+            # Validate timestamp ordering
+            created = datetime.fromisoformat(payload["created_at"].replace("Z", "+00:00"))
+            effective = datetime.fromisoformat(payload["effective_at"].replace("Z", "+00:00"))
+            expires = datetime.fromisoformat(payload["expires_at"].replace("Z", "+00:00"))
+
+            if effective < created:
+                raise AuthorityStoreMigrationError(
+                    f"line {line_num}: effective_at precedes created_at"
+                )
+            if expires <= effective:
+                raise AuthorityStoreMigrationError(
+                    f"line {line_num}: expires_at does not follow effective_at"
+                )
+
+            # Validate optional parent fields have valid types
+            if "parent_grant_id" in payload:
+                parent_id = payload["parent_grant_id"]
+                if parent_id is not None and not isinstance(parent_id, str):
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: parent_grant_id must be string or null"
+                    )
+
+            if "parent_grant_fingerprint" in payload:
+                parent_fp = payload["parent_grant_fingerprint"]
+                if parent_fp is not None and not isinstance(parent_fp, str):
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: parent_grant_fingerprint must be string or null"
+                    )
+
+            # Validate revocation fields are internally consistent
+            has_revoked_at = "revoked_at" in payload and payload["revoked_at"] is not None
+            has_revocation_reason = "revocation_reason" in payload and payload["revocation_reason"] is not None
+
+            if payload["status"] == "revoked":
+                if not has_revoked_at:
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: status is 'revoked' but revoked_at is missing"
+                    )
+            else:
+                if has_revoked_at or has_revocation_reason:
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: revocation fields present but status is not 'revoked'"
+                    )
+
+            # Handle duplicate records
             key = (payload["domain_id"], payload["mission_id"], payload["grant_id"])
+
+            # Compute canonical form for exact duplicate detection
+            canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+            if key in grants_by_key:
+                # Duplicate key found - check if exact duplicate or conflict
+                if canonical_payload != seen_exact[key]:
+                    raise AuthorityStoreMigrationError(
+                        f"line {line_num}: duplicate grant key {key!r} with conflicting authority definition"
+                    )
+                # Exact duplicate - last-write-wins for lifecycle snapshots is acceptable
+                # This allows legacy registry to have repeated lifecycle state snapshots
+
             grants_by_key[key] = payload
+            seen_exact[key] = canonical_payload
 
         return list(grants_by_key.values())
 
