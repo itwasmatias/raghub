@@ -118,6 +118,28 @@ from federation.credential_broker import (
     CredentialLease,
     CredentialRef,
 )
+from federation.access_requirement import AccessRequirement
+from federation.access_connection import AccessConnection, ConnectionLifecycle
+from federation.authentication_session import (
+    AuthenticationSession,
+    AuthenticationState,
+    create_authentication_session,
+)
+from federation.credential_backend import (
+    CredentialBackend,
+    CredentialBackendError,
+    CredentialNotFoundError,
+    InMemoryCredentialBackend,
+)
+from federation.access_credential_store import (
+    AccessCredentialError,
+    AccessCredentialStore,
+    AuthSessionConflictError,
+    AuthSessionNotFoundError,
+    ConnectionConflictError,
+    ConnectionLifecycleError,
+    ConnectionNotFoundError,
+)
 from federation.registry import NodeRegistry
 from federation.routing_decision import ExcludedNode, RoutingDecision, RoutingOutcome
 from federation.task_assignment import TaskAssignment
@@ -255,6 +277,24 @@ __all__ = [
     "CredentialBrokerNotFoundError",
     "CredentialLease",
     "CredentialRef",
+    # Access & Credential Broker v0.1
+    "AccessRequirement",
+    "AccessConnection",
+    "ConnectionLifecycle",
+    "AuthenticationSession",
+    "AuthenticationState",
+    "create_authentication_session",
+    "CredentialBackend",
+    "CredentialBackendError",
+    "CredentialNotFoundError",
+    "InMemoryCredentialBackend",
+    "AccessCredentialError",
+    "AccessCredentialStore",
+    "AuthSessionConflictError",
+    "AuthSessionNotFoundError",
+    "ConnectionConflictError",
+    "ConnectionLifecycleError",
+    "ConnectionNotFoundError",
     # Task Routing
     "AuthorizationLevel",
     "TaskRequest",
