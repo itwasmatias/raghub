@@ -126,10 +126,19 @@ from federation.authentication_session import (
     create_authentication_session,
 )
 from federation.credential_backend import (
-    CredentialBackend,
+    CredentialBackend,  # INTERNAL: Trusted primitive - use AccessCredentialBroker for authority-gated access
     CredentialBackendError,
     CredentialNotFoundError,
-    InMemoryCredentialBackend,
+    InMemoryCredentialBackend,  # INTERNAL: Test-only - never use in production
+)
+from federation.access_credential_broker import (
+    AccessCredentialBroker,
+    AccessCredentialBrokerError,
+    AccessCredentialAuthorityError,
+    AccessCredentialConnectionError,
+    AccessCredentialLease,
+    AccessCredentialNotFoundError,
+    AccessCredentialRequest,
 )
 from federation.access_credential_store import (
     AccessCredentialError,
@@ -284,10 +293,20 @@ __all__ = [
     "AuthenticationSession",
     "AuthenticationState",
     "create_authentication_session",
+    # Credential Backend (INTERNAL - use AccessCredentialBroker for authority-gated access)
     "CredentialBackend",
     "CredentialBackendError",
     "CredentialNotFoundError",
     "InMemoryCredentialBackend",
+    # Access Credential Broker (authority-gated)
+    "AccessCredentialBroker",
+    "AccessCredentialBrokerError",
+    "AccessCredentialAuthorityError",
+    "AccessCredentialConnectionError",
+    "AccessCredentialLease",
+    "AccessCredentialNotFoundError",
+    "AccessCredentialRequest",
+    # Access Credential Store
     "AccessCredentialError",
     "AccessCredentialStore",
     "AuthSessionConflictError",

@@ -729,8 +729,13 @@ def test_credential_backend_stores_secrets_safely():
     assert TEST_SECRET.decode() not in repr(backend)
 
 
-def test_credential_backend_prevents_unauthorized_access():
-    """Test credential backend prevents unauthorized access."""
+def test_credential_backend_rejects_invalid_reference():
+    """Test credential backend rejects invalid backend reference.
+
+    This test verifies low-level backend reference validation only.
+    It does NOT test MissionaryX authority gating.
+    For authority tests, see test_access_broker_authority_* tests.
+    """
     backend = InMemoryCredentialBackend()
 
     backend.store_credential("backend-ref-1", TEST_SECRET)
@@ -986,6 +991,630 @@ def test_access_connection_deep_immutability():
     input_scopes.append("scope-c")
 
     assert len(conn.granted_scopes) == 2
+
+
+# ==================================================
+# TEST AREA 32-35: MISSIONARYX AUTHORITY GATING
+# ==================================================
+
+
+def _setup_authority_fixture(tmp_path):
+    """Setup complete authority testing infrastructure."""
+    from federation import (
+        AccessCredentialBroker,
+        AccessCredentialRequest,
+        AgentIdentity,
+        DelegationGrant,
+        DelegationGrantRegistry,
+        DurableAgentIdentityRegistry,
+    )
+    from federation.control_domain import ControlDomain
+    from federation.control_domain_registry import DurableControlDomainRegistry
+
+    KEY = b"test-authority-integrity-key-0001-min32bytes-required"
+    clock = MutableClock()
+
+    # Setup registries
+    domain_registry = DurableControlDomainRegistry(
+        tmp_path / "domains.jsonl",
+        integrity_key=KEY,
+    )
+    domain_registry.register(
+        ControlDomain(
+            domain_id="domain-a",
+            name="Domain A",
+            owner="owner-a",
+            created_at=NOW,
+        )
+    )
+    domain_registry.register(
+        ControlDomain(
+            domain_id="domain-b",
+            name="Domain B",
+            owner="owner-b",
+            created_at=NOW,
+        )
+    )
+
+    identity_registry = DurableAgentIdentityRegistry(
+        tmp_path / "identities.jsonl",
+        domain_registry=domain_registry,
+        integrity_key=KEY,
+        clock=clock,
+    )
+    identity_registry.register(
+        AgentIdentity(
+            agent_id="agent-a",
+            domain_id="domain-a",
+            name="Agent A",
+            created_at=NOW,
+        )
+    )
+    identity_registry.register(
+        AgentIdentity(
+            agent_id="agent-b",
+            domain_id="domain-a",
+            name="Agent B",
+            created_at=NOW,
+        )
+    )
+
+    grant_registry = DelegationGrantRegistry(
+        tmp_path / "grants.jsonl",
+        domain_registry=domain_registry,
+        identity_registry=identity_registry,
+        integrity_key=KEY,
+        clock=clock,
+    )
+
+    # Setup credential infrastructure
+    credential_store = AccessCredentialStore(tmp_path / "credentials.db", clock=clock)
+    backend = InMemoryCredentialBackend()
+    backend.store_credential("backend-ref-1", TEST_SECRET)
+
+    # Register connection
+    credential_store.register_connection(
+        connection_id="conn-1",
+        domain_id="domain-a",
+        provider="google",
+        account_id="user@example.com",
+        granted_scopes=("scope-a", "scope-b"),
+        credential_backend_ref="backend-ref-1",
+    )
+
+    broker = AccessCredentialBroker(
+        credential_store=credential_store,
+        credential_backend=backend,
+        domain_registry=domain_registry,
+        identity_registry=identity_registry,
+        grant_registry=grant_registry,
+    )
+
+    return broker, grant_registry, credential_store, backend
+
+
+def test_access_broker_authority_connection_without_grant_denied(tmp_path):
+    """Test connection exists but no grant denies access."""
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    # Connection exists, but NO grant registered
+    request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-nonexistent",
+        connection_id="conn-1",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+
+    from federation import AccessCredentialNotFoundError
+
+    with pytest.raises(AccessCredentialNotFoundError, match="Grant.*not found"):
+        broker.authorize(request, evaluation_time=NOW)
+
+
+def test_access_broker_authority_wrong_capability_denied(tmp_path):
+    """Test valid connection but wrong capability denies access."""
+    from federation import (
+        AccessCredentialAuthorityError,
+        AccessCredentialRequest,
+        DelegationGrant,
+    )
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    # Register grant with specific capability
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",  # Self-grant for test
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),  # Far future for test stability
+        )
+    )
+
+    # Request different capability
+    request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-1",
+        capability="google.drive.write",  # NOT granted!
+        resource="drive:user@example.com",
+    )
+
+    with pytest.raises(AccessCredentialAuthorityError, match="authority denied.*capability"):
+        broker.authorize(request, evaluation_time=NOW)
+
+
+def test_access_broker_authority_wrong_resource_denied(tmp_path):
+    """Test valid connection but wrong resource denies access."""
+    from federation import (
+        AccessCredentialAuthorityError,
+        AccessCredentialRequest,
+        DelegationGrant,
+    )
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),  # Far future for test stability
+        )
+    )
+
+    # Request different resource
+    request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-1",
+        capability="google.drive.read",
+        resource="drive:other@example.com",  # NOT in scope!
+    )
+
+    with pytest.raises(AccessCredentialAuthorityError, match="authority denied.*resource"):
+        broker.authorize(request, evaluation_time=NOW)
+
+
+def test_access_broker_authority_wrong_mission_denied(tmp_path):
+    """Test valid connection but wrong mission denies access."""
+    from federation import (
+        AccessCredentialAuthorityError,
+        AccessCredentialRequest,
+        DelegationGrant,
+    )
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",  # Bound to mission-1
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),  # Far future for test stability
+        )
+    )
+
+    # Request with different mission
+    request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-2",  # WRONG mission!
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-1",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+
+    with pytest.raises(AccessCredentialAuthorityError, match="authority denied.*mission"):
+        broker.authorize(request, evaluation_time=NOW)
+
+
+def test_access_broker_authority_wrong_grantee_denied(tmp_path):
+    """Test grant for different agent denies access."""
+    from federation import (
+        AccessCredentialAuthorityError,
+        AccessCredentialRequest,
+        DelegationGrant,
+    )
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    # Grant to agent-a
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",  # Granted to agent-a
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),  # Far future for test stability
+        )
+    )
+
+    # agent-b tries to use it
+    request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-b",  # WRONG agent!
+        grant_id="grant-1",
+        connection_id="conn-1",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+
+    # The grantee_identity check in evaluate_grant compares the provided
+    # grantee_identity (agent-b) against the grant's grantee (agent-a) and denies
+    with pytest.raises(AccessCredentialAuthorityError, match="authority denied"):
+        broker.authorize(request, evaluation_time=NOW)
+
+
+def test_access_broker_authority_full_valid_authorization_succeeds(tmp_path):
+    """Test fully valid authority grants access."""
+    from federation import AccessCredentialRequest, DelegationGrant
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),  # Far future for test stability
+        )
+    )
+
+    request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-1",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+
+    lease = broker.authorize(request, evaluation_time=NOW)
+    assert lease.secret_bytes() == TEST_SECRET
+    assert lease.connection.connection_id == "conn-1"
+    assert lease.request.capability == "google.drive.read"
+    assert lease.request.resource == "drive:user@example.com"
+    assert lease.decision.allowed is True
+
+
+def test_access_broker_cross_mission_connection_reuse_denied(tmp_path):
+    """Test connection authorized for M1 cannot be reused for M2 without grant."""
+    from federation import (
+        AccessCredentialAuthorityError,
+        AccessCredentialRequest,
+        DelegationGrant,
+    )
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    # Grant for mission-1
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-m1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),  # Far future for test stability
+        )
+    )
+
+    # First request for mission-1 succeeds
+    request_m1 = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-m1",
+        connection_id="conn-1",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+
+    lease_m1 = broker.authorize(request_m1)
+    assert lease_m1.secret_bytes() == TEST_SECRET
+
+    # Now try to use same connection for mission-2 with NO M2 grant
+    request_m2 = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-2",  # Different mission
+        agent_id="agent-a",
+        grant_id="grant-m1",  # Wrong grant (bound to mission-1)
+        connection_id="conn-1",  # Same connection
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+
+    # Must be denied - prior M1 authorization doesn't grant M2 access
+    with pytest.raises(AccessCredentialAuthorityError, match="authority denied.*mission"):
+        broker.authorize(request_m2)
+
+
+def test_access_broker_confused_deputy_field_alteration_attacks(tmp_path):
+    """Test confused-deputy attacks by altering each authority field."""
+    from federation import (
+        AccessCredentialAuthorityError,
+        AccessCredentialNotFoundError,
+        AccessCredentialRequest,
+        DelegationGrant,
+    )
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),  # Far future for test stability
+        )
+    )
+
+    # Valid baseline
+    valid_request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-1",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+
+    # Baseline succeeds
+    lease = broker.authorize(valid_request)
+    assert lease.secret_bytes() == TEST_SECRET
+
+    # Attack 1: Different domain
+    with pytest.raises(AccessCredentialNotFoundError, match="not found"):
+        broker.authorize(
+            AccessCredentialRequest(
+                domain_id="domain-b",  # ALTERED
+                mission_id="mission-1",
+                agent_id="agent-a",
+                grant_id="grant-1",
+                connection_id="conn-1",
+                capability="google.drive.read",
+                resource="drive:user@example.com",
+            )
+        )
+
+    # Attack 2: Different mission
+    with pytest.raises(AccessCredentialAuthorityError, match="authority denied"):
+        broker.authorize(
+            AccessCredentialRequest(
+                domain_id="domain-a",
+                mission_id="mission-999",  # ALTERED
+                agent_id="agent-a",
+                grant_id="grant-1",
+                connection_id="conn-1",
+                capability="google.drive.read",
+                resource="drive:user@example.com",
+            )
+        )
+
+    # Attack 3: Different agent
+    with pytest.raises(AccessCredentialAuthorityError, match="authority denied"):
+        broker.authorize(
+            AccessCredentialRequest(
+                domain_id="domain-a",
+                mission_id="mission-1",
+                agent_id="agent-b",  # ALTERED
+                grant_id="grant-1",
+                connection_id="conn-1",
+                capability="google.drive.read",
+                resource="drive:user@example.com",
+            )
+        )
+
+    # Attack 4: Different capability
+    with pytest.raises(AccessCredentialAuthorityError, match="authority denied.*capability"):
+        broker.authorize(
+            AccessCredentialRequest(
+                domain_id="domain-a",
+                mission_id="mission-1",
+                agent_id="agent-a",
+                grant_id="grant-1",
+                connection_id="conn-1",
+                capability="google.drive.write",  # ALTERED
+                resource="drive:user@example.com",
+            )
+        )
+
+    # Attack 5: Different resource
+    with pytest.raises(AccessCredentialAuthorityError, match="authority denied.*resource"):
+        broker.authorize(
+            AccessCredentialRequest(
+                domain_id="domain-a",
+                mission_id="mission-1",
+                agent_id="agent-a",
+                grant_id="grant-1",
+                connection_id="conn-1",
+                capability="google.drive.read",
+                resource="drive:evil@example.com",  # ALTERED
+            )
+        )
+
+    # Attack 6: Different connection (not found)
+    with pytest.raises(AccessCredentialNotFoundError, match="Connection.*not found"):
+        broker.authorize(
+            AccessCredentialRequest(
+                domain_id="domain-a",
+                mission_id="mission-1",
+                agent_id="agent-a",
+                grant_id="grant-1",
+                connection_id="conn-evil",  # ALTERED
+                capability="google.drive.read",
+                resource="drive:user@example.com",
+            )
+        )
+
+
+def test_access_broker_secret_not_exposed_in_lease_repr(tmp_path):
+    """Test secret is redacted from AccessCredentialLease repr/str/to_dict."""
+    from federation import AccessCredentialRequest, DelegationGrant
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),  # Far future for test stability
+        )
+    )
+
+    request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-1",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+
+    lease = broker.authorize(request)
+
+    # Secret is accessible via methods
+    assert lease.secret_bytes() == TEST_SECRET
+    assert lease.secret_text() == TEST_SECRET.decode()
+
+    # But NOT in repr/str/to_dict
+    assert TEST_SECRET.decode() not in repr(lease)
+    assert TEST_SECRET.decode() not in str(lease)
+    assert TEST_SECRET.decode() not in json.dumps(lease.to_dict())
+
+
+# ==================================================
+# TEST AREA 36: AUTH SESSION MULTIPROCESS CONCURRENCY
+# ==================================================
+
+
+def _auth_session_complete_worker(db_path, session_id, domain_id, provider, mission_id):
+    """Worker process for concurrent auth session completion."""
+    from pathlib import Path
+    from federation import (
+        AccessCredentialStore,
+        AuthSessionConflictError,
+        AuthSessionNotFoundError,
+    )
+
+    try:
+        store = AccessCredentialStore(Path(db_path))
+        completed = store.complete_auth_session(
+            session_id=session_id,
+            domain_id=domain_id,
+            provider=provider,
+            mission_id=mission_id,
+        )
+        return {"success": True, "state": completed.state.value}
+    except AuthSessionConflictError as e:
+        return {"success": False, "error": "conflict", "message": str(e)}
+    except AuthSessionNotFoundError as e:
+        return {"success": False, "error": "not_found", "message": str(e)}
+    except Exception as e:
+        return {"success": False, "error": "unexpected", "message": str(e)}
+
+
+def test_auth_session_concurrent_completion_exactly_once():
+    """Test authentication session concurrent completion succeeds exactly once.
+
+    This is a genuine multiprocess concurrency test with independent processes
+    racing to complete the same session.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        db_path = tmp_path / "test.db"
+        store = AccessCredentialStore(db_path, clock=MutableClock())
+
+        # Create session
+        store.create_auth_session(
+            session_id="session-race",
+            domain_id="domain-a",
+            provider="google",
+            mission_id="mission-1",
+            expires_at=NOW + timedelta(days=365),  # Far future for test
+        )
+
+        # Race two processes to complete it
+        with multiprocessing.Pool(processes=2) as pool:
+            results = pool.starmap(
+                _auth_session_complete_worker,
+                [
+                    (str(db_path), "session-race", "domain-a", "google", "mission-1"),
+                    (str(db_path), "session-race", "domain-a", "google", "mission-1"),
+                ],
+            )
+
+        # Exactly one must succeed
+        successes = [r for r in results if r["success"]]
+        failures = [r for r in results if not r["success"]]
+
+        assert len(successes) == 1, f"Expected 1 success, got {len(successes)}: {results}"
+        assert len(failures) == 1, f"Expected 1 failure, got {len(failures)}: {results}"
+
+        # Failure must be semantic conflict, not raw sqlite error
+        assert failures[0]["error"] == "conflict", f"Expected 'conflict', got {failures[0]}"
+        assert "terminal state" in failures[0]["message"].lower(), f"Wrong error message: {failures[0]['message']}"
+
+        # Verify durability
+        store2 = AccessCredentialStore(db_path)
+        session = store2.get_auth_session(
+            session_id="session-race",
+            domain_id="domain-a",
+        )
+        assert session.state.value == "completed"
 
 
 if __name__ == "__main__":
