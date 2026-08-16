@@ -570,6 +570,37 @@ class AccessCredentialStore:
                 conn.rollback()
                 raise
 
+    def get_auth_session(self, *, session_id: str, domain_id: str) -> AuthenticationSession:
+        """Get an authentication session by ID and domain.
+
+        Domain-scoped read-only access for durability verification.
+
+        Raises:
+            AuthSessionNotFoundError: If session doesn't exist in the specified domain
+        """
+        session_id = _require_text(session_id, "session_id")
+        domain_id = _require_text(domain_id, "domain_id")
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                """
+                SELECT session_id, domain_id, provider, mission_id, state, initiated_at,
+                       expires_at, challenge_data, completed_at, failed_at, failure_reason,
+                       cancelled_at, cancellation_reason
+                FROM authentication_sessions
+                WHERE domain_id = ? AND session_id = ?
+                """,
+                (domain_id, session_id),
+            )
+            row = cursor.fetchone()
+
+            if row is None:
+                raise AuthSessionNotFoundError(
+                    f"Session {session_id!r} not found in domain {domain_id!r}"
+                )
+
+            return self._session_from_row(row)
+
     def complete_auth_session(
         self,
         *,

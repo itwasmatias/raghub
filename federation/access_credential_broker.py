@@ -82,15 +82,90 @@ class AccessCredentialRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class AccessCredentialLease:
-    """Ephemeral credential authorization for one authorized access operation.
+class AccessCredentialAuthorization:
+    """Non-secret authorization evidence for credential use.
+
+    This object represents MissionaryX authority to use a credential.
+    It contains NO raw secret material and is safe to:
+    - Serialize to JSON/dict
+    - Log for audit
+    - Store in databases
+    - Include in repr/str output
+    - Pass across trust boundaries
 
     Contains:
     - Full authority binding (domain, mission, agent, grant, capability, resource)
     - Connection and provider binding
     - Authority decision evidence
     - Time bounds
-    - Secret material (redacted from repr/str/to_dict)
+
+    This object does NOT imply:
+    - Credential has been retrieved
+    - Credential has been used
+    - Effect has been dispatched
+    - Operation has succeeded
+    """
+
+    authorization_id: str  # Unique identifier for this authorization instance
+    request: AccessCredentialRequest
+    connection_id: str
+    provider: str
+    grant_fingerprint: str
+    decision: AuthorityDecision
+    required_provider_scopes: tuple[str, ...]
+    granted_provider_scopes: tuple[str, ...]
+    issued_at: datetime
+    expires_at: datetime | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "authorization_id", _require_text(self.authorization_id, "authorization_id"))
+        if type(self.request) is not AccessCredentialRequest:
+            raise TypeError("request must be an AccessCredentialRequest")
+        object.__setattr__(self, "connection_id", _require_text(self.connection_id, "connection_id"))
+        object.__setattr__(self, "provider", _require_text(self.provider, "provider"))
+        object.__setattr__(self, "grant_fingerprint", _require_text(self.grant_fingerprint, "grant_fingerprint"))
+        if type(self.decision) is not AuthorityDecision:
+            raise TypeError("decision must be an AuthorityDecision")
+        if not isinstance(self.required_provider_scopes, tuple):
+            raise TypeError("required_provider_scopes must be a tuple")
+        if not isinstance(self.granted_provider_scopes, tuple):
+            raise TypeError("granted_provider_scopes must be a tuple")
+        if not isinstance(self.issued_at, datetime) or self.issued_at.tzinfo is None:
+            raise TypeError("issued_at must be a timezone-aware datetime")
+        object.__setattr__(self, "issued_at", self.issued_at.astimezone(timezone.utc))
+        if self.expires_at is not None:
+            if not isinstance(self.expires_at, datetime) or self.expires_at.tzinfo is None:
+                raise TypeError("expires_at must be a timezone-aware datetime or None")
+            object.__setattr__(self, "expires_at", self.expires_at.astimezone(timezone.utc))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return safe serializable representation."""
+        return {
+            "authorization_id": self.authorization_id,
+            "domain_id": self.request.domain_id,
+            "mission_id": self.request.mission_id,
+            "agent_id": self.request.agent_id,
+            "grant_id": self.request.grant_id,
+            "grant_fingerprint": self.grant_fingerprint,
+            "connection_id": self.connection_id,
+            "provider": self.provider,
+            "capability": self.request.capability,
+            "resource": self.request.resource,
+            "required_provider_scopes": list(self.required_provider_scopes),
+            "granted_provider_scopes": list(self.granted_provider_scopes),
+            "issued_at": self.issued_at.isoformat(),
+            "expires_at": None if self.expires_at is None else self.expires_at.isoformat(),
+            "authority_granted": self.decision.allowed,
+        }
+
+
+# DEPRECATED: Use AccessCredentialAuthorization instead
+# This class is kept temporarily for compatibility but will be removed
+@dataclass(frozen=True, slots=True)
+class AccessCredentialLease:
+    """DEPRECATED: Use AccessCredentialAuthorization instead.
+
+    This class conflates authorization with secret material and will be removed.
     """
 
     request: AccessCredentialRequest
@@ -202,23 +277,33 @@ class AccessCredentialBroker:
         request: AccessCredentialRequest,
         *,
         evaluation_time: datetime | None = None,
-    ) -> AccessCredentialLease:
-        """Authorize and release credential for the requested access operation.
+        required_provider_scopes: tuple[str, ...] = (),
+    ) -> AccessCredentialAuthorization:
+        """Authorize credential use for the requested access operation.
+
+        This method validates MissionaryX delegation authority and provider scope
+        requirements, then issues a non-secret authorization object.
+
+        The authorization object contains NO raw credential material and is safe to
+        serialize, log, and store.
 
         Args:
             request: The access credential request
             evaluation_time: Time for authority evaluation (defaults to now)
+            required_provider_scopes: Provider-specific scopes required for this operation
 
         Returns:
-            AccessCredentialLease with secret material and full authority binding
+            AccessCredentialAuthorization with authority evidence (NO secrets)
 
         Raises:
-            AccessCredentialAuthorityError: If authority is denied
+            AccessCredentialAuthorityError: If authority is denied or scopes insufficient
             AccessCredentialNotFoundError: If connection/grant/domain not found
             AccessCredentialConnectionError: If connection is not active/usable
         """
         if type(request) is not AccessCredentialRequest:
             raise TypeError("request must be an AccessCredentialRequest")
+        if not isinstance(required_provider_scopes, tuple):
+            raise TypeError("required_provider_scopes must be a tuple")
 
         now = evaluation_time if evaluation_time is not None else self._now()
 
@@ -247,7 +332,18 @@ class AccessCredentialBroker:
                 f"Connection {request.connection_id!r} is not active: {connection.lifecycle.value}"
             )
 
-        # Step 4: Resolve grant
+        # Step 4: Enforce provider scope requirements
+        # Required scopes must be subset of granted scopes
+        required_scopes_set = set(required_provider_scopes)
+        granted_scopes_set = set(connection.granted_scopes)
+
+        if not required_scopes_set.issubset(granted_scopes_set):
+            missing_scopes = required_scopes_set - granted_scopes_set
+            raise AccessCredentialAuthorityError(
+                f"Connection {request.connection_id!r} missing required provider scopes: {sorted(missing_scopes)}"
+            )
+
+        # Step 5: Resolve grant
         try:
             grant = self._grant_registry.get(
                 request.grant_id,
@@ -259,7 +355,7 @@ class AccessCredentialBroker:
                 f"Grant {request.grant_id!r} not found"
             ) from exc
 
-        # Step 5: Resolve grantee identity
+        # Step 6: Resolve grantee identity
         try:
             grantee_identity = self._identity_registry.get(
                 agent_id=request.agent_id,
@@ -270,7 +366,7 @@ class AccessCredentialBroker:
                 f"Agent identity {request.agent_id!r} not found in domain {request.domain_id!r}"
             ) from exc
 
-        # Step 6: Evaluate MissionaryX delegation authority
+        # Step 7: Evaluate MissionaryX delegation authority
         decision = evaluate_grant(
             control_domain=domain,
             grant=grant,
@@ -281,33 +377,33 @@ class AccessCredentialBroker:
             evaluation_time=now,
         )
 
-        # Step 7: Enforce authority decision
+        # Step 8: Enforce authority decision
         if not decision.allowed:
             raise AccessCredentialAuthorityError(
                 f"MissionaryX authority denied: {decision.reason} ({decision.denial_code.value if decision.denial_code else 'unknown'})"
             )
 
-        # Step 8: Resolve secret from trusted backend
-        # This is the only point where raw credential material is accessed
-        try:
-            secret = self._credential_backend.resolve_credential(connection.credential_backend_ref)
-        except Exception as exc:
-            raise AccessCredentialNotFoundError(
-                f"Credential backend reference {connection.credential_backend_ref!r} could not be resolved"
-            ) from exc
-
-        # Step 9: Issue time-bounded credential lease
+        # Step 9: Issue non-secret authorization
+        # Raw credential resolution is NOT performed here - authorization is separate from credential use
         issued_at = self._now()
         expires_at = grant.expires_at if grant.expires_at is not None else None
 
-        return AccessCredentialLease(
+        # Generate unique authorization ID
+        import hashlib
+        auth_id_input = f"{request.domain_id}:{request.mission_id}:{request.agent_id}:{request.grant_id}:{request.connection_id}:{request.capability}:{request.resource}:{issued_at.isoformat()}"
+        authorization_id = "auth-" + hashlib.sha256(auth_id_input.encode()).hexdigest()[:32]
+
+        return AccessCredentialAuthorization(
+            authorization_id=authorization_id,
             request=request,
-            connection=connection,
+            connection_id=connection.connection_id,
+            provider=connection.provider,
             grant_fingerprint=grant.grant_fingerprint,
             decision=decision,
+            required_provider_scopes=required_provider_scopes,
+            granted_provider_scopes=connection.granted_scopes,
             issued_at=issued_at,
             expires_at=expires_at,
-            _secret=secret,
         )
 
 
@@ -315,8 +411,9 @@ __all__ = [
     "AccessCredentialBroker",
     "AccessCredentialBrokerError",
     "AccessCredentialAuthorityError",
+    "AccessCredentialAuthorization",  # Non-secret authorization (recommended)
     "AccessCredentialConnectionError",
-    "AccessCredentialLease",
+    "AccessCredentialLease",  # DEPRECATED: Will be removed
     "AccessCredentialNotFoundError",
     "AccessCredentialRequest",
 ]
