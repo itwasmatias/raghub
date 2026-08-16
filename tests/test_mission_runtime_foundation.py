@@ -430,23 +430,30 @@ def test_duplicate_checkpoint_sequence_rejected():
         )
 
 
-def _concurrent_transition_worker(db_path, domain, mission_id, worker_id, to_state, result_queue):
-    """Worker function for concurrent transition attack test."""
+def _concurrent_transition_worker(db_path, domain, mission_id, expected_revision, worker_id, to_state, result_queue):
+    """Worker function for concurrent transition attack test.
+
+    Args:
+        db_path: Path to database
+        domain: ControlDomain identifier
+        mission_id: Mission identifier
+        expected_revision: The revision both workers should attempt to transition from
+        worker_id: Worker identifier for debugging
+        to_state: Target state for transition
+        result_queue: Queue to return results
+    """
     try:
         # Each worker creates its own connection via separate runtime
         runtime = MissionRuntime(db_path=db_path)
 
-        # Both workers read the same initial revision
-        _, current_state, revision, _ = runtime.get_mission(domain, mission_id)
-
-        # Small delay to ensure both workers start roughly simultaneously
+        # Small delay to ensure both workers acquire database connections roughly simultaneously
         time.sleep(0.01)
 
         # Both attempt transition with same expected_revision
         if to_state == MissionLifecycle.PAUSED:
-            new_rev = runtime.pause_mission(domain, mission_id, revision, reason=f"Worker {worker_id}")
+            new_rev = runtime.pause_mission(domain, mission_id, expected_revision, reason=f"Worker {worker_id}")
         elif to_state == MissionLifecycle.COMPLETED:
-            new_rev = runtime.complete_mission(domain, mission_id, revision, reason=f"Worker {worker_id}")
+            new_rev = runtime.complete_mission(domain, mission_id, expected_revision, reason=f"Worker {worker_id}")
 
         # Success
         result_queue.put(("success", worker_id, new_rev))
@@ -464,12 +471,11 @@ def test_real_concurrent_process_atomic_update():
     This test uses separate processes with separate database connections to prove
     the UPDATE revision check is atomic at the database level, not just Python-level.
 
-    KNOWN LIMITATION: This test is flaky in SQLite WAL mode due to snapshot isolation.
-    The UPDATE rowcount check provides atomicity, but WAL mode allows rare races where
-    both workers can see the same revision before either commits. For production use,
-    consider PostgreSQL or another RDBMS with stricter serialization.
+    SQLite BEGIN IMMEDIATE semantics guarantee that the write transaction is acquired
+    before the SELECT, preventing concurrent authoritative writes. A second concurrent
+    writer must wait or fail with SQLITE_BUSY; exactly one transition succeeds,
+    the other receives MissionRevisionConflictError.
     """
-    pytest.skip("Flaky in SQLite WAL mode - see test docstring for details")
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test_concurrent.db"
         domain = "test-domain"
@@ -491,16 +497,16 @@ def test_real_concurrent_process_atomic_update():
         assert initial_rev == 2
 
         # ATTACK: Two separate processes attempt conflicting transitions
-        # Both read revision 2, both try to transition
+        # Both use the same initial revision, both try to transition
         result_queue = multiprocessing.Queue()
 
         worker1 = multiprocessing.Process(
             target=_concurrent_transition_worker,
-            args=(db_path, domain, mission_id, 1, MissionLifecycle.PAUSED, result_queue)
+            args=(db_path, domain, mission_id, initial_rev, 1, MissionLifecycle.PAUSED, result_queue)
         )
         worker2 = multiprocessing.Process(
             target=_concurrent_transition_worker,
-            args=(db_path, domain, mission_id, 2, MissionLifecycle.COMPLETED, result_queue)
+            args=(db_path, domain, mission_id, initial_rev, 2, MissionLifecycle.COMPLETED, result_queue)
         )
 
         # Start both workers simultaneously
