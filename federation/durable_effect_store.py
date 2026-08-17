@@ -727,12 +727,6 @@ class DurableEffectStore:
                                     f"supported version {SCHEMA_VERSION}. Upgrade required."
                                 )
                             if current_version == 1:
-                                self._validate_schema_contract(
-                                    connection,
-                                    expected_tables=_EXPECTED_SCHEMA_TABLES_V1,
-                                    expected_indexes=_EXPECTED_INDEXES_V1,
-                                    expected_version=1,
-                                )
                                 try:
                                     connection.execute("BEGIN IMMEDIATE")
                                 except sqlite3.OperationalError as exc:
@@ -766,6 +760,12 @@ class DurableEffectStore:
                                                 self._ensure_wal_mode(wal_connection, self.database_path)
                                         return
                                     continue
+                                self._validate_schema_contract(
+                                    connection,
+                                    expected_tables=_EXPECTED_SCHEMA_TABLES_V1,
+                                    expected_indexes=_EXPECTED_INDEXES_V1,
+                                    expected_version=1,
+                                )
                                 _execute_sql_script(connection, self.MIGRATIONS[1][1])
                                 connection.execute("DELETE FROM effect_store_schema")
                                 connection.execute(
