@@ -137,7 +137,6 @@ from federation.access_credential_broker import (
     AccessCredentialAuthorityError,
     AccessCredentialAuthorization,
     AccessCredentialConnectionError,
-    AccessCredentialLease,  # DEPRECATED - use AccessCredentialAuthorization
     AccessCredentialNotFoundError,
     AccessCredentialRequest,
 )
@@ -305,7 +304,6 @@ __all__ = [
     "AccessCredentialAuthorityError",
     "AccessCredentialAuthorization",
     "AccessCredentialConnectionError",
-    "AccessCredentialLease",  # DEPRECATED
     "AccessCredentialNotFoundError",
     "AccessCredentialRequest",
     # Access Credential Store

@@ -159,69 +159,6 @@ class AccessCredentialAuthorization:
         }
 
 
-# DEPRECATED: Use AccessCredentialAuthorization instead
-# This class is kept temporarily for compatibility but will be removed
-@dataclass(frozen=True, slots=True)
-class AccessCredentialLease:
-    """DEPRECATED: Use AccessCredentialAuthorization instead.
-
-    This class conflates authorization with secret material and will be removed.
-    """
-
-    request: AccessCredentialRequest
-    connection: AccessConnection
-    grant_fingerprint: str
-    decision: AuthorityDecision
-    issued_at: datetime
-    expires_at: datetime | None
-    _secret: bytes = field(repr=False, compare=False, hash=False)
-
-    def __post_init__(self) -> None:
-        if type(self.request) is not AccessCredentialRequest:
-            raise TypeError("request must be an AccessCredentialRequest")
-        if type(self.connection) is not AccessConnection:
-            raise TypeError("connection must be an AccessConnection")
-        object.__setattr__(self, "grant_fingerprint", _require_text(self.grant_fingerprint, "grant_fingerprint"))
-        if type(self.decision) is not AuthorityDecision:
-            raise TypeError("decision must be an AuthorityDecision")
-        if not isinstance(self.issued_at, datetime) or self.issued_at.tzinfo is None:
-            raise TypeError("issued_at must be a timezone-aware datetime")
-        object.__setattr__(self, "issued_at", self.issued_at.astimezone(timezone.utc))
-        if self.expires_at is not None:
-            if not isinstance(self.expires_at, datetime) or self.expires_at.tzinfo is None:
-                raise TypeError("expires_at must be a timezone-aware datetime or None")
-            object.__setattr__(self, "expires_at", self.expires_at.astimezone(timezone.utc))
-        if type(self._secret) is not bytes:
-            raise TypeError("secret material must be bytes")
-        if not self._secret:
-            raise ValueError("secret material must be non-empty")
-
-    def secret_bytes(self) -> bytes:
-        """Return secret as bytes."""
-        return bytes(self._secret)
-
-    def secret_text(self, encoding: str = "utf-8") -> str:
-        """Return secret as text."""
-        return self._secret.decode(encoding)
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return safe serializable representation (NO raw secrets)."""
-        return {
-            "domain_id": self.request.domain_id,
-            "mission_id": self.request.mission_id,
-            "agent_id": self.request.agent_id,
-            "grant_id": self.request.grant_id,
-            "grant_fingerprint": self.grant_fingerprint,
-            "connection_id": self.connection.connection_id,
-            "provider": self.connection.provider,
-            "capability": self.request.capability,
-            "resource": self.request.resource,
-            "issued_at": self.issued_at.isoformat(),
-            "expires_at": None if self.expires_at is None else self.expires_at.isoformat(),
-            "authority_granted": self.decision.allowed,
-        }
-
-
 class AccessCredentialBroker:
     """Authority-gated credential broker for external provider access.
 
@@ -411,9 +348,8 @@ __all__ = [
     "AccessCredentialBroker",
     "AccessCredentialBrokerError",
     "AccessCredentialAuthorityError",
-    "AccessCredentialAuthorization",  # Non-secret authorization (recommended)
+    "AccessCredentialAuthorization",
     "AccessCredentialConnectionError",
-    "AccessCredentialLease",  # DEPRECATED: Will be removed
     "AccessCredentialNotFoundError",
     "AccessCredentialRequest",
 ]

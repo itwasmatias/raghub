@@ -1238,17 +1238,11 @@ def test_access_broker_authority_wrong_mission_denied(tmp_path):
         broker.authorize(request, evaluation_time=NOW)
 
 
-@pytest.mark.xfail(
-    reason="Depends on protected evaluate_grant enforcing grantee_identity validation. "
-    "Currently evaluate_grant (protected boundary) does not reject when wrong agent "
-    "uses a grant. This is a known issue in protected code that cannot be fixed here."
-)
 def test_access_broker_authority_wrong_grantee_denied(tmp_path):
     """Test grant for different agent denies access.
 
-    PROTECTED BOUNDARY DEPENDENCY: This test validates that evaluate_grant
-    (protected function in authority_evaluator.py) correctly enforces grantee
-    validation. Currently failing due to protected code behavior.
+    Validates that evaluate_grant correctly enforces grantee identity matching.
+    Agent B cannot use a grant issued to Agent A.
     """
     from federation import (
         AccessCredentialAuthorityError,
@@ -1460,11 +1454,19 @@ def test_access_broker_confused_deputy_field_alteration_attacks(tmp_path):
             )
         )
 
-    # Attack 3: Different agent (SKIPPED - depends on protected evaluate_grant grantee validation)
-    # See test_access_broker_authority_wrong_grantee_denied for dedicated xfailed test
-    # This attack is skipped because it depends on protected evaluate_grant enforcing
-    # grantee_identity validation, which currently does not work correctly
-    pytest.skip("Attack 3 depends on protected evaluate_grant grantee validation - see xfailed dedicated test")
+    # Attack 3: Different agent (grantee mismatch)
+    with pytest.raises(AccessCredentialAuthorityError, match="authority denied"):
+        broker.authorize(
+            AccessCredentialRequest(
+                domain_id="domain-a",
+                mission_id="mission-1",
+                agent_id="agent-b",  # ALTERED - wrong grantee
+                grant_id="grant-1",
+                connection_id="conn-1",
+                capability="google.drive.read",
+                resource="drive:user@example.com",
+            )
+        )
 
     # Attack 4: Different capability
     with pytest.raises(AccessCredentialAuthorityError, match="authority denied.*capability"):
