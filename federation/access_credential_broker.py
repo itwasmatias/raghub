@@ -19,6 +19,7 @@ from typing import Any
 
 from federation.access_connection import AccessConnection
 from federation.access_credential_store import AccessCredentialStore
+from federation.access_requirement import _canonicalize_provider_scopes
 from federation.agent_identity_registry import DurableAgentIdentityRegistry
 from federation.authority_evaluator import AuthorityDecision, evaluate_grant
 from federation.control_domain_registry import DurableControlDomainRegistry
@@ -68,6 +69,7 @@ class AccessCredentialRequest:
     agent_id: str
     grant_id: str
     connection_id: str
+    provider: str
     capability: str
     resource: str
 
@@ -77,6 +79,7 @@ class AccessCredentialRequest:
         object.__setattr__(self, "agent_id", _require_text(self.agent_id, "agent_id"))
         object.__setattr__(self, "grant_id", _require_text(self.grant_id, "grant_id"))
         object.__setattr__(self, "connection_id", _require_text(self.connection_id, "connection_id"))
+        object.__setattr__(self, "provider", _require_text(self.provider, "provider"))
         object.__setattr__(self, "capability", _require_text(self.capability, "capability"))
         object.__setattr__(self, "resource", _require_text(self.resource, "resource"))
 
@@ -269,16 +272,40 @@ class AccessCredentialBroker:
                 f"Connection {request.connection_id!r} is not active: {connection.lifecycle.value}"
             )
 
-        # Step 4: Enforce provider scope requirements
-        # Required scopes must be subset of granted scopes
-        required_scopes_set = set(required_provider_scopes)
-        granted_scopes_set = set(connection.granted_scopes)
-
-        if not required_scopes_set.issubset(granted_scopes_set):
-            missing_scopes = required_scopes_set - granted_scopes_set
+        # Step 3.5: Validate provider matches
+        if connection.provider != request.provider:
             raise AccessCredentialAuthorityError(
-                f"Connection {request.connection_id!r} missing required provider scopes: {sorted(missing_scopes)}"
+                f"Provider mismatch: request specifies {request.provider!r} but connection uses {connection.provider!r}"
             )
+
+        # Step 4: Canonicalize and enforce provider scope requirements
+        # Empty tuple is valid (no scopes required)
+        # Non-empty must be canonicalized using the existing helper
+        if required_provider_scopes:
+            # Canonicalize using existing helper (validates, deduplicates, sorts)
+            try:
+                canonical_required_scopes = _canonicalize_provider_scopes(
+                    required_provider_scopes,
+                    "required_provider_scopes"
+                )
+            except (TypeError, ValueError) as exc:
+                raise AccessCredentialAuthorityError(
+                    f"Invalid required_provider_scopes: {exc}"
+                ) from exc
+        else:
+            # Empty tuple means no provider scopes required
+            canonical_required_scopes = ()
+
+        # Check required scopes are subset of granted scopes
+        if canonical_required_scopes:
+            required_scopes_set = set(canonical_required_scopes)
+            granted_scopes_set = set(connection.granted_scopes)
+
+            if not required_scopes_set.issubset(granted_scopes_set):
+                missing_scopes = required_scopes_set - granted_scopes_set
+                raise AccessCredentialAuthorityError(
+                    f"Connection {request.connection_id!r} missing required provider scopes: {sorted(missing_scopes)}"
+                )
 
         # Step 5: Resolve grant
         try:
@@ -337,7 +364,7 @@ class AccessCredentialBroker:
             provider=connection.provider,
             grant_fingerprint=grant.grant_fingerprint,
             decision=decision,
-            required_provider_scopes=required_provider_scopes,
+            required_provider_scopes=canonical_required_scopes,
             granted_provider_scopes=connection.granted_scopes,
             issued_at=issued_at,
             expires_at=expires_at,

@@ -1106,6 +1106,7 @@ def test_access_broker_authority_connection_without_grant_denied(tmp_path):
         agent_id="agent-a",
         grant_id="grant-nonexistent",
         connection_id="conn-1",
+        provider="google",
         capability="google.drive.read",
         resource="drive:user@example.com",
     )
@@ -1146,6 +1147,7 @@ def test_access_broker_authority_wrong_capability_denied(tmp_path):
         agent_id="agent-a",
         grant_id="grant-1",
         connection_id="conn-1",
+        provider="google",
         capability="google.drive.write",  # NOT granted!
         resource="drive:user@example.com",
     )
@@ -1185,6 +1187,7 @@ def test_access_broker_authority_wrong_resource_denied(tmp_path):
         agent_id="agent-a",
         grant_id="grant-1",
         connection_id="conn-1",
+        provider="google",
         capability="google.drive.read",
         resource="drive:other@example.com",  # NOT in scope!
     )
@@ -1229,6 +1232,7 @@ def test_access_broker_authority_wrong_mission_denied(tmp_path):
         agent_id="agent-a",
         grant_id="grant-1",
         connection_id="conn-1",
+        provider="google",
         capability="google.drive.read",
         resource="drive:user@example.com",
     )
@@ -1274,6 +1278,7 @@ def test_access_broker_authority_wrong_grantee_denied(tmp_path):
         agent_id="agent-b",  # WRONG agent!
         grant_id="grant-1",
         connection_id="conn-1",
+        provider="google",
         capability="google.drive.read",
         resource="drive:user@example.com",
     )
@@ -1310,6 +1315,7 @@ def test_access_broker_authority_full_valid_authorization_succeeds(tmp_path):
         agent_id="agent-a",
         grant_id="grant-1",
         connection_id="conn-1",
+        provider="google",
         capability="google.drive.read",
         resource="drive:user@example.com",
     )
@@ -1361,6 +1367,7 @@ def test_access_broker_cross_mission_connection_reuse_denied(tmp_path):
         agent_id="agent-a",
         grant_id="grant-m1",
         connection_id="conn-1",
+        provider="google",
         capability="google.drive.read",
         resource="drive:user@example.com",
     )
@@ -1377,6 +1384,7 @@ def test_access_broker_cross_mission_connection_reuse_denied(tmp_path):
         agent_id="agent-a",
         grant_id="grant-m1",  # Wrong grant (bound to mission-1)
         connection_id="conn-1",  # Same connection
+        provider="google",
         capability="google.drive.read",
         resource="drive:user@example.com",
     )
@@ -1418,6 +1426,7 @@ def test_access_broker_confused_deputy_field_alteration_attacks(tmp_path):
         agent_id="agent-a",
         grant_id="grant-1",
         connection_id="conn-1",
+        provider="google",
         capability="google.drive.read",
         resource="drive:user@example.com",
     )
@@ -1435,6 +1444,7 @@ def test_access_broker_confused_deputy_field_alteration_attacks(tmp_path):
                 agent_id="agent-a",
                 grant_id="grant-1",
                 connection_id="conn-1",
+                provider="google",
                 capability="google.drive.read",
                 resource="drive:user@example.com",
             )
@@ -1449,6 +1459,7 @@ def test_access_broker_confused_deputy_field_alteration_attacks(tmp_path):
                 agent_id="agent-a",
                 grant_id="grant-1",
                 connection_id="conn-1",
+                provider="google",
                 capability="google.drive.read",
                 resource="drive:user@example.com",
             )
@@ -1463,6 +1474,7 @@ def test_access_broker_confused_deputy_field_alteration_attacks(tmp_path):
                 agent_id="agent-b",  # ALTERED - wrong grantee
                 grant_id="grant-1",
                 connection_id="conn-1",
+                provider="google",
                 capability="google.drive.read",
                 resource="drive:user@example.com",
             )
@@ -1477,6 +1489,7 @@ def test_access_broker_confused_deputy_field_alteration_attacks(tmp_path):
                 agent_id="agent-a",
                 grant_id="grant-1",
                 connection_id="conn-1",
+                provider="google",
                 capability="google.drive.write",  # ALTERED
                 resource="drive:user@example.com",
             )
@@ -1491,6 +1504,7 @@ def test_access_broker_confused_deputy_field_alteration_attacks(tmp_path):
                 agent_id="agent-a",
                 grant_id="grant-1",
                 connection_id="conn-1",
+                provider="google",
                 capability="google.drive.read",
                 resource="drive:evil@example.com",  # ALTERED
             )
@@ -1505,6 +1519,7 @@ def test_access_broker_confused_deputy_field_alteration_attacks(tmp_path):
                 agent_id="agent-a",
                 grant_id="grant-1",
                 connection_id="conn-evil",  # ALTERED
+                provider="google",
                 capability="google.drive.read",
                 resource="drive:user@example.com",
             )
@@ -1538,6 +1553,7 @@ def test_access_broker_authorization_contains_no_secrets(tmp_path):
         agent_id="agent-a",
         grant_id="grant-1",
         connection_id="conn-1",
+        provider="google",
         capability="google.drive.read",
         resource="drive:user@example.com",
     )
@@ -1650,6 +1666,630 @@ def test_auth_session_concurrent_completion_exactly_once():
             domain_id="domain-a",
         )
         assert session.state.value == "completed"
+
+
+# ==================================================
+# NEW TESTS: PROVIDER BINDING (Access Broker v0.1 Correction)
+# ==================================================
+
+
+def test_broker_provider_field_validation_rejects_blank(tmp_path):
+    """Test AccessCredentialRequest rejects blank provider field."""
+    from federation import AccessCredentialRequest
+
+    # Blank provider
+    with pytest.raises(ValueError, match="provider"):
+        AccessCredentialRequest(
+            domain_id="domain-a",
+            mission_id="mission-1",
+            agent_id="agent-a",
+            grant_id="grant-1",
+            connection_id="conn-1",
+            provider="",  # Blank!
+            capability="google.drive.read",
+            resource="drive:user@example.com",
+        )
+
+
+def test_broker_provider_field_validation_rejects_nul(tmp_path):
+    """Test AccessCredentialRequest rejects NUL-bearing provider field."""
+    from federation import AccessCredentialRequest
+
+    # NUL byte in provider
+    with pytest.raises(ValueError, match="NULL"):
+        AccessCredentialRequest(
+            domain_id="domain-a",
+            mission_id="mission-1",
+            agent_id="agent-a",
+            grant_id="grant-1",
+            connection_id="conn-1",
+            provider="google\x00evil",  # NUL byte!
+            capability="google.drive.read",
+            resource="drive:user@example.com",
+        )
+
+
+def test_broker_provider_match_authorizes(tmp_path):
+    """Test matching provider between request and connection authorizes."""
+    from federation import AccessCredentialRequest, DelegationGrant
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),
+        )
+    )
+
+    # Connection is google, request is google - should match
+    request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-1",
+        provider="google",  # Matches connection.provider
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+
+    authorization = broker.authorize(request, evaluation_time=NOW)
+    assert authorization.provider == "google"
+    assert authorization.decision.allowed is True
+
+
+def test_broker_provider_mismatch_denies(tmp_path):
+    """Test provider mismatch between request and connection denies."""
+    from federation import (
+        AccessCredentialAuthorityError,
+        AccessCredentialRequest,
+        DelegationGrant,
+    )
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    # Register a github connection
+    credential_store.register_connection(
+        connection_id="conn-github",
+        domain_id="domain-a",
+        provider="github",  # Different provider!
+        account_id="user-github@example.com",
+        granted_scopes=("repo", "user"),
+        credential_backend_ref="backend-ref-github",
+    )
+    backend.store_credential("backend-ref-github", b"github-token")
+
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["github.repo.read"],
+            resource_scope=["repo:user-github@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),
+        )
+    )
+
+    # Request says google but connection is github - must deny
+    request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-github",  # GitHub connection
+        provider="google",  # But request claims google!
+        capability="github.repo.read",
+        resource="repo:user-github@example.com",
+    )
+
+    with pytest.raises(AccessCredentialAuthorityError, match="Provider mismatch"):
+        broker.authorize(request, evaluation_time=NOW)
+
+
+# ==================================================
+# NEW TESTS: SCOPE CANONICALIZATION (Access Broker v0.1 Correction)
+# ==================================================
+
+
+def test_broker_empty_required_scopes_accepted(tmp_path):
+    """Test empty required_provider_scopes tuple is valid."""
+    from federation import AccessCredentialRequest, DelegationGrant
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),
+        )
+    )
+
+    request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-1",
+        provider="google",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+
+    # Empty scopes means no provider scopes required
+    authorization = broker.authorize(request, required_provider_scopes=(), evaluation_time=NOW)
+    assert authorization.required_provider_scopes == ()
+    assert authorization.decision.allowed is True
+
+
+def test_broker_exact_required_scope_accepted(tmp_path):
+    """Test exact required scope that is granted authorizes."""
+    from federation import AccessCredentialRequest, DelegationGrant
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),
+        )
+    )
+
+    request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-1",
+        provider="google",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+
+    # Connection has scope-a, scope-b; require scope-a
+    authorization = broker.authorize(request, required_provider_scopes=("scope-a",), evaluation_time=NOW)
+    assert authorization.required_provider_scopes == ("scope-a",)
+    assert authorization.decision.allowed is True
+
+
+def test_broker_missing_required_scope_denied(tmp_path):
+    """Test missing required scope denies authorization."""
+    from federation import (
+        AccessCredentialAuthorityError,
+        AccessCredentialRequest,
+        DelegationGrant,
+    )
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),
+        )
+    )
+
+    request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-1",
+        provider="google",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+
+    # Connection has scope-a, scope-b; require scope-c (NOT granted)
+    with pytest.raises(AccessCredentialAuthorityError, match="missing required provider scopes"):
+        broker.authorize(request, required_provider_scopes=("scope-c",), evaluation_time=NOW)
+
+
+def test_broker_scope_case_mismatch_denied(tmp_path):
+    """Test scope case mismatch denies (exact match required)."""
+    from federation import (
+        AccessCredentialAuthorityError,
+        AccessCredentialRequest,
+        DelegationGrant,
+    )
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),
+        )
+    )
+
+    request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-1",
+        provider="google",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+
+    # Connection has "scope-a" (lowercase); require "Scope-A" (different case)
+    with pytest.raises(AccessCredentialAuthorityError, match="missing required provider scopes"):
+        broker.authorize(request, required_provider_scopes=("Scope-A",), evaluation_time=NOW)
+
+
+def test_broker_scope_lookalike_prefix_denied(tmp_path):
+    """Test lookalike prefix scope denies (exact match required)."""
+    from federation import (
+        AccessCredentialAuthorityError,
+        AccessCredentialRequest,
+        DelegationGrant,
+    )
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),
+        )
+    )
+
+    request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-1",
+        provider="google",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+
+    # Connection has "scope-a"; require "scope" (lookalike prefix, not exact)
+    with pytest.raises(AccessCredentialAuthorityError, match="missing required provider scopes"):
+        broker.authorize(request, required_provider_scopes=("scope",), evaluation_time=NOW)
+
+
+def test_broker_scope_blank_rejected(tmp_path):
+    """Test blank scope atom is rejected during canonicalization."""
+    from federation import (
+        AccessCredentialAuthorityError,
+        AccessCredentialRequest,
+        DelegationGrant,
+    )
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),
+        )
+    )
+
+    request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-1",
+        provider="google",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+
+    # Blank scope atom
+    with pytest.raises(AccessCredentialAuthorityError, match="Invalid required_provider_scopes"):
+        broker.authorize(request, required_provider_scopes=("",), evaluation_time=NOW)
+
+
+def test_broker_scope_nul_rejected(tmp_path):
+    """Test NUL-bearing scope atom is rejected during canonicalization."""
+    from federation import (
+        AccessCredentialAuthorityError,
+        AccessCredentialRequest,
+        DelegationGrant,
+    )
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),
+        )
+    )
+
+    request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-1",
+        provider="google",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+
+    # NUL byte in scope
+    with pytest.raises(AccessCredentialAuthorityError, match="Invalid required_provider_scopes.*NULL"):
+        broker.authorize(request, required_provider_scopes=("scope-a\x00bad",), evaluation_time=NOW)
+
+
+def test_broker_scope_duplicate_rejected(tmp_path):
+    """Test duplicate scope atoms are rejected during canonicalization."""
+    from federation import (
+        AccessCredentialAuthorityError,
+        AccessCredentialRequest,
+        DelegationGrant,
+    )
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),
+        )
+    )
+
+    request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-1",
+        provider="google",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+
+    # Duplicate scope-a
+    with pytest.raises(AccessCredentialAuthorityError, match="Invalid required_provider_scopes.*duplicates"):
+        broker.authorize(request, required_provider_scopes=("scope-a", "scope-a"), evaluation_time=NOW)
+
+
+def test_broker_scope_reordered_canonicalizes_identically(tmp_path):
+    """Test reordered equivalent scopes canonicalize to same tuple."""
+    from federation import AccessCredentialRequest, DelegationGrant
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),
+        )
+    )
+
+    request = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-1",
+        provider="google",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+
+    # Authorize with ("scope-b", "scope-a")
+    auth1 = broker.authorize(request, required_provider_scopes=("scope-b", "scope-a"), evaluation_time=NOW)
+
+    # Authorize with ("scope-a", "scope-b") - different order
+    auth2 = broker.authorize(request, required_provider_scopes=("scope-a", "scope-b"), evaluation_time=NOW)
+
+    # Both canonicalize to same sorted tuple
+    assert auth1.required_provider_scopes == ("scope-a", "scope-b")
+    assert auth2.required_provider_scopes == ("scope-a", "scope-b")
+    assert auth1.required_provider_scopes == auth2.required_provider_scopes
+
+
+# ==================================================
+# NEW TESTS: CALLER-SELECTABLE ID CONTRACT (Access Broker v0.1 Correction)
+# ==================================================
+
+
+def test_broker_alternate_grant_selection(tmp_path):
+    """Test alternate independently valid grant can be explicitly selected."""
+    from federation import AccessCredentialRequest, DelegationGrant
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    # Register two independent grants with same authority dimensions
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),
+        )
+    )
+
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-2",  # Different ID
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],  # Same authority dimensions
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),
+        )
+    )
+
+    # Request with grant-1 succeeds
+    request1 = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",  # Explicitly select grant-1
+        connection_id="conn-1",
+        provider="google",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+    auth1 = broker.authorize(request1, evaluation_time=NOW)
+    assert auth1.request.grant_id == "grant-1"
+    assert auth1.decision.allowed is True
+
+    # Request with grant-2 ALSO succeeds (caller-selectable)
+    request2 = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-2",  # Explicitly select grant-2
+        connection_id="conn-1",
+        provider="google",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+    auth2 = broker.authorize(request2, evaluation_time=NOW)
+    assert auth2.request.grant_id == "grant-2"
+    assert auth2.decision.allowed is True
+
+
+def test_broker_alternate_connection_selection(tmp_path):
+    """Test alternate independently valid same-provider connection can be explicitly selected."""
+    from federation import AccessCredentialRequest, DelegationGrant
+
+    broker, grant_registry, credential_store, backend = _setup_authority_fixture(tmp_path)
+
+    # Register second google connection
+    credential_store.register_connection(
+        connection_id="conn-2",  # Different ID
+        domain_id="domain-a",
+        provider="google",  # Same provider
+        account_id="user2@example.com",
+        granted_scopes=("scope-a", "scope-b"),  # Same scopes
+        credential_backend_ref="backend-ref-2",
+    )
+    backend.store_credential("backend-ref-2", b"another-token")
+
+    grant_registry.register(
+        DelegationGrant(
+            grant_id="grant-1",
+            domain_id="domain-a",
+            mission_id="mission-1",
+            grantor_identity="agent-a",
+            grantee_identity="agent-a",
+            capabilities=["google.drive.read"],
+            resource_scope=["drive:user@example.com"],
+            created_at=NOW,
+            expires_at=NOW + timedelta(days=365),
+        )
+    )
+
+    # Request with conn-1 succeeds
+    request1 = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-1",  # Explicitly select conn-1
+        provider="google",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+    auth1 = broker.authorize(request1, evaluation_time=NOW)
+    assert auth1.connection_id == "conn-1"
+    assert auth1.decision.allowed is True
+
+    # Request with conn-2 ALSO succeeds (caller-selectable)
+    request2 = AccessCredentialRequest(
+        domain_id="domain-a",
+        mission_id="mission-1",
+        agent_id="agent-a",
+        grant_id="grant-1",
+        connection_id="conn-2",  # Explicitly select conn-2
+        provider="google",
+        capability="google.drive.read",
+        resource="drive:user@example.com",
+    )
+    auth2 = broker.authorize(request2, evaluation_time=NOW)
+    assert auth2.connection_id == "conn-2"
+    assert auth2.decision.allowed is True
 
 
 if __name__ == "__main__":
