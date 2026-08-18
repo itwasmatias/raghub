@@ -2041,7 +2041,7 @@ def test_malicious_int_subclass_transition_rejected():
 
 
 def _concurrent_checkpoint_vs_transition_worker(
-    db_path, domain, mission_id, operation, expected_revision, worker_id, result_queue
+    db_path, domain, mission_id, operation, expected_revision, worker_id, barrier, result_queue
 ):
     """Worker for deterministic two-writer race test.
 
@@ -2052,14 +2052,21 @@ def _concurrent_checkpoint_vs_transition_worker(
         operation: "checkpoint" or "transition"
         expected_revision: Expected revision for concurrency control
         worker_id: Worker identifier
+        barrier: multiprocessing.Barrier to synchronize worker starts
         result_queue: Queue to return results
     """
     try:
         # Each worker creates its own connection via separate runtime
         runtime = MissionRuntime(db_path=db_path)
 
-        # Small delay to ensure both workers start roughly simultaneously
-        time.sleep(0.01)
+        # Wait at barrier until both workers are ready
+        # This ensures both workers enter their critical sections simultaneously,
+        # forcing SQLite BEGIN IMMEDIATE to serialize the writes deterministically
+        barrier.wait(timeout=5)
+
+        # Both workers proceed simultaneously after barrier
+        # SQLite's BEGIN IMMEDIATE will acquire write lock before SELECT,
+        # serializing the operations and preventing stale-write race
 
         if operation == "checkpoint":
             # Attempt guarded checkpoint creation
@@ -2089,15 +2096,16 @@ def test_concurrent_checkpoint_vs_transition_serialized():
     DEFECT: Without BEGIN IMMEDIATE, checkpoint SELECT and lifecycle transition UPDATE
     can interleave, allowing stale checkpoint to commit after transition completes.
 
-    SCENARIO:
+    SCENARIO (FORBIDDEN):
         Checkpoint: SELECT revision=1, validate
         Transition: UPDATE revision 1->2, COMMIT
         Checkpoint: INSERT (stale validation), COMMIT  <- FORBIDDEN
 
     CORRECTION: BEGIN IMMEDIATE acquires write lock before SELECT, preventing interleave.
 
-    This test uses separate processes with independent database connections to prove
-    SQLite-level serialization prevents the race condition.
+    This test uses multiprocessing.Barrier to ensure both workers enter their critical
+    sections simultaneously, forcing SQLite's BEGIN IMMEDIATE to serialize the writes.
+    This proves database-level serialization prevents the stale-write race condition.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test_checkpoint_transition_race.db"
@@ -2117,27 +2125,36 @@ def test_concurrent_checkpoint_vs_transition_serialized():
         assert state == MissionLifecycle.CREATED
         assert initial_rev == 1
 
-        # RACE: Two workers attempt operations with same expected_revision=1
+        # DETERMINISTIC RACE: Use barrier to force both workers to start simultaneously
         # Worker 1: Create guarded checkpoint (expects revision 1)
         # Worker 2: Transition to RUNNING (expects revision 1, will create revision 2)
+        # The barrier ensures both workers are ready before proceeding,
+        # forcing SQLite to serialize the BEGIN IMMEDIATE operations
+        barrier = multiprocessing.Barrier(2)
         result_queue = multiprocessing.Queue()
 
         worker1 = multiprocessing.Process(
             target=_concurrent_checkpoint_vs_transition_worker,
-            args=(db_path, domain, mission_id, "checkpoint", initial_rev, 1, result_queue)
+            args=(db_path, domain, mission_id, "checkpoint", initial_rev, 1, barrier, result_queue)
         )
         worker2 = multiprocessing.Process(
             target=_concurrent_checkpoint_vs_transition_worker,
-            args=(db_path, domain, mission_id, "transition", initial_rev, 2, result_queue)
+            args=(db_path, domain, mission_id, "transition", initial_rev, 2, barrier, result_queue)
         )
 
         # Start both workers simultaneously
         worker1.start()
         worker2.start()
 
-        # Wait for completion
-        worker1.join(timeout=5)
-        worker2.join(timeout=5)
+        # Wait for completion with adequate timeout for DB operations
+        worker1.join(timeout=10)
+        worker2.join(timeout=10)
+
+        # Verify processes exited cleanly (not timed out or crashed)
+        assert worker1.exitcode is not None, "Worker 1 did not exit (timeout or deadlock)"
+        assert worker2.exitcode is not None, "Worker 2 did not exit (timeout or deadlock)"
+        assert worker1.exitcode == 0, f"Worker 1 exited with code {worker1.exitcode}"
+        assert worker2.exitcode == 0, f"Worker 2 exited with code {worker2.exitcode}"
 
         # Collect results
         results = []
@@ -2229,3 +2246,139 @@ def test_concurrent_checkpoint_vs_transition_serialized():
                 f"Got {len(successes)} successes. This could indicate a race where checkpoint "
                 "validated against rev=1 but committed after transition moved to rev=2."
             )
+
+
+def _deterministic_order_b_transition_worker(db_path, domain, mission_id, expected_revision, done_event, result_queue):
+    """Worker that performs transition and signals completion for ORDER B test."""
+    try:
+        runtime = MissionRuntime(db_path=db_path)
+        new_rev = runtime.start_mission(domain, mission_id, expected_revision)
+        result_queue.put(("transition_success", new_rev))
+        done_event.set()  # Signal checkpoint worker to proceed
+    except Exception as e:
+        result_queue.put(("transition_error", str(e)))
+        done_event.set()  # Always signal to prevent deadlock
+
+
+def _deterministic_order_b_checkpoint_worker(db_path, domain, mission_id, expected_revision, wait_event, result_queue):
+    """Worker that waits for transition, then attempts stale checkpoint for ORDER B test."""
+    try:
+        runtime = MissionRuntime(db_path=db_path)
+        # Wait for transition to complete before attempting checkpoint
+        if not wait_event.wait(timeout=10):
+            result_queue.put(("checkpoint_error", "Timeout waiting for transition"))
+            return
+
+        # Transition has committed R -> R+1
+        # Now attempt checkpoint with stale expected_revision=R
+        checkpoint = runtime.create_checkpoint(
+            control_domain=domain,
+            mission_id=mission_id,
+            mission_state=MissionLifecycle.CREATED,  # Stale state
+            expected_revision=expected_revision,  # Stale revision
+        )
+        # If we get here, the guard failed
+        result_queue.put(("checkpoint_success", checkpoint.checkpoint_id))
+    except MissionRevisionConflictError as e:
+        # Expected: stale checkpoint rejected
+        result_queue.put(("checkpoint_conflict", str(e)))
+    except Exception as e:
+        result_queue.put(("checkpoint_error", str(e)))
+
+
+def test_checkpoint_after_transition_deterministic_order():
+    """REGRESSION: Deterministic ORDER B proof - transition commits first, checkpoint fails.
+
+    This test deterministically forces the transition to complete before the checkpoint
+    attempts, proving that a stale checkpoint is rejected when the transition has already
+    advanced the revision.
+
+    ORDER B - Transition first, checkpoint fails:
+        1. Transition process commits R -> R+1
+        2. Checkpoint process (after transition completes) attempts checkpoint with expected_revision=R
+        3. Result: Transition succeeds, checkpoint fails with MissionRevisionConflictError
+
+    This uses multiprocessing.Event for deterministic coordination, ensuring the checkpoint
+    cannot proceed until the transition has fully committed.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "test_deterministic_order_b.db"
+        domain = "test-domain"
+        mission_id = "test-deterministic-order-b"
+
+        # Setup: Create mission in CREATED state (revision 1)
+        runtime = MissionRuntime(db_path=db_path)
+        runtime.create_mission(
+            mission_id=mission_id,
+            control_domain=domain,
+            objective="Test deterministic ORDER B",
+            owner_identity="owner",
+        )
+
+        _, state, initial_rev, _ = runtime.get_mission(domain, mission_id)
+        assert state == MissionLifecycle.CREATED
+        assert initial_rev == 1
+
+        # Deterministic coordination: Event signals when transition is complete
+        transition_done = multiprocessing.Event()
+        result_queue = multiprocessing.Queue()
+
+        # Start transition worker first
+        worker_transition = multiprocessing.Process(
+            target=_deterministic_order_b_transition_worker,
+            args=(db_path, domain, mission_id, initial_rev, transition_done, result_queue)
+        )
+
+        # Start checkpoint worker (it will wait for transition)
+        worker_checkpoint = multiprocessing.Process(
+            target=_deterministic_order_b_checkpoint_worker,
+            args=(db_path, domain, mission_id, initial_rev, transition_done, result_queue)
+        )
+
+        worker_transition.start()
+        worker_checkpoint.start()
+
+        # Wait for completion
+        worker_transition.join(timeout=10)
+        worker_checkpoint.join(timeout=10)
+
+        # Verify processes exited cleanly
+        assert worker_transition.exitcode is not None, "Transition worker did not exit"
+        assert worker_checkpoint.exitcode is not None, "Checkpoint worker did not exit"
+        assert worker_transition.exitcode == 0, f"Transition worker failed: {worker_transition.exitcode}"
+        assert worker_checkpoint.exitcode == 0, f"Checkpoint worker failed: {worker_checkpoint.exitcode}"
+
+        # Collect results
+        results = {}
+        while not result_queue.empty():
+            key, value = result_queue.get()
+            results[key] = value
+
+        # PROOF: Transition succeeded
+        assert "transition_success" in results, f"Transition did not succeed: {results}"
+        assert results["transition_success"] == 2, f"Expected revision 2, got {results['transition_success']}"
+
+        # PROOF: Checkpoint was rejected (ORDER B)
+        assert "checkpoint_conflict" in results, (
+            f"Checkpoint should have been rejected with MissionRevisionConflictError. Results: {results}"
+        )
+        assert "Revision conflict" in results["checkpoint_conflict"], (
+            f"Expected revision conflict error, got: {results['checkpoint_conflict']}"
+        )
+
+        # Verify final database state
+        runtime_final = MissionRuntime(db_path=db_path)
+        _, final_state, final_rev, _ = runtime_final.get_mission(domain, mission_id)
+        checkpoints_final = runtime_final.list_checkpoints(domain, mission_id)
+
+        # PROOF: Mission transitioned to RUNNING with revision 2
+        assert final_state == MissionLifecycle.RUNNING, f"Expected RUNNING, got {final_state}"
+        assert final_rev == 2, f"Expected revision 2, got {final_rev}"
+
+        # PROOF: No stale checkpoint was written
+        assert len(checkpoints_final) == 0, (
+            f"Expected no checkpoints (stale checkpoint should be rejected), "
+            f"but found {len(checkpoints_final)} checkpoints"
+        )
+
+        # This proves ORDER B: transition commits first, checkpoint with stale revision fails
