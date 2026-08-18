@@ -347,7 +347,10 @@ present. Local AI is optional assistance.
 
 ## Critical Invariants
 
-These must hold for ALL MissionaryX operations:
+These separations define the adopted governed control model and are evidenced for
+the governed paths covered by current acceptance and validation. That evidence
+does not demonstrate universal enforcement across every MissionaryX operation,
+repository entry point, or runtime capability:
 
 - `identity != authority`
 - `connection != authority`

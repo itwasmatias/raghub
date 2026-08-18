@@ -287,6 +287,33 @@ def test_legacy_secret_boundary_is_described_without_global_no_secret_claim():
     assert "secret leases are not exposed in public interfaces" not in combined
 
 
+def test_access_credential_broker_responsibilities_match_current_boundary():
+    text = (repository_root() / "ARCHITECTURE.md").read_text(encoding="utf-8")
+    section = text.split(
+        "### 3. ACCESS / CREDENTIAL TRUTH (Access & Credential Broker)", 1
+    )[1].split("\n---", 1)[0]
+    assert "injected `CredentialBackend` reference" in section
+    assert "does not select or route credential backends" in section
+    assert "does not manage authentication sessions" in section
+    assert "does not retrieve or inject raw credentials" in section
+    assert "- Credential backend selection and routing" not in section
+    assert "- Authentication session management" not in section
+
+
+def test_governed_and_offline_claims_are_qualified():
+    development_state = (repository_root() / "DEVELOPMENT_STATE.md").read_text(
+        encoding="utf-8"
+    )
+    offline_survival = (repository_root() / "OFFLINE_SURVIVAL.md").read_text(
+        encoding="utf-8"
+    )
+    assert "ALL MissionaryX operations" not in development_state
+    assert "does not demonstrate universal enforcement" in development_state
+    assert "MissionaryX remains fully functional" not in offline_survival
+    assert "development can continue without hosted AI" in offline_survival
+    assert "does not imply that every MissionaryX runtime capability" in offline_survival
+
+
 def test_local_ai_document_uses_real_adapter_interface_and_governed_endpoint():
     text = (repository_root() / "LOCAL_AI_DEVELOPMENT.md").read_text(encoding="utf-8")
     assert "LlamaCppLocalAdapter" in text
@@ -325,11 +352,26 @@ def test_verify_checkpoint_matching_sha_succeeds(tmp_path):
     assert "CHECKPOINT MATCH" in result.stdout
 
 
-def test_verify_checkpoint_mismatch_fails_nonzero(tmp_path):
+def test_verify_checkpoint_valid_incorrect_full_sha_returns_one(tmp_path):
     repo, tool = repository_with_tool(tmp_path, "verify-checkpoint")
     result = run([str(tool), "0" * 40], cwd=repo)
-    assert result.returncode != 0
+    assert result.returncode == 1
     assert "CHECKPOINT MISMATCH" in result.stdout
+
+
+def test_verify_checkpoint_abbreviated_sha_returns_two(tmp_path):
+    repo, tool = repository_with_tool(tmp_path, "verify-checkpoint")
+    head = git(repo, "rev-parse", "HEAD")
+    result = run([str(tool), head[:12]], cwd=repo)
+    assert result.returncode == 2
+    assert "must be 40 characters" in result.stderr
+
+
+def test_verify_checkpoint_malformed_sha_returns_two(tmp_path):
+    repo, tool = repository_with_tool(tmp_path, "verify-checkpoint")
+    result = run([str(tool), "z" * 40], cwd=repo)
+    assert result.returncode == 2
+    assert "invalid characters" in result.stderr
 
 
 def test_verify_checkpoint_require_clean_enforces_tree_state(tmp_path):
@@ -348,7 +390,7 @@ def test_verify_checkpoint_does_not_mutate_git_state(tmp_path):
     repo, tool = repository_with_tool(tmp_path, "verify-checkpoint")
     head = git(repo, "rev-parse", "HEAD")
     before = git_snapshot(repo)
-    for arguments in ((), (head,), ("0" * 40,)):
+    for arguments in ((), (head,), ("0" * 40,), (head[:12],), ("z" * 40,)):
         run([str(tool), *arguments], cwd=repo)
     assert git_snapshot(repo) == before
 

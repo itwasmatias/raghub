@@ -416,15 +416,17 @@ Authentication: Proof of identity (session-scoped)
 **Location**: `federation/access_credential_broker.py`, `federation/access_credential_store.py`, `federation/access_connection.py`, `federation/access_requirement.py`, `federation/credential_backend.py`, `federation/credential_broker.py`, `federation/authentication_session.py`
 
 **Purpose**: Separates access authorization from credential retrieval and records
-provider/canonical scope bindings. The newer `AccessCredentialBroker.authorize()`
-returns non-secret `AccessCredentialAuthorization` and does not resolve or return
-reusable credentials.
+provider/canonical scope bindings. The newer `AccessCredentialBroker` receives an
+injected `CredentialBackend` reference, but `authorize()` only evaluates the
+resolved connection, provider/scope, and delegated-authority context. It returns
+non-secret `AccessCredentialAuthorization` and does not resolve or return reusable
+credentials.
 
 **Key Invariants**:
 - Authorization ≠ credential retrieval
 - Credential retrieval ≠ effect dispatch
 - Access requirements are evaluated independently
-- Credential backend selection respects provider scope
+- Backend selection and routing remain separate from credential authorization
 - Canonical digest binds credentials to specific contexts
 - The newer authorization result is non-secret and performs no raw-secret resolution
 - The inherited legacy `CredentialBroker` remains a separate public raw-secret boundary
@@ -440,11 +442,21 @@ Canonical Scope:       Cryptographic context binding
 ```
 
 **Responsibilities of the newer AccessCredentialBroker**:
-- Access requirement evaluation
-- Credential retrieval authorization
-- Credential backend selection and routing
-- Authentication session management
-- Provider and canonical scope binding
+- Resolve the domain, connection, grant, and grantee records needed for a request
+- Evaluate connection lifecycle, requested provider, required provider scopes, and
+  delegated authority
+- Return non-secret authorization evidence for the evaluated credential-use request
+- Receive an injected `CredentialBackend` reference without selecting it or calling
+  `resolve_credential()` during `authorize()`
+
+**Currently distinct responsibilities**:
+- The newer broker does not select or route credential backends; its caller supplies
+  one backend reference. Backend routing would require a separate future integration.
+- The newer broker does not manage authentication sessions; session lifecycle remains
+  in `federation/authentication_session.py` and related connection workflows.
+- The newer broker does not retrieve or inject raw credentials. Low-level backend
+  resolution and the inherited legacy broker are separate boundaries; any future
+  credential-use integration must preserve the authorization/retrieval separation.
 
 **Inherited legacy debt**: `federation.credential_broker.CredentialLease` remains
 root-exported and publicly exposes `secret_bytes()` and `secret_text()`. That
@@ -453,7 +465,8 @@ introduce it and must not be described as eliminating the repository-wide
 raw-secret boundary.
 
 **Does NOT Handle**:
-- Authority evaluation (handled by Authority Truth)
+- Authority-policy definition or grant persistence (handled by Authority Truth; the
+  broker invokes its evaluator for the request context)
 - Effect execution (handled by Effect Truth)
 - Mission lifecycle (handled by Mission Truth)
 

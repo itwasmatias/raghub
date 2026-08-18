@@ -13,7 +13,7 @@ Usage:
 Exit codes:
     0: Success (report mode) or checkpoint matches (verify mode)
     1: Checkpoint mismatch or clean-tree requirement failed
-    2: Invalid usage or Git environment error
+    2: Invalid expected SHA, invalid CLI usage, or Git tool/environment error
 """
 
 import argparse
@@ -107,12 +107,12 @@ def verify_checkpoint(expected_sha, *, require_clean=False):
     if len(expected_sha) != 40:
         print(f"ERROR: Expected SHA must be 40 characters (got {len(expected_sha)})", file=sys.stderr)
         print("Full SHA-1 hashes are required for checkpoint verification", file=sys.stderr)
-        return False
+        raise SystemExit(2)
 
     if not all(c in '0123456789abcdef' for c in expected_sha.lower()):
         print("ERROR: Expected SHA contains invalid characters", file=sys.stderr)
         print("SHA must be 40 hexadecimal characters", file=sys.stderr)
-        return False
+        raise SystemExit(2)
 
     # Get current state
     root = get_repository_root()

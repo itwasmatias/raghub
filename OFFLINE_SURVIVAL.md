@@ -12,13 +12,14 @@ MissionaryX does not require AI assistance for human review, Git operations, or
 testing on an **existing prepared machine** with the repository, Python
 environment, and dependencies already available.
 
-All essential capabilities are preserved:
+The following development capabilities remain available on such a prepared machine:
 - Repository with complete code and history
 - Executable test suite
 - Deterministic validation tools
 - Human-readable documentation
 - Git-based version control
-- Optional local model support (not required)
+- Optional local model support when a compatible executable and model assets are
+  already available (not required)
 
 ---
 
@@ -556,7 +557,11 @@ patch uncommitted artifacts separately when they must be preserved.
 - [ ] Validation tools working
 - [ ] Commit workflow understood
 
-**MissionaryX remains fully functional without hosted AI services.**
+On a prepared machine, **development can continue without hosted AI**: Git, source
+inspection, and deterministic validation remain usable. Local AI is optional and
+requires a compatible local executable and model assets. A fresh offline machine is
+not guaranteed to be bootstrap-ready, and this continuity claim
+does not imply that every MissionaryX runtime capability is available.
 
 ---
 
