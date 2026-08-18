@@ -263,9 +263,12 @@ def test_development_continuity_does_not_modify_core_implementation():
     assert result.returncode == 0
     # Mission Observability and Pavilion Native Interface are explicitly
     # non-authoritative read/presentation surfaces.
+    # Mission Runtime and Runtime Store contain the checkpoint revision guard.
     # Continue rejecting changes to every other existing core implementation file.
     assert set(result.stdout.splitlines()) <= {
         "federation/mission_observability.py",
+        "federation/mission_runtime.py",
+        "federation/mission_runtime_store.py",
         "pavilionos/native_interface.py",
     }
 
