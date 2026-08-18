@@ -34,9 +34,13 @@ pip install -r requirements-dev.txt
 
 The `requirements-dev.txt` automatically includes `requirements-fedora-core.txt`.
 
-These install commands require network access or a previously populated package
-cache. The repository does not vendor an offline wheelhouse, so this is not a
-guaranteed fresh-machine offline bootstrap procedure.
+These install commands require network access, a previously populated package
+cache, or an external wheelhouse. The repository does not vendor that
+wheelhouse. A 41-wheel no-index reconstruction has been proven for the current
+CPython 3.14 / x86_64 environment, but the machine was not physically air-gapped
+during that proof. See `LOCAL_DEVELOPMENT_READINESS.md` for the exact
+`pip download`, `SHA256SUMS`, `python -m venv`, and
+`pip --no-index --find-links` workflow and its portability limits.
 
 ---
 
@@ -177,12 +181,18 @@ After setup, verify your environment:
 # 3. Import key dependencies
 .venv/bin/python -c "import flask; import openai; import pytest; print('OK')"
 
-# 4. Run quick validation
+# 4. Optional: verify prepared local-AI fallback assets without starting a server
+./tools/check-local-development-readiness
+
+# 5. Run quick validation
 ./tools/validate-missionaryx --quick \
   --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 ```
 
-All commands should succeed without errors.
+The Python, import, and quick-validation commands should succeed without
+errors. The optional readiness command is expected to succeed only on a machine
+where the external wheelhouse, llama.cpp checkout, binary, and model artifact
+have been prepared as described in `LOCAL_DEVELOPMENT_READINESS.md`.
 
 ---
 

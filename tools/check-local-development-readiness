@@ -1,0 +1,794 @@
+#!/usr/bin/env python3
+"""Deterministic, non-destructive MissionaryX local development readiness.
+
+Default mode verifies static local assets only.  ``--live`` additionally uses
+the existing MissionaryX llama.cpp adapter against an already-running
+loopback server.  This tool never starts, stops, signals, or replaces a model
+server and never contacts a package index or cloud service.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence, TextIO
+from urllib.parse import urlsplit
+
+
+# Importing repository modules must not create or refresh bytecode in the
+# checkout.  The readiness surface is observational only.
+sys.dont_write_bytecode = True
+TOOL_REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+if str(TOOL_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(TOOL_REPOSITORY_ROOT))
+
+from federation.local_model_server_lifecycle import (  # noqa: E402
+    LocalModelServerProfile,
+)
+
+
+EXPECTED_MODEL_SHA256 = (
+    "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
+)
+EXPECTED_MODEL_RELATIVE_PATH = Path(
+    "local-ai/models/qwen2.5-0.5b-instruct/"
+    "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+)
+EXPECTED_LLAMA_CPP_RELATIVE_PATH = Path("local-ai/llama.cpp")
+EXPECTED_WHEELHOUSE_NAME = "missionaryx-offline-wheelhouse"
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+PIN_PATTERN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.-]*)==([^\s;]+)$")
+MANIFEST_PATTERN = re.compile(r"^([0-9a-f]{64}) ([ *])(.+)$")
+MINIMUM_PYTHON = (3, 11)
+MAXIMUM_DETAIL_LENGTH = 600
+MAXIMUM_LIVE_RESPONSE_BYTES = 1 << 20
+
+
+@dataclass(frozen=True)
+class ReadinessPaths:
+    repository: Path
+    python: Path
+    wheelhouse: Path
+    requirements: Path
+    llama_cpp_source: Path
+    llama_server: Path
+    model: Path
+
+
+@dataclass(frozen=True)
+class CheckResult:
+    name: str
+    passed: bool
+    detail: str
+
+
+class Reporter:
+    def __init__(self, output: TextIO):
+        self.output = output
+        self.results: list[CheckResult] = []
+
+    def record(self, name: str, passed: bool, detail: str) -> bool:
+        normalized = _one_line(detail)
+        self.results.append(CheckResult(name, passed, normalized))
+        status = "PASS" if passed else "FAIL"
+        suffix = f" {normalized}" if normalized else ""
+        print(f"{status} {name}{suffix}", file=self.output)
+        return passed
+
+    def skip(self, name: str, detail: str) -> None:
+        print(f"SKIP {name} {_one_line(detail)}", file=self.output)
+
+
+def _one_line(value: Any) -> str:
+    text = " ".join(str(value).split())
+    if len(text) > MAXIMUM_DETAIL_LENGTH:
+        return text[: MAXIMUM_DETAIL_LENGTH - 3] + "..."
+    return text
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _regular_file(path: Path) -> bool:
+    try:
+        return not path.is_symlink() and stat.S_ISREG(path.stat().st_mode)
+    except OSError:
+        return False
+
+
+def _run(
+    command: Sequence[str],
+    *,
+    cwd: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    normalized = list(command)
+    try:
+        return subprocess.run(
+            normalized,
+            cwd=cwd,
+            env=None if environment is None else dict(environment),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        return subprocess.CompletedProcess(
+            normalized,
+            127,
+            stdout="",
+            stderr=f"{type(exc).__name__}: command could not be executed",
+        )
+
+
+def _default_repository() -> Path:
+    result = _run(["git", "rev-parse", "--show-toplevel"], cwd=Path.cwd())
+    if result.returncode == 0 and result.stdout.strip():
+        return Path(result.stdout.strip())
+    return Path.cwd()
+
+
+def _parser(profile: Any) -> argparse.ArgumentParser:
+    home = Path.home()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Verify fail-closed MissionaryX local development readiness. "
+            "Static checks are the default; --live inspects an already-running "
+            "loopback llama-server at adapter level."
+        )
+    )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="also run adapter-level inference against an already-running server",
+    )
+    parser.add_argument(
+        "--repository",
+        type=Path,
+        help="MissionaryX checkout root (default: current Git checkout)",
+    )
+    parser.add_argument(
+        "--python",
+        type=Path,
+        help="Python interpreter for version and no-index resolution checks",
+    )
+    parser.add_argument(
+        "--wheelhouse",
+        type=Path,
+        default=home / EXPECTED_WHEELHOUSE_NAME,
+        help="offline wheelhouse directory",
+    )
+    parser.add_argument(
+        "--llama-cpp-source",
+        type=Path,
+        default=home / EXPECTED_LLAMA_CPP_RELATIVE_PATH,
+        help="llama.cpp source checkout",
+    )
+    parser.add_argument(
+        "--llama-server",
+        type=Path,
+        help="llama-server executable (default: SOURCE/build/bin/llama-server)",
+    )
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=home / EXPECTED_MODEL_RELATIVE_PATH,
+        help="local GGUF model artifact",
+    )
+    parser.add_argument(
+        "--model-sha256",
+        default=EXPECTED_MODEL_SHA256,
+        help="trusted lowercase SHA-256 for --model",
+    )
+    parser.add_argument(
+        "--endpoint",
+        default=profile.endpoint,
+        help="literal loopback HTTP endpoint for --live",
+    )
+    return parser
+
+
+def _resolve_paths(arguments: argparse.Namespace) -> ReadinessPaths:
+    repository = (
+        arguments.repository if arguments.repository is not None else _default_repository()
+    ).expanduser().resolve()
+    default_venv_python = repository / ".venv" / "bin" / "python"
+    python = arguments.python
+    if python is None:
+        python = default_venv_python if default_venv_python.exists() else Path(sys.executable)
+    # Preserve a virtual-environment interpreter symlink so invoking it keeps
+    # the venv prefix and installed-package context.
+    python = python.expanduser().absolute()
+    source = arguments.llama_cpp_source.expanduser().resolve()
+    llama_server = arguments.llama_server
+    if llama_server is None:
+        llama_server = source / "build" / "bin" / "llama-server"
+    return ReadinessPaths(
+        repository=repository,
+        python=python,
+        wheelhouse=arguments.wheelhouse.expanduser().resolve(),
+        requirements=repository / "requirements-dev.txt",
+        llama_cpp_source=source,
+        llama_server=llama_server.expanduser().resolve(),
+        model=arguments.model.expanduser().resolve(),
+    )
+
+
+def _check_git_checkout(paths: ReadinessPaths) -> tuple[bool, str]:
+    repository = paths.repository
+    if not repository.is_dir():
+        return False, f"repository directory is missing: {repository}"
+    result = _run(["git", "-C", str(repository), "rev-parse", "--show-toplevel"])
+    if result.returncode != 0 or not result.stdout.strip():
+        return False, "repository is not a Git checkout"
+    try:
+        git_root = Path(result.stdout.strip()).resolve()
+    except OSError as exc:
+        return False, f"cannot resolve Git root: {type(exc).__name__}"
+    if git_root != repository:
+        return False, f"repository is not the checkout root (Git root: {git_root})"
+
+    state_path = repository / "missionaryx-state.json"
+    if not _regular_file(state_path):
+        return False, "missionaryx-state.json is missing or is not a regular file"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return False, f"missionaryx-state.json is invalid: {type(exc).__name__}"
+    if not isinstance(state, dict) or state.get("project") != "MissionaryX":
+        return False, "missionaryx-state.json does not identify MissionaryX"
+    if not _regular_file(paths.requirements):
+        return False, "requirements-dev.txt is missing or is not a regular file"
+    return True, f"root={repository}"
+
+
+def _normalized_distribution(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _inspect_requirements(path: Path) -> dict[str, str]:
+    pins: dict[str, str] = {}
+    visited: set[Path] = set()
+
+    def visit(requirements_path: Path) -> None:
+        resolved = requirements_path.resolve()
+        if resolved in visited:
+            raise ValueError(f"recursive requirement include: {requirements_path.name}")
+        if not _regular_file(resolved):
+            raise ValueError(f"requirement file is missing: {requirements_path.name}")
+        visited.add(resolved)
+        try:
+            lines = resolved.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(
+                f"cannot inspect requirement file {requirements_path.name}"
+            ) from exc
+        for line_number, raw_line in enumerate(lines, 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("-r ") or line.startswith("--requirement "):
+                include = line.split(maxsplit=1)[1]
+                if not include or include.startswith("-"):
+                    raise ValueError(
+                        f"invalid requirement include at {resolved.name}:{line_number}"
+                    )
+                visit(resolved.parent / include)
+                continue
+            match = PIN_PATTERN.fullmatch(line)
+            if match is None:
+                raise ValueError(
+                    f"development requirement is not an exact pin at "
+                    f"{resolved.name}:{line_number}"
+                )
+            name, version = match.groups()
+            normalized = _normalized_distribution(name)
+            prior = pins.get(normalized)
+            if prior is not None and prior != version:
+                raise ValueError(f"conflicting exact pins for {normalized}")
+            pins[normalized] = version
+        visited.remove(resolved)
+
+    visit(path)
+    if not pins:
+        raise ValueError("development requirements contain no exact pins")
+    return dict(sorted(pins.items()))
+
+
+_PACKAGE_QUERY = """
+import json
+import sys
+from importlib import metadata
+
+expected = json.loads(sys.argv[1])
+actual = {}
+for name in expected:
+    try:
+        actual[name] = metadata.version(name)
+    except metadata.PackageNotFoundError:
+        actual[name] = None
+print(json.dumps(actual, sort_keys=True))
+"""
+
+
+def _python_version(python: Path) -> tuple[tuple[int, int, int], str] | None:
+    result = _run([str(python), "--version"])
+    combined = (result.stdout + " " + result.stderr).strip()
+    match = re.search(r"Python (\d+)\.(\d+)(?:\.(\d+))?", combined)
+    if result.returncode != 0 or match is None:
+        return None
+    parts = tuple(int(value or 0) for value in match.groups())
+    return parts, f"{parts[0]}.{parts[1]}.{parts[2]}"
+
+
+def _installed_versions(python: Path, expected: dict[str, str]) -> dict[str, str | None]:
+    result = _run(
+        [str(python), "-c", _PACKAGE_QUERY, json.dumps(expected, sort_keys=True)]
+    )
+    if result.returncode != 0:
+        raise ValueError("cannot query virtual-environment package versions")
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError("virtual-environment package query returned invalid JSON") from exc
+    if not isinstance(value, dict) or set(value) != set(expected):
+        raise ValueError("virtual-environment package query returned an invalid schema")
+    for package, version in value.items():
+        if version is not None and not isinstance(version, str):
+            raise ValueError(f"package version for {package} is invalid")
+    return value
+
+
+def _check_python_environment(
+    paths: ReadinessPaths,
+) -> tuple[bool, str, dict[str, str] | None]:
+    python = paths.python
+    if not python.is_file():
+        return False, f"Python executable is missing or not a file: {python}", None
+    if not os.access(python, os.X_OK):
+        return False, f"Python executable is not executable: {python}", None
+    version = _python_version(python)
+    if version is None:
+        return False, f"cannot execute Python interpreter: {python}", None
+    version_tuple, version_text = version
+    if version_tuple[:2] < MINIMUM_PYTHON:
+        return False, f"Python {version_text} is older than 3.11", None
+    try:
+        pins = _inspect_requirements(paths.requirements)
+    except ValueError as exc:
+        return False, str(exc), None
+
+    venv = paths.repository / ".venv"
+    if venv.exists():
+        venv_python = venv / "bin" / "python"
+        if not venv_python.is_file() or not os.access(venv_python, os.X_OK):
+            return False, ".venv exists without an executable bin/python", None
+        venv_version = _python_version(venv_python)
+        if venv_version is None:
+            return False, ".venv/bin/python cannot report its version", None
+        try:
+            actual = _installed_versions(venv_python, pins)
+        except ValueError as exc:
+            return False, str(exc), None
+        mismatches = [
+            f"{name} expected {expected}, found {actual.get(name) or 'missing'}"
+            for name, expected in pins.items()
+            if actual.get(name) != expected
+        ]
+        if mismatches:
+            return False, "virtual environment mismatch: " + "; ".join(mismatches), None
+        packages = ",".join(f"{name}={actual[name]}" for name in sorted(actual))
+        detail = (
+            f"python={python} version={version_text}; .venv={venv_python} "
+            f"version={venv_version[1]}; packages={packages}"
+        )
+    else:
+        detail = (
+            f"python={python} version={version_text}; "
+            f"requirements={len(pins)} exact pins; .venv absent"
+        )
+    return True, detail, pins
+
+
+def _read_manifest(manifest: Path) -> dict[str, str]:
+    if not _regular_file(manifest):
+        raise ValueError("SHA256SUMS is missing or is not a regular file")
+    try:
+        lines = manifest.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("SHA256SUMS cannot be read as UTF-8") from exc
+    entries: dict[str, str] = {}
+    for line_number, line in enumerate(lines, 1):
+        match = MANIFEST_PATTERN.fullmatch(line)
+        if match is None:
+            raise ValueError(f"SHA256SUMS line {line_number} is malformed")
+        expected, _, filename = match.groups()
+        relative = Path(filename)
+        if relative.name != filename or filename in {".", ".."}:
+            raise ValueError(f"SHA256SUMS line {line_number} has an unsafe filename")
+        if not filename.endswith(".whl"):
+            raise ValueError(f"SHA256SUMS line {line_number} is not a wheel")
+        if filename in entries:
+            raise ValueError(f"SHA256SUMS repeats {filename}")
+        entries[filename] = expected
+    if not entries:
+        raise ValueError("SHA256SUMS contains no wheel entries")
+    return entries
+
+
+def _pip_environment() -> dict[str, str]:
+    # The resolver needs no credentials, proxies, provider configuration, or
+    # package-index settings.  Pass only basic process-local runtime context.
+    environment = {
+        name: os.environ[name]
+        for name in ("HOME", "LANG", "LC_ALL", "PATH", "TMPDIR")
+        if name in os.environ
+    }
+    environment["PIP_CONFIG_FILE"] = os.devnull
+    environment["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    environment["PIP_NO_INDEX"] = "1"
+    environment["PIP_NO_INPUT"] = "1"
+    return environment
+
+
+def _check_wheelhouse(
+    paths: ReadinessPaths,
+    requirements: dict[str, str] | None,
+) -> tuple[bool, str]:
+    wheelhouse = paths.wheelhouse
+    if not wheelhouse.is_dir():
+        return False, f"wheelhouse directory is missing: {wheelhouse}"
+    if requirements is None:
+        return False, "requirements were not safely inspectable"
+    try:
+        entries = _read_manifest(wheelhouse / "SHA256SUMS")
+    except ValueError as exc:
+        return False, str(exc)
+
+    try:
+        wheel_paths = {
+            path.name: path
+            for path in wheelhouse.iterdir()
+            if path.name.endswith(".whl")
+        }
+    except OSError as exc:
+        return False, f"wheelhouse cannot be inspected: {type(exc).__name__}"
+    if set(wheel_paths) != set(entries):
+        missing = sorted(set(entries) - set(wheel_paths))
+        unmanifested = sorted(set(wheel_paths) - set(entries))
+        detail = []
+        if missing:
+            detail.append("missing manifested wheels=" + ",".join(missing))
+        if unmanifested:
+            detail.append("unmanifested wheels=" + ",".join(unmanifested))
+        return False, "; ".join(detail)
+
+    for filename, expected in entries.items():
+        wheel = wheel_paths[filename]
+        if not _regular_file(wheel):
+            return False, f"wheel is missing or not a regular file: {filename}"
+        try:
+            actual = _sha256(wheel)
+        except OSError as exc:
+            return False, f"cannot hash wheel {filename}: {type(exc).__name__}"
+        if actual != expected:
+            return False, f"wheel checksum mismatch: {filename}"
+
+    command = [
+        str(paths.python),
+        "-m",
+        "pip",
+        "--isolated",
+        "--disable-pip-version-check",
+        "install",
+        "--dry-run",
+        "--ignore-installed",
+        "--no-cache-dir",
+        "--no-input",
+        "--no-index",
+        "--find-links",
+        str(wheelhouse),
+        "--requirement",
+        str(paths.requirements),
+    ]
+    result = _run(command, cwd=paths.repository, environment=_pip_environment())
+    if result.returncode != 0:
+        return False, f"no-index pip dry-run resolution failed (exit {result.returncode})"
+    return (
+        True,
+        f"wheelhouse={wheelhouse}; checksums={len(entries)}; "
+        f"no-index dry-run resolved {len(requirements)} exact requirements",
+    )
+
+
+def _check_llama_cpp_source(paths: ReadinessPaths, profile: Any) -> tuple[bool, str]:
+    source = paths.llama_cpp_source
+    if not source.is_dir():
+        return False, f"llama.cpp source directory is missing: {source}"
+    expected = getattr(profile, "source_commit", None)
+    if not isinstance(expected, str) or COMMIT_PATTERN.fullmatch(expected) is None:
+        return False, "profile source checkpoint is not a lowercase full Git SHA"
+    root_result = _run(["git", "-C", str(source), "rev-parse", "--show-toplevel"])
+    if root_result.returncode != 0 or not root_result.stdout.strip():
+        return False, "llama.cpp source path is not a Git checkout"
+    if Path(root_result.stdout.strip()).resolve() != source:
+        return False, "llama.cpp source path is not its Git checkout root"
+    head_result = _run(["git", "-C", str(source), "rev-parse", "HEAD"])
+    head = head_result.stdout.strip()
+    if head_result.returncode != 0 or COMMIT_PATTERN.fullmatch(head) is None:
+        return False, "cannot establish llama.cpp source checkpoint"
+    if head != expected:
+        return False, f"source checkpoint mismatch: expected {expected}, found {head}"
+    return True, f"source={source}; checkpoint={head}"
+
+
+def _check_llama_server(paths: ReadinessPaths, profile: Any) -> tuple[bool, str]:
+    binary = paths.llama_server
+    expected = getattr(profile, "binary_sha256", None)
+    if not isinstance(expected, str) or SHA256_PATTERN.fullmatch(expected) is None:
+        return False, "profile binary identity is not lowercase SHA-256"
+    if not _regular_file(binary):
+        return False, f"llama-server is missing or not a regular file: {binary}"
+    if not os.access(binary, os.X_OK):
+        return False, f"llama-server is not executable: {binary}"
+    try:
+        actual = _sha256(binary)
+    except OSError as exc:
+        return False, f"cannot hash llama-server: {type(exc).__name__}"
+    if actual != expected:
+        return False, f"llama-server SHA-256 mismatch: expected {expected}, found {actual}"
+    return True, f"binary={binary}; profile_sha256={actual}"
+
+
+def _check_model(paths: ReadinessPaths, expected: str) -> tuple[bool, str]:
+    if not isinstance(expected, str) or SHA256_PATTERN.fullmatch(expected) is None:
+        return False, "expected model digest must be lowercase SHA-256 hex"
+    model = paths.model
+    if not _regular_file(model):
+        return False, f"model is missing or not a regular file: {model}"
+    try:
+        actual = _sha256(model)
+    except OSError as exc:
+        return False, f"cannot hash model: {type(exc).__name__}"
+    if actual != expected:
+        return False, f"model SHA-256 mismatch: expected {expected}, found {actual}"
+    return True, f"model={model}; sha256={actual}"
+
+
+def _loopback_endpoint(endpoint: str) -> tuple[bool, str]:
+    if not isinstance(endpoint, str) or not endpoint or endpoint != endpoint.strip():
+        return False, "live endpoint must be a canonical URL"
+    try:
+        parsed = urlsplit(endpoint)
+        port = parsed.port
+    except ValueError:
+        return False, "live endpoint has an invalid port"
+    if parsed.scheme != "http":
+        return False, "live endpoint must use plain HTTP on loopback"
+    if parsed.username is not None or parsed.password is not None:
+        return False, "live endpoint must not contain credentials"
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        return False, "live endpoint must contain only scheme, loopback host, and port"
+    if parsed.hostname is None or port is None:
+        return False, "live endpoint must include a literal loopback host and port"
+    try:
+        address = ipaddress.ip_address(parsed.hostname)
+    except ValueError:
+        return False, "live endpoint host must be a literal loopback address"
+    if not address.is_loopback:
+        return False, "live endpoint must not contact a non-loopback address"
+    return True, endpoint.rstrip("/")
+
+
+def _live_contracts(profile: Any, endpoint: str, model_sha256: str):
+    from federation.llamacpp_adapter import LlamaCppAdapterConfig, LlamaCppAdapterMode
+    from federation.task_request import AuthorizationLevel
+    from tools.ai_controller.local_capability_baseline import LocalityType
+    from tools.ai_controller.local_model_runtime import (
+        GenerationConfig,
+        LocalInferenceRequest,
+        LocalModelCapability,
+        LocalModelDescriptor,
+        LocalModelLoadStatus,
+        LocalModelRuntimeConfig,
+    )
+
+    runtime_id = "llama.cpp-readiness"
+    node_id = "local-development-readiness"
+    descriptor = LocalModelDescriptor(
+        model_id=profile.model_alias,
+        runtime_id=runtime_id,
+        node_id=node_id,
+        profile_fingerprint=profile.fingerprint,
+        locality=LocalityType.LOCAL,
+        family="Qwen2.5",
+        quantization="Q4_K_M",
+        context_limit=profile.context_size,
+        capabilities=frozenset({LocalModelCapability.TEXT_GENERATION}),
+        load_status=LocalModelLoadStatus.LOADED,
+        runtime_metadata={"purpose": "adapter-level-local-readiness"},
+    )
+    generation = GenerationConfig(
+        maximum_output_tokens=8,
+        temperature=0.0,
+        seed=0,
+        stop_conditions=(),
+        structured_output_required=False,
+    )
+    request = LocalInferenceRequest(
+        request_id="local-readiness-request",
+        task_id="local-readiness-task",
+        worker_node_id=node_id,
+        descriptor_fingerprint=descriptor.descriptor_fingerprint(),
+        input_text="Reply with one word.",
+        generation=generation,
+        authorization_level=AuthorizationLevel.INTERNAL,
+        approval_required=False,
+        permitted_tool_capabilities=(),
+        local_only=True,
+        execution_attempt_id="local-readiness-attempt",
+        assignment_id="local-readiness-assignment",
+        dispatch_offer_id="local-readiness-offer",
+        execution_fingerprint=hashlib.sha256(
+            b"missionaryx-local-development-readiness-v0.1"
+        ).hexdigest(),
+    )
+    runtime = LocalModelRuntimeConfig(
+        local_only=True,
+        maximum_output_tokens_limit=8,
+        allowed_tool_capabilities=frozenset(),
+        require_loaded_model=True,
+    )
+    adapter_config = LlamaCppAdapterConfig(
+        adapter_id="local-readiness-adapter",
+        node_id=node_id,
+        endpoint=endpoint,
+        expected_runtime_id=runtime_id,
+        expected_model_id=profile.model_alias,
+        model_fingerprint=model_sha256,
+        connection_timeout_seconds=2.0,
+        request_timeout_seconds=60.0,
+        maximum_response_bytes=MAXIMUM_LIVE_RESPONSE_BYTES,
+        mode=LlamaCppAdapterMode.COMPLETION,
+    )
+    return adapter_config, descriptor, request, runtime
+
+
+def _check_live_adapter(
+    *,
+    profile: Any,
+    endpoint: str,
+    model_sha256: str,
+    adapter_factory: Callable[..., Any],
+) -> tuple[bool, str]:
+    from tools.ai_controller.local_capability_baseline import LocalityType
+    from tools.ai_controller.local_model_runtime import LocalInferenceStatus
+
+    endpoint_ok, endpoint_detail = _loopback_endpoint(endpoint)
+    if not endpoint_ok:
+        return False, endpoint_detail
+    try:
+        adapter_config, descriptor, request, runtime = _live_contracts(
+            profile, endpoint_detail, model_sha256
+        )
+        adapter = adapter_factory(config=adapter_config)
+        response = adapter.infer(descriptor, request, runtime)
+    except Exception as exc:
+        return (
+            False,
+            "adapter-level live readiness failed against the already-running "
+            f"loopback server: {type(exc).__name__}: {_one_line(exc)}",
+        )
+
+    failures = []
+    try:
+        if response.status is not LocalInferenceStatus.SUCCEEDED:
+            failures.append(
+                f"status={getattr(response.status, 'value', response.status)}"
+            )
+        if response.locality is not LocalityType.LOCAL:
+            failures.append(
+                f"locality={getattr(response.locality, 'value', response.locality)}"
+            )
+        if response.remote_execution is not False:
+            failures.append(f"remote_execution={response.remote_execution}")
+        if response.cloud_escalation_count != 0:
+            failures.append(f"cloud_escalation_count={response.cloud_escalation_count}")
+        if response.cloud_cost_usd != 0.0:
+            failures.append(f"cloud_cost_usd={response.cloud_cost_usd}")
+        if response.error_code is not None:
+            failures.append(f"error_code={response.error_code}")
+        if not isinstance(response.output_text, str) or not response.output_text.strip():
+            failures.append("output_text is empty")
+        if response.model_id != profile.model_alias:
+            failures.append(f"model_id={response.model_id}")
+    except (AttributeError, TypeError, ValueError) as exc:
+        return False, f"adapter-level live result is malformed: {type(exc).__name__}"
+    if failures:
+        return False, "adapter-level live result rejected: " + "; ".join(failures)
+    return (
+        True,
+        "adapter-level live readiness; model metadata unambiguous; "
+        "structurally valid non-empty local inference; no cloud escalation",
+    )
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    profile: Any | None = None,
+    adapter_factory: Callable[..., Any] | None = None,
+    stdout: TextIO | None = None,
+) -> int:
+    profile = LocalModelServerProfile() if profile is None else profile
+    arguments = _parser(profile).parse_args(argv)
+    paths = _resolve_paths(arguments)
+    output = sys.stdout if stdout is None else stdout
+    reporter = Reporter(output)
+
+    static_ready = True
+    passed, detail = _check_git_checkout(paths)
+    static_ready = reporter.record("git_checkout", passed, detail) and static_ready
+
+    passed, detail, requirements = _check_python_environment(paths)
+    static_ready = reporter.record("python_environment", passed, detail) and static_ready
+
+    passed, detail = _check_wheelhouse(paths, requirements)
+    static_ready = reporter.record("wheelhouse_integrity", passed, detail) and static_ready
+
+    passed, detail = _check_llama_cpp_source(paths, profile)
+    static_ready = reporter.record("llama_cpp_source", passed, detail) and static_ready
+
+    passed, detail = _check_llama_server(paths, profile)
+    static_ready = reporter.record("llama_server_binary", passed, detail) and static_ready
+
+    passed, detail = _check_model(paths, arguments.model_sha256)
+    static_ready = reporter.record("model_integrity", passed, detail) and static_ready
+
+    live_ready = False
+    if not arguments.live:
+        reporter.skip("live_adapter_inference", "explicit --live was not requested")
+    elif not static_ready:
+        reporter.skip("live_adapter_inference", "static readiness failed")
+    else:
+        if adapter_factory is None:
+            from federation.llamacpp_adapter import LlamaCppLocalAdapter
+
+            adapter_factory = LlamaCppLocalAdapter
+        passed, detail = _check_live_adapter(
+            profile=profile,
+            endpoint=arguments.endpoint,
+            model_sha256=arguments.model_sha256,
+            adapter_factory=adapter_factory,
+        )
+        live_ready = reporter.record("live_adapter_inference", passed, detail)
+
+    if static_ready and (not arguments.live or live_ready):
+        summary = (
+            "LOCAL_DEVELOPMENT_LIVE_READY"
+            if arguments.live
+            else "LOCAL_DEVELOPMENT_STATIC_READY"
+        )
+        print(summary, file=output)
+        return 0
+    print("LOCAL_DEVELOPMENT_NOT_READY", file=output)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

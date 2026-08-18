@@ -41,19 +41,27 @@ attested:
 - `tests/test_governed_local_inference.py`: Governed inference
 - `tests/test_local_only_pilot.py`: End-to-end pilot
 
-### PROVEN RUNNABLE LOCAL ENVIRONMENT
+### MACHINE READINESS IS OBSERVED, NOT VENDORED
 
-**Not established by this checkout alone.** Repository code and fake-backed
-tests do not prove that the current machine has:
+Repository code and fake-backed tests alone do not prove that the current
+machine has:
 
 - a `llama-server` executable
 - compatible, verified model weights
 - an offline Python wheelhouse or dependency cache
 - a live, attested server ready for governed inference
 
-Verify those prerequisites directly before claiming live readiness. Local AI is
-optional assistance; Git history and deterministic tests remain acceptance
-authority.
+The prepared development host has separately proven a 41-wheel no-index Python
+reconstruction, exact llama.cpp and model digests, and a small adapter-level
+live inference. Run `./tools/check-local-development-readiness` to re-evaluate
+the current static assets. Add `--live` only when the expected loopback server
+is already running. The tool never starts or stops it.
+
+That live check is adapter-level only. It is not evidence that the full durable
+lifecycle plus governed-inference production chain ran live; deterministic
+tests cover those stronger contracts. See `LOCAL_DEVELOPMENT_READINESS.md` for
+the exact evidence and precision limits. Local AI is optional assistance; Git
+history and deterministic tests remain acceptance authority.
 
 ### NOT YET IMPLEMENTED
 
@@ -214,12 +222,14 @@ git diff > changes.diff
 
 ### Setup
 
-1. Verify a compatible `llama-server` binary and model artifact by digest.
-2. Follow `docs/local-model-artifact-registry-v0.1.md` and
+1. Run `./tools/check-local-development-readiness` to verify the prepared static
+   assets without starting a server.
+2. Verify a compatible `llama-server` binary and model artifact by digest.
+3. Follow `docs/local-model-artifact-registry-v0.1.md` and
    `docs/local-model-server-lifecycle-v0.1.md` to register and manage them.
-3. Require an eligible, attested lifecycle record at the governed endpoint
+4. Require an eligible, attested lifecycle record at the governed endpoint
    `http://127.0.0.1:18080`.
-4. Use `tools/ai_controller/governed_local_inference.py`; do not start an
+5. Use `tools/ai_controller/governed_local_inference.py`; do not start an
    unmanaged server or treat a listening loopback port as lifecycle identity.
 
 ### Basic Usage

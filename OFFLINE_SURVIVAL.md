@@ -119,10 +119,32 @@ source .venv/bin/activate
 pip install -r requirements-dev.txt
 ```
 
-This installation requires network access or a pre-populated package cache. On
-a fresh machine with no network and no cached dependencies, stop and report that
-the environment is not bootstrap-ready. `make setup` installs core requirements
-only, not the complete development/test requirements.
+This installation requires network access, a pre-populated package cache, or a
+copied local wheelhouse. The prepared development host has proven a no-index
+reconstruction from `$HOME/missionaryx-offline-wheelhouse`: its 41 wheels are
+covered by `SHA256SUMS`, and the fresh environment was populated with:
+
+```bash
+wheelhouse="$HOME/missionaryx-offline-wheelhouse"
+(
+  cd "$wheelhouse"
+  sha256sum -c SHA256SUMS
+)
+python3.14 -m venv .venv
+.venv/bin/python -m pip install \
+  --no-index \
+  --find-links "$wheelhouse" \
+  --requirement requirements-dev.txt
+```
+
+The wheelhouse was populated earlier with `pip download`; it is external to the
+repository and must be copied with its checksum manifest. The proof did not
+physically air-gap the machine, and native wheels are CPython 3.14 / x86_64
+specific where applicable. This is not a claim that every fresh Fedora machine
+can bootstrap. Without compatible Python/system prerequisites or a complete
+verified wheelhouse, stop and report that the environment is not bootstrap-ready.
+`make setup` installs core requirements only, not the complete development/test
+requirements. See `LOCAL_DEVELOPMENT_READINESS.md` for the full workflow.
 
 **Alternative using Makefile**:
 ```bash
@@ -143,6 +165,16 @@ Verify your environment works:
 Expected output: Quick tests pass (or report specific failures).
 
 If validation fails, troubleshoot before proceeding.
+
+The non-destructive static readiness check can be run before validation:
+
+```bash
+./tools/check-local-development-readiness
+```
+
+It does not start or stop llama-server. Use `--live` only to inspect an
+already-running loopback server; that result is explicitly adapter-level and is
+not proof of the full durable governed lifecycle/integration chain.
 
 ---
 

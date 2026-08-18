@@ -290,8 +290,8 @@ See `DEVELOPMENT_PROTOCOL.md` for the full development lifecycle.
 MissionaryX contains local-model adapter, lifecycle, registry, capacity, and
 governed-inference code support.
 
-**Status**: CODE SUPPORT PRESENT; RUNNABLE LOCAL ENVIRONMENT NOT PROVEN BY THIS
-CHECKOUT
+**Status**: CODE SUPPORT PRESENT; CURRENT MACHINE READINESS REQUIRES DIRECT
+STATIC OR LIVE EVIDENCE
 
 **Components**:
 - `federation/llamacpp_adapter.py`: llama.cpp integration
@@ -304,12 +304,17 @@ CHECKOUT
 - `docs/local-model-server-lifecycle-v0.1.md`
 - `docs/local-model-artifact-registry-v0.1.md`
 - `docs/governed-local-inference-integration-v0.1.md`
+- `LOCAL_DEVELOPMENT_READINESS.md`
 
 **Usage**: See `LOCAL_AI_DEVELOPMENT.md` for local model development workflow.
 
 This checkout does not itself prove that `llama-server`, compatible model
 weights, an offline wheelhouse, or a live attested inference environment is
-present. Local AI is optional assistance.
+present. `./tools/check-local-development-readiness` now provides a
+non-destructive, fail-closed observation of the current machine. Its optional
+live result is adapter-level only and does not claim a live exercise of the full
+durable lifecycle/governed-inference production chain. Local AI is optional
+assistance.
 
 **Important**: Local models are not automatically trusted. Deterministic tests and Git remain the acceptance authority.
 
@@ -324,6 +329,7 @@ present. Local AI is optional assistance.
 ├── DEVELOPMENT_PROTOCOL.md            # Development lifecycle
 ├── ENVIRONMENT_SETUP.md               # Python environment setup
 ├── LOCAL_AI_DEVELOPMENT.md            # Local model development workflow
+├── LOCAL_DEVELOPMENT_READINESS.md     # Static/live readiness evidence and limits
 ├── OFFLINE_SURVIVAL.md                # Offline development procedure
 ├── README.md                          # SIP application documentation
 ├── docs/
@@ -334,6 +340,7 @@ present. Local AI is optional assistance.
 ├── tools/
 │   ├── validate-missionaryx           # Validation script
 │   ├── verify-checkpoint              # Checkpoint verification
+│   ├── check-local-development-readiness # Non-destructive machine readiness
 │   └── [other tooling]
 ├── tests/                             # Comprehensive test suite
 ├── scripts/                           # Utility scripts
