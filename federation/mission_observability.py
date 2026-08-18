@@ -600,10 +600,49 @@ class MissionObservability:
                     transitioned_at=transition.transitioned_at,
                 )
             )
-        projected.sort(
-            key=lambda item: (item.revision, item.transitioned_at, item.transition_id)
-        )
         return tuple(projected)
+
+    @staticmethod
+    def _is_legal_mission_transition(from_state: MissionLifecycle, to_state: MissionLifecycle) -> bool:
+        """Validate transition legality per authoritative Mission Runtime semantics.
+
+        This mirrors Mission Runtime transition rules for fail-closed read validation only.
+        It does not become a state-transition authority.
+
+        Terminal states: COMPLETED, FAILED, CANCELLED cannot transition to anything.
+        Non-terminal states allow idempotent transitions and specific non-idempotent transitions.
+        """
+        # Terminal states cannot transition
+        if from_state in {MissionLifecycle.COMPLETED, MissionLifecycle.FAILED, MissionLifecycle.CANCELLED}:
+            return False
+
+        # Idempotent transitions are always legal for non-terminal states
+        if from_state == to_state:
+            return True
+
+        # Non-idempotent transitions from CREATED
+        if from_state == MissionLifecycle.CREATED:
+            return to_state in {MissionLifecycle.RUNNING, MissionLifecycle.CANCELLED}
+
+        # Non-idempotent transitions from RUNNING
+        if from_state == MissionLifecycle.RUNNING:
+            return to_state in {
+                MissionLifecycle.PAUSED,
+                MissionLifecycle.COMPLETED,
+                MissionLifecycle.FAILED,
+                MissionLifecycle.CANCELLED,
+            }
+
+        # Non-idempotent transitions from PAUSED
+        if from_state == MissionLifecycle.PAUSED:
+            return to_state in {
+                MissionLifecycle.RUNNING,
+                MissionLifecycle.COMPLETED,
+                MissionLifecycle.FAILED,
+                MissionLifecycle.CANCELLED,
+            }
+
+        return False
 
     @staticmethod
     def _validate_transition_history(
@@ -623,17 +662,44 @@ class MissionObservability:
                 "Mission transition history contradicts current lifecycle"
             )
 
-        # Validate state chain continuity: each transition must continue from previous to_state
+        # Validate first transition is exactly the initial CREATED -> CREATED at revision 1
+        if len(transitions) > 0:
+            first = transitions[0]
+            if first.revision != 1:
+                raise MissionObservabilityIntegrityError(
+                    f"Mission first transition must be revision 1, found {first.revision}"
+                )
+            if first.from_state != MissionLifecycle.CREATED:
+                raise MissionObservabilityIntegrityError(
+                    f"Mission first transition must be from CREATED, found {first.from_state.value!r}"
+                )
+            if first.to_state != MissionLifecycle.CREATED:
+                raise MissionObservabilityIntegrityError(
+                    f"Mission first transition must be to CREATED, found {first.to_state.value!r}"
+                )
+
+        # Validate state chain continuity and transition legality for subsequent transitions
         for i, transition in enumerate(transitions):
             if i == 0:
-                # First transition must be from the initial lifecycle state (CREATED)
+                # First transition already validated above
                 continue
             previous = transitions[i - 1]
+
+            # Check continuity: from_state must equal previous to_state
             if transition.from_state != previous.to_state:
                 raise MissionObservabilityIntegrityError(
                     f"Mission transition chain broken at revision {transition.revision}: "
                     f"transition from {transition.from_state.value!r} but previous ended at "
                     f"{previous.to_state.value!r}"
+                )
+
+            # Check transition legality per Mission Runtime rules
+            if not MissionObservability._is_legal_mission_transition(
+                transition.from_state, transition.to_state
+            ):
+                raise MissionObservabilityIntegrityError(
+                    f"Illegal mission transition at revision {transition.revision}: "
+                    f"{transition.from_state.value!r} -> {transition.to_state.value!r}"
                 )
 
         # Validate timestamp ordering: transitions must not regress in time
@@ -1096,7 +1162,7 @@ class MissionObservability:
 
         # Validate chronological ordering of phase timestamps
         if handoff_started_at is not None:
-            if handoff_started_at <= claimed_at:
+            if handoff_started_at < claimed_at:
                 raise MissionObservabilityIntegrityError(
                     f"Gateway claim {claim_id!r} handoff_started_at must follow claimed_at"
                 )
@@ -1106,7 +1172,7 @@ class MissionObservability:
                 raise MissionObservabilityIntegrityError(
                     f"Gateway claim {claim_id!r} receipt_recorded_at requires handoff_started_at"
                 )
-            if receipt_recorded_at <= handoff_started_at:
+            if receipt_recorded_at < handoff_started_at:
                 raise MissionObservabilityIntegrityError(
                     f"Gateway claim {claim_id!r} receipt_recorded_at must follow handoff_started_at"
                 )
@@ -1118,7 +1184,7 @@ class MissionObservability:
                     raise MissionObservabilityIntegrityError(
                         f"Gateway claim {claim_id!r} terminal_at requires receipt_recorded_at"
                     )
-                if terminal_at <= receipt_recorded_at:
+                if terminal_at < receipt_recorded_at:
                     raise MissionObservabilityIntegrityError(
                         f"Gateway claim {claim_id!r} terminal_at must follow receipt_recorded_at"
                     )
@@ -1128,7 +1194,7 @@ class MissionObservability:
                     raise MissionObservabilityIntegrityError(
                         f"Gateway claim {claim_id!r} terminal_at requires handoff_started_at"
                     )
-                if terminal_at <= handoff_started_at:
+                if terminal_at < handoff_started_at:
                     raise MissionObservabilityIntegrityError(
                         f"Gateway claim {claim_id!r} terminal_at must follow handoff_started_at"
                     )

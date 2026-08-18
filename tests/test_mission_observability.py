@@ -1470,3 +1470,332 @@ def test_serialization_is_deterministic_and_contains_no_secret_material(tmp_path
     assert "credential" not in first.to_json()
     assert "metadata_json" not in first.to_json()
     assert '"immutable"' not in first.to_json()
+
+
+# ======================================================================
+# FINAL CORRECTION REGRESSIONS: Equal timestamp validation
+# ======================================================================
+
+
+def test_gateway_claim_terminal_with_all_equal_timestamps_succeeds(tmp_path: Path) -> None:
+    """Valid terminal claim with all phase timestamps equal should succeed."""
+    runtime, store = _runtime_and_store(tmp_path)
+    intent, dispatch = _commit_effect(store, include_claim=True)
+    assert dispatch is not None
+    _add_reference(runtime, intent, dispatch, claim_id="claim-1")
+    claim = store.get_gateway_claim("claim-1", DOMAIN_A)
+    assert claim is not None
+    same_time = NOW + timedelta(minutes=10)
+    valid_claim = {
+        **claim,
+        "state": "terminal",
+        "claimed_at": same_time.isoformat(),
+        "expires_at": (same_time + timedelta(hours=1)).isoformat(),
+        "handoff_started_at": same_time.isoformat(),
+        "receipt_recorded_at": same_time.isoformat(),
+        "terminal_at": same_time.isoformat(),
+    }
+
+    observation = _observe(runtime, _EffectReadOverride(store, claim=valid_claim))
+
+    assert observation.effects[0].gateway_claim is not None
+    assert observation.effects[0].gateway_claim.state == "terminal"
+
+
+def test_gateway_claim_indeterminate_with_all_equal_timestamps_succeeds(tmp_path: Path) -> None:
+    """Valid indeterminate claim with claimed_at == handoff_started_at == terminal_at should succeed."""
+    runtime, store = _runtime_and_store(tmp_path)
+    intent, dispatch = _commit_effect(store, include_claim=True)
+    assert dispatch is not None
+    _add_reference(runtime, intent, dispatch, claim_id="claim-1")
+    claim = store.get_gateway_claim("claim-1", DOMAIN_A)
+    assert claim is not None
+    same_time = NOW + timedelta(minutes=10)
+    valid_claim = {
+        **claim,
+        "state": "indeterminate",
+        "claimed_at": same_time.isoformat(),
+        "expires_at": (same_time + timedelta(hours=1)).isoformat(),
+        "handoff_started_at": same_time.isoformat(),
+        "receipt_recorded_at": None,
+        "terminal_at": same_time.isoformat(),
+    }
+
+    observation = _observe(runtime, _EffectReadOverride(store, claim=valid_claim))
+
+    assert observation.effects[0].gateway_claim is not None
+    assert observation.effects[0].gateway_claim.state == "indeterminate"
+
+
+# ======================================================================
+# FINAL CORRECTION REGRESSIONS: Source-order validation
+# ======================================================================
+
+
+def test_mission_transition_out_of_revision_order_fails(tmp_path: Path) -> None:
+    """Individually plausible transitions returned out of revision order must fail, not be sorted."""
+    runtime, store = _runtime_and_store(tmp_path)
+    runtime.start_mission(DOMAIN_A, MISSION_ID, expected_revision=1)
+    runtime.pause_mission(DOMAIN_A, MISSION_ID, expected_revision=2)
+
+    class OutOfOrderRuntime:
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+        def get_mission(self, control_domain: str, mission_id: str):
+            return self.delegate.get_mission(control_domain, mission_id)
+
+        def list_transitions(self, control_domain: str, mission_id: str):
+            transitions = list(self.delegate.list_transitions(control_domain, mission_id))
+            # Return them in wrong order: [rev 2, rev 1, rev 3] instead of [1, 2, 3]
+            if len(transitions) >= 3:
+                return [transitions[1], transitions[0], transitions[2]]
+            return transitions
+
+        def list_checkpoints(self, control_domain: str, mission_id: str):
+            return self.delegate.list_checkpoints(control_domain, mission_id)
+
+        def list_effect_references(self, control_domain: str, mission_id: str):
+            return self.delegate.list_effect_references(control_domain, mission_id)
+
+    with pytest.raises(MissionObservabilityIntegrityError, match="transition revisions contradict"):
+        _observe(OutOfOrderRuntime(runtime), store)
+
+
+# ======================================================================
+# FINAL CORRECTION REGRESSIONS: Transition legality validation
+# ======================================================================
+
+
+def test_mission_initial_transition_must_be_created_to_created(tmp_path: Path) -> None:
+    """First transition must be exactly CREATED -> CREATED with revision 1."""
+    runtime, store = _runtime_and_store(tmp_path)
+
+    class WrongInitialTransitionRuntime:
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+        def get_mission(self, control_domain: str, mission_id: str):
+            spec, _, rev, updated = self.delegate.get_mission(control_domain, mission_id)
+            # Return RUNNING to match the broken first transition
+            return spec, MissionLifecycle.RUNNING, rev, updated
+
+        def list_transitions(self, control_domain: str, mission_id: str):
+            transitions = list(self.delegate.list_transitions(control_domain, mission_id))
+            if len(transitions) > 0:
+                # Break initial transition: make it CREATED -> RUNNING
+                broken = replace(transitions[0], to_state=MissionLifecycle.RUNNING)
+                transitions[0] = broken
+            return transitions
+
+        def list_checkpoints(self, control_domain: str, mission_id: str):
+            return self.delegate.list_checkpoints(control_domain, mission_id)
+
+        def list_effect_references(self, control_domain: str, mission_id: str):
+            return self.delegate.list_effect_references(control_domain, mission_id)
+
+    with pytest.raises(MissionObservabilityIntegrityError, match="first transition must be to CREATED"):
+        _observe(WrongInitialTransitionRuntime(runtime), store)
+
+
+def test_mission_initial_transition_from_paused_fails(tmp_path: Path) -> None:
+    """Initial transition from PAUSED instead of CREATED must fail."""
+    runtime, store = _runtime_and_store(tmp_path)
+
+    class WrongInitialFromStateRuntime:
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+        def get_mission(self, control_domain: str, mission_id: str):
+            return self.delegate.get_mission(control_domain, mission_id)
+
+        def list_transitions(self, control_domain: str, mission_id: str):
+            transitions = list(self.delegate.list_transitions(control_domain, mission_id))
+            if len(transitions) > 0:
+                broken = replace(transitions[0], from_state=MissionLifecycle.PAUSED)
+                transitions[0] = broken
+            return transitions
+
+        def list_checkpoints(self, control_domain: str, mission_id: str):
+            return self.delegate.list_checkpoints(control_domain, mission_id)
+
+        def list_effect_references(self, control_domain: str, mission_id: str):
+            return self.delegate.list_effect_references(control_domain, mission_id)
+
+    with pytest.raises(MissionObservabilityIntegrityError, match="first transition must be from CREATED"):
+        _observe(WrongInitialFromStateRuntime(runtime), store)
+
+
+def test_mission_illegal_created_to_failed_transition_fails(tmp_path: Path) -> None:
+    """Illegal CREATED -> FAILED transition must fail."""
+    runtime, store = _runtime_and_store(tmp_path)
+
+    class IllegalCreatedToFailedRuntime:
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+        def get_mission(self, control_domain: str, mission_id: str):
+            spec, _, rev, updated = self.delegate.get_mission(control_domain, mission_id)
+            # Return FAILED to match the illegal transition
+            return spec, MissionLifecycle.FAILED, 2, updated
+
+        def list_transitions(self, control_domain: str, mission_id: str):
+            transitions = list(self.delegate.list_transitions(control_domain, mission_id))
+            # Add illegal transition CREATED -> FAILED
+            illegal = replace(
+                transitions[0],
+                revision=2,
+                to_state=MissionLifecycle.FAILED,
+                transition_id="illegal-transition",
+            )
+            return transitions + [illegal]
+
+        def list_checkpoints(self, control_domain: str, mission_id: str):
+            return self.delegate.list_checkpoints(control_domain, mission_id)
+
+        def list_effect_references(self, control_domain: str, mission_id: str):
+            return self.delegate.list_effect_references(control_domain, mission_id)
+
+    with pytest.raises(MissionObservabilityIntegrityError, match="Illegal mission transition"):
+        _observe(IllegalCreatedToFailedRuntime(runtime), store)
+
+
+def test_mission_illegal_created_to_paused_transition_fails(tmp_path: Path) -> None:
+    """Illegal CREATED -> PAUSED transition must fail."""
+    runtime, store = _runtime_and_store(tmp_path)
+
+    class IllegalCreatedToPausedRuntime:
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+        def get_mission(self, control_domain: str, mission_id: str):
+            spec, _, rev, updated = self.delegate.get_mission(control_domain, mission_id)
+            # Return PAUSED to match the illegal transition
+            return spec, MissionLifecycle.PAUSED, 2, updated
+
+        def list_transitions(self, control_domain: str, mission_id: str):
+            transitions = list(self.delegate.list_transitions(control_domain, mission_id))
+            illegal = replace(
+                transitions[0],
+                revision=2,
+                to_state=MissionLifecycle.PAUSED,
+                transition_id="illegal-paused",
+            )
+            return transitions + [illegal]
+
+        def list_checkpoints(self, control_domain: str, mission_id: str):
+            return self.delegate.list_checkpoints(control_domain, mission_id)
+
+        def list_effect_references(self, control_domain: str, mission_id: str):
+            return self.delegate.list_effect_references(control_domain, mission_id)
+
+    with pytest.raises(MissionObservabilityIntegrityError, match="Illegal mission transition"):
+        _observe(IllegalCreatedToPausedRuntime(runtime), store)
+
+
+def test_mission_transition_from_completed_fails(tmp_path: Path) -> None:
+    """Terminal state COMPLETED cannot transition."""
+    runtime, store = _runtime_and_store(tmp_path)
+    runtime.start_mission(DOMAIN_A, MISSION_ID, expected_revision=1)
+    runtime.complete_mission(DOMAIN_A, MISSION_ID, expected_revision=2)
+
+    class TerminalTransitionRuntime:
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+        def get_mission(self, control_domain: str, mission_id: str):
+            spec, _, _, updated = self.delegate.get_mission(control_domain, mission_id)
+            # Return RUNNING to match the illegal transition end state
+            return spec, MissionLifecycle.RUNNING, 4, updated
+
+        def list_transitions(self, control_domain: str, mission_id: str):
+            transitions = list(self.delegate.list_transitions(control_domain, mission_id))
+            # Try to transition from COMPLETED
+            illegal = replace(
+                transitions[-1],
+                revision=4,
+                from_state=MissionLifecycle.COMPLETED,
+                to_state=MissionLifecycle.RUNNING,
+                transition_id="illegal-from-terminal",
+            )
+            return transitions + [illegal]
+
+        def list_checkpoints(self, control_domain: str, mission_id: str):
+            return self.delegate.list_checkpoints(control_domain, mission_id)
+
+        def list_effect_references(self, control_domain: str, mission_id: str):
+            return self.delegate.list_effect_references(control_domain, mission_id)
+
+    with pytest.raises(MissionObservabilityIntegrityError, match="Illegal mission transition"):
+        _observe(TerminalTransitionRuntime(runtime), store)
+
+
+def test_mission_transition_from_failed_fails(tmp_path: Path) -> None:
+    """Terminal state FAILED cannot transition."""
+    runtime, store = _runtime_and_store(tmp_path)
+    runtime.start_mission(DOMAIN_A, MISSION_ID, expected_revision=1)
+    runtime.fail_mission(DOMAIN_A, MISSION_ID, expected_revision=2, reason="test failure")
+
+    class FailedTransitionRuntime:
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+        def get_mission(self, control_domain: str, mission_id: str):
+            spec, _, _, updated = self.delegate.get_mission(control_domain, mission_id)
+            # Return RUNNING to match the illegal transition end state
+            return spec, MissionLifecycle.RUNNING, 4, updated
+
+        def list_transitions(self, control_domain: str, mission_id: str):
+            transitions = list(self.delegate.list_transitions(control_domain, mission_id))
+            illegal = replace(
+                transitions[-1],
+                revision=4,
+                from_state=MissionLifecycle.FAILED,
+                to_state=MissionLifecycle.RUNNING,
+                transition_id="illegal-from-failed",
+            )
+            return transitions + [illegal]
+
+        def list_checkpoints(self, control_domain: str, mission_id: str):
+            return self.delegate.list_checkpoints(control_domain, mission_id)
+
+        def list_effect_references(self, control_domain: str, mission_id: str):
+            return self.delegate.list_effect_references(control_domain, mission_id)
+
+    with pytest.raises(MissionObservabilityIntegrityError, match="Illegal mission transition"):
+        _observe(FailedTransitionRuntime(runtime), store)
+
+
+def test_mission_transition_from_cancelled_fails(tmp_path: Path) -> None:
+    """Terminal state CANCELLED cannot transition."""
+    runtime, store = _runtime_and_store(tmp_path)
+    runtime.cancel_mission(DOMAIN_A, MISSION_ID, expected_revision=1, reason="test cancellation")
+
+    class CancelledTransitionRuntime:
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+        def get_mission(self, control_domain: str, mission_id: str):
+            spec, _, _, updated = self.delegate.get_mission(control_domain, mission_id)
+            # Return RUNNING to match the illegal transition end state
+            return spec, MissionLifecycle.RUNNING, 3, updated
+
+        def list_transitions(self, control_domain: str, mission_id: str):
+            transitions = list(self.delegate.list_transitions(control_domain, mission_id))
+            illegal = replace(
+                transitions[-1],
+                revision=3,
+                from_state=MissionLifecycle.CANCELLED,
+                to_state=MissionLifecycle.RUNNING,
+                transition_id="illegal-from-cancelled",
+            )
+            return transitions + [illegal]
+
+        def list_checkpoints(self, control_domain: str, mission_id: str):
+            return self.delegate.list_checkpoints(control_domain, mission_id)
+
+        def list_effect_references(self, control_domain: str, mission_id: str):
+            return self.delegate.list_effect_references(control_domain, mission_id)
+
+    with pytest.raises(MissionObservabilityIntegrityError, match="Illegal mission transition"):
+        _observe(CancelledTransitionRuntime(runtime), store)

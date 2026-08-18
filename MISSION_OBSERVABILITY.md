@@ -27,10 +27,12 @@ timeline = reader.timeline(control_domain, mission_id)
 
 `observe()` returns a frozen, slotted `MissionObservation`. All nested projection
 models are also frozen and slotted. Collections stored in the projection are
-tuples. Mission metadata and checkpoint progress are retained as canonical JSON
-text so nested caller-owned dictionaries or lists cannot mutate the observation.
-`to_dict()` returns a new serialization copy; changing that copy does not change
-the projection. `to_json()` emits canonical deterministic JSON.
+tuples. Raw mission metadata is not projected; specification identity is retained
+via the safe `specification_fingerprint`. Checkpoint progress is retained as
+canonical JSON text so nested caller-owned dictionaries or lists cannot mutate
+the observation. `to_dict()` returns a fresh serialization copy; changing that
+copy does not change the projection. `to_json()` emits canonical deterministic
+JSON.
 
 ## Authoritative inputs
 
