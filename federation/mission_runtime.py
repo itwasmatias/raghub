@@ -336,6 +336,8 @@ class MissionRuntime:
         reason: str | None = None,
         checkpoint_id: str | None = None,
         sequence: int | None = None,
+        *,
+        expected_revision: int | None = None,
     ) -> MissionCheckpoint:
         """Create a mission checkpoint (append-only progress evidence).
 
@@ -350,12 +352,17 @@ class MissionRuntime:
             reason: Optional checkpoint reason
             checkpoint_id: Optional checkpoint ID (auto-generated if None)
             sequence: Optional sequence number (auto-computed if None)
+            expected_revision: Optional expected mission revision for concurrency control.
+                If supplied, checkpoint creation fails with MissionRevisionConflictError
+                if the mission revision has changed since the caller observed it.
+                MUST be a positive integer (not bool, not 0, not negative).
 
         Returns:
             Created checkpoint
 
         Raises:
             MissionNotFoundError: If mission does not exist
+            MissionRevisionConflictError: If expected_revision is stale
             MissionRuntimeError: If checkpoint sequence already exists
         """
         # Auto-generate checkpoint_id if not provided
@@ -379,9 +386,15 @@ class MissionRuntime:
         )
 
         try:
-            self._store.create_checkpoint(checkpoint)
+            self._store.create_checkpoint(checkpoint, expected_revision=expected_revision)
         except MissionNotFoundError:
             # Re-raise MissionNotFoundError without wrapping
+            raise
+        except MissionRevisionConflictError:
+            # Re-raise MissionRevisionConflictError without wrapping
+            raise
+        except ValueError:
+            # Re-raise ValueError without wrapping (validation errors)
             raise
         except Exception as exc:
             raise MissionRuntimeError(f"Failed to create checkpoint: {exc}") from exc

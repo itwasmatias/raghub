@@ -1430,3 +1430,520 @@ def test_mission_runtime_v0_1_foundation_complete():
 
     # Foundation complete
     assert True
+
+
+# ============================================================================
+# CHECKPOINT REVISION GUARD ATTACKS (Long-Running Mission Controller v0.1 prerequisite)
+# ============================================================================
+
+
+def test_checkpoint_with_exact_current_revision_succeeds():
+    """ATTACK 1: Checkpoint with exact current revision succeeds."""
+    runtime = MissionRuntime()
+    domain = "test-domain"
+    mission_id = "test-checkpoint-exact-revision"
+
+    runtime.create_mission(
+        mission_id=mission_id,
+        control_domain=domain,
+        objective="Test exact revision",
+        owner_identity="owner",
+    )
+
+    _, state, rev, _ = runtime.get_mission(domain, mission_id)
+    assert state == MissionLifecycle.CREATED
+    assert rev == 1
+
+    # Create checkpoint with exact current revision - should succeed
+    checkpoint = runtime.create_checkpoint(
+        control_domain=domain,
+        mission_id=mission_id,
+        mission_state=MissionLifecycle.CREATED,
+        expected_revision=rev,
+    )
+    assert checkpoint is not None
+    assert checkpoint.sequence == 0
+
+    # Verify checkpoint was created
+    checkpoints = runtime.list_checkpoints(domain, mission_id)
+    assert len(checkpoints) == 1
+
+
+def test_checkpoint_with_stale_revision_fails():
+    """ATTACK 2: Checkpoint with stale revision fails with MissionRevisionConflictError."""
+    runtime = MissionRuntime()
+    domain = "test-domain"
+    mission_id = "test-checkpoint-stale-revision"
+
+    runtime.create_mission(
+        mission_id=mission_id,
+        control_domain=domain,
+        objective="Test stale revision",
+        owner_identity="owner",
+    )
+
+    # Read initial revision
+    _, _, initial_rev, _ = runtime.get_mission(domain, mission_id)
+    assert initial_rev == 1
+
+    # Transition to RUNNING (revision 1 → 2)
+    new_rev = runtime.start_mission(domain, mission_id, initial_rev)
+    assert new_rev == 2
+
+    # ATTACK: Create checkpoint with stale revision 1 - should fail
+    with pytest.raises(MissionRevisionConflictError, match="Revision conflict"):
+        runtime.create_checkpoint(
+            control_domain=domain,
+            mission_id=mission_id,
+            mission_state=MissionLifecycle.RUNNING,
+            expected_revision=initial_rev,  # Stale revision
+        )
+
+
+def test_stale_checkpoint_failure_writes_nothing():
+    """ATTACK 3: Stale checkpoint failure writes nothing."""
+    runtime = MissionRuntime()
+    domain = "test-domain"
+    mission_id = "test-stale-writes-nothing"
+
+    runtime.create_mission(
+        mission_id=mission_id,
+        control_domain=domain,
+        objective="Test stale writes nothing",
+        owner_identity="owner",
+    )
+
+    # Get initial revision
+    _, _, rev, _ = runtime.get_mission(domain, mission_id)
+    assert rev == 1
+
+    # Transition to RUNNING
+    rev = runtime.start_mission(domain, mission_id, rev)
+    assert rev == 2
+
+    # ATTACK: Try to create checkpoint with stale revision
+    with pytest.raises(MissionRevisionConflictError):
+        runtime.create_checkpoint(
+            control_domain=domain,
+            mission_id=mission_id,
+            mission_state=MissionLifecycle.RUNNING,
+            expected_revision=1,  # Stale
+        )
+
+    # PROOF: No checkpoint was written
+    checkpoints = runtime.list_checkpoints(domain, mission_id)
+    assert len(checkpoints) == 0
+
+    # PROOF: Mission revision unchanged
+    _, _, final_rev, _ = runtime.get_mission(domain, mission_id)
+    assert final_rev == 2
+
+
+def test_checkpoint_with_future_revision_fails():
+    """ATTACK 4: Checkpoint with future/non-current revision fails."""
+    runtime = MissionRuntime()
+    domain = "test-domain"
+    mission_id = "test-checkpoint-future-revision"
+
+    runtime.create_mission(
+        mission_id=mission_id,
+        control_domain=domain,
+        objective="Test future revision",
+        owner_identity="owner",
+    )
+
+    _, _, rev, _ = runtime.get_mission(domain, mission_id)
+    assert rev == 1
+
+    # ATTACK: Try to create checkpoint with future revision - should fail
+    with pytest.raises(MissionRevisionConflictError, match="Revision conflict"):
+        runtime.create_checkpoint(
+            control_domain=domain,
+            mission_id=mission_id,
+            mission_state=MissionLifecycle.CREATED,
+            expected_revision=999,  # Future revision
+        )
+
+
+def test_checkpoint_expected_revision_zero_fails():
+    """ATTACK 5: expected_revision=0 fails validation."""
+    runtime = MissionRuntime()
+    domain = "test-domain"
+    mission_id = "test-checkpoint-revision-zero"
+
+    runtime.create_mission(
+        mission_id=mission_id,
+        control_domain=domain,
+        objective="Test revision zero",
+        owner_identity="owner",
+    )
+
+    # ATTACK: expected_revision=0 should fail validation
+    with pytest.raises(ValueError, match="positive integer"):
+        runtime.create_checkpoint(
+            control_domain=domain,
+            mission_id=mission_id,
+            mission_state=MissionLifecycle.CREATED,
+            expected_revision=0,
+        )
+
+
+def test_checkpoint_expected_revision_negative_fails():
+    """ATTACK 6: expected_revision=-1 fails validation."""
+    runtime = MissionRuntime()
+    domain = "test-domain"
+    mission_id = "test-checkpoint-revision-negative"
+
+    runtime.create_mission(
+        mission_id=mission_id,
+        control_domain=domain,
+        objective="Test negative revision",
+        owner_identity="owner",
+    )
+
+    # ATTACK: expected_revision=-1 should fail validation
+    with pytest.raises(ValueError, match="positive integer"):
+        runtime.create_checkpoint(
+            control_domain=domain,
+            mission_id=mission_id,
+            mission_state=MissionLifecycle.CREATED,
+            expected_revision=-1,
+        )
+
+
+def test_checkpoint_expected_revision_bool_fails():
+    """ATTACK 7: expected_revision=True fails validation (bool is not int)."""
+    runtime = MissionRuntime()
+    domain = "test-domain"
+    mission_id = "test-checkpoint-revision-bool"
+
+    runtime.create_mission(
+        mission_id=mission_id,
+        control_domain=domain,
+        objective="Test bool revision",
+        owner_identity="owner",
+    )
+
+    # ATTACK: expected_revision=True should fail validation
+    # (bool is subclass of int in Python, so we explicitly reject it)
+    with pytest.raises(ValueError, match="not bool"):
+        runtime.create_checkpoint(
+            control_domain=domain,
+            mission_id=mission_id,
+            mission_state=MissionLifecycle.CREATED,
+            expected_revision=True,
+        )
+
+
+def test_checkpoint_expected_revision_string_fails():
+    """ATTACK 8: expected_revision="1" fails validation."""
+    runtime = MissionRuntime()
+    domain = "test-domain"
+    mission_id = "test-checkpoint-revision-string"
+
+    runtime.create_mission(
+        mission_id=mission_id,
+        control_domain=domain,
+        objective="Test string revision",
+        owner_identity="owner",
+    )
+
+    # ATTACK: expected_revision="1" should fail validation
+    with pytest.raises(ValueError, match="integer"):
+        runtime.create_checkpoint(
+            control_domain=domain,
+            mission_id=mission_id,
+            mission_state=MissionLifecycle.CREATED,
+            expected_revision="1",  # type: ignore
+        )
+
+
+def test_checkpoint_omitted_expected_revision_preserves_compatibility():
+    """ATTACK 9: Omitted expected_revision preserves existing compatibility behavior."""
+    runtime = MissionRuntime()
+    domain = "test-domain"
+    mission_id = "test-checkpoint-omitted-revision"
+
+    runtime.create_mission(
+        mission_id=mission_id,
+        control_domain=domain,
+        objective="Test omitted revision",
+        owner_identity="owner",
+    )
+
+    # Create checkpoint WITHOUT expected_revision (backward compatibility)
+    checkpoint = runtime.create_checkpoint(
+        control_domain=domain,
+        mission_id=mission_id,
+        mission_state=MissionLifecycle.CREATED,
+        # expected_revision NOT supplied
+    )
+    assert checkpoint is not None
+
+    # Transition mission
+    runtime.start_mission(domain, mission_id, 1)
+
+    # Create another checkpoint WITHOUT expected_revision - should still work
+    checkpoint2 = runtime.create_checkpoint(
+        control_domain=domain,
+        mission_id=mission_id,
+        mission_state=MissionLifecycle.RUNNING,
+        # expected_revision NOT supplied
+    )
+    assert checkpoint2 is not None
+
+    checkpoints = runtime.list_checkpoints(domain, mission_id)
+    assert len(checkpoints) == 2
+
+
+def test_checkpoint_state_mismatch_still_fails_with_revision():
+    """ATTACK 10: Current mission state mismatch still fails as before (even with correct revision)."""
+    runtime = MissionRuntime()
+    domain = "test-domain"
+    mission_id = "test-checkpoint-state-mismatch-with-revision"
+
+    runtime.create_mission(
+        mission_id=mission_id,
+        control_domain=domain,
+        objective="Test state mismatch",
+        owner_identity="owner",
+    )
+
+    runtime.start_mission(domain, mission_id, 1)
+
+    _, _, rev, _ = runtime.get_mission(domain, mission_id)
+    assert rev == 2
+
+    # ATTACK: Correct revision but wrong state - should fail
+    with pytest.raises(MissionRuntimeError, match="does not match"):
+        runtime.create_checkpoint(
+            control_domain=domain,
+            mission_id=mission_id,
+            mission_state=MissionLifecycle.PAUSED,  # Wrong state
+            expected_revision=rev,  # Correct revision
+        )
+
+
+def test_terminal_mission_still_rejects_checkpoint_with_revision():
+    """ATTACK 11: Terminal mission still rejects checkpoint as before (even with correct revision)."""
+    runtime = MissionRuntime()
+    domain = "test-domain"
+    mission_id = "test-terminal-checkpoint-with-revision"
+
+    runtime.create_mission(
+        mission_id=mission_id,
+        control_domain=domain,
+        objective="Test terminal with revision",
+        owner_identity="owner",
+    )
+
+    rev = runtime.start_mission(domain, mission_id, 1)
+    rev = runtime.complete_mission(domain, mission_id, rev)
+
+    _, state, final_rev, _ = runtime.get_mission(domain, mission_id)
+    assert state == MissionLifecycle.COMPLETED
+
+    # ATTACK: Correct revision but terminal state - should fail
+    with pytest.raises(MissionRuntimeError, match="terminal"):
+        runtime.create_checkpoint(
+            control_domain=domain,
+            mission_id=mission_id,
+            mission_state=MissionLifecycle.COMPLETED,
+            expected_revision=final_rev,  # Correct revision
+        )
+
+
+def test_checkpoint_cross_domain_isolation_with_revision():
+    """ATTACK 12: Same mission_id in different ControlDomains cannot interfere."""
+    runtime = MissionRuntime()
+    mission_id = "test-cross-domain-checkpoint"
+    domain_a = "domain-alpha"
+    domain_b = "domain-beta"
+
+    # Create mission in domain A
+    runtime.create_mission(
+        mission_id=mission_id,
+        control_domain=domain_a,
+        objective="Domain A",
+        owner_identity="owner-a",
+    )
+
+    # Create mission in domain B (same mission_id)
+    runtime.create_mission(
+        mission_id=mission_id,
+        control_domain=domain_b,
+        objective="Domain B",
+        owner_identity="owner-b",
+    )
+
+    # Transition domain A to RUNNING (revision 2)
+    runtime.start_mission(domain_a, mission_id, 1)
+
+    # Get revisions
+    _, _, rev_a, _ = runtime.get_mission(domain_a, mission_id)
+    _, _, rev_b, _ = runtime.get_mission(domain_b, mission_id)
+    assert rev_a == 2
+    assert rev_b == 1
+
+    # Create checkpoint in domain A with its revision
+    runtime.create_checkpoint(
+        control_domain=domain_a,
+        mission_id=mission_id,
+        mission_state=MissionLifecycle.RUNNING,
+        expected_revision=rev_a,
+    )
+
+    # Create checkpoint in domain B with its revision
+    runtime.create_checkpoint(
+        control_domain=domain_b,
+        mission_id=mission_id,
+        mission_state=MissionLifecycle.CREATED,
+        expected_revision=rev_b,
+    )
+
+    # PROOF: Both succeeded independently
+    checkpoints_a = runtime.list_checkpoints(domain_a, mission_id)
+    checkpoints_b = runtime.list_checkpoints(domain_b, mission_id)
+    assert len(checkpoints_a) == 1
+    assert len(checkpoints_b) == 1
+
+
+def test_checkpoint_lifecycle_transition_causes_stale_revision_failure():
+    """ATTACK 13: Lifecycle transition between read and checkpoint commit causes failure."""
+    runtime = MissionRuntime()
+    domain = "test-domain"
+    mission_id = "test-checkpoint-race"
+
+    runtime.create_mission(
+        mission_id=mission_id,
+        control_domain=domain,
+        objective="Test race condition",
+        owner_identity="owner",
+    )
+
+    # Actor A reads revision 1
+    _, state_a, rev_a, _ = runtime.get_mission(domain, mission_id)
+    assert rev_a == 1
+    assert state_a == MissionLifecycle.CREATED
+
+    # Actor B transitions mission (revision 1 → 2)
+    new_rev = runtime.start_mission(domain, mission_id, 1)
+    assert new_rev == 2
+
+    # ATTACK: Actor A attempts checkpoint with stale revision 1 - should fail
+    with pytest.raises(MissionRevisionConflictError, match="Revision conflict"):
+        runtime.create_checkpoint(
+            control_domain=domain,
+            mission_id=mission_id,
+            mission_state=MissionLifecycle.CREATED,  # State A observed
+            expected_revision=rev_a,  # Stale revision
+        )
+
+
+def test_checkpoint_revision_check_is_store_authoritative():
+    """ATTACK 14: Two independent store instances prove revision detection is database-authoritative."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "test_store_authoritative.db"
+        domain = "test-domain"
+        mission_id = "test-store-authoritative"
+
+        # Runtime 1: Create mission
+        runtime1 = MissionRuntime(db_path=db_path)
+        runtime1.create_mission(
+            mission_id=mission_id,
+            control_domain=domain,
+            objective="Test store authority",
+            owner_identity="owner",
+        )
+
+        # Runtime 1: Read revision
+        _, _, rev1, _ = runtime1.get_mission(domain, mission_id)
+        assert rev1 == 1
+
+        # Runtime 2: Separate connection, transition mission
+        runtime2 = MissionRuntime(db_path=db_path)
+        new_rev = runtime2.start_mission(domain, mission_id, 1)
+        assert new_rev == 2
+
+        # ATTACK: Runtime 1 attempts checkpoint with stale revision
+        # This proves the check is at database level, not in-memory
+        with pytest.raises(MissionRevisionConflictError, match="Revision conflict"):
+            runtime1.create_checkpoint(
+                control_domain=domain,
+                mission_id=mission_id,
+                mission_state=MissionLifecycle.CREATED,
+                expected_revision=rev1,  # Stale from runtime1's perspective
+            )
+
+
+def test_checkpoint_conflict_does_not_mutate_mission_revision():
+    """ATTACK 15: Checkpoint conflict must not mutate mission revision."""
+    runtime = MissionRuntime()
+    domain = "test-domain"
+    mission_id = "test-checkpoint-no-revision-mutation"
+
+    runtime.create_mission(
+        mission_id=mission_id,
+        control_domain=domain,
+        objective="Test no revision mutation",
+        owner_identity="owner",
+    )
+
+    runtime.start_mission(domain, mission_id, 1)
+
+    _, _, rev_before, _ = runtime.get_mission(domain, mission_id)
+    assert rev_before == 2
+
+    # ATTACK: Try to create checkpoint with stale revision
+    with pytest.raises(MissionRevisionConflictError):
+        runtime.create_checkpoint(
+            control_domain=domain,
+            mission_id=mission_id,
+            mission_state=MissionLifecycle.RUNNING,
+            expected_revision=1,  # Stale
+        )
+
+    # PROOF: Mission revision unchanged
+    _, _, rev_after, _ = runtime.get_mission(domain, mission_id)
+    assert rev_after == rev_before == 2
+
+
+def test_checkpoint_conflict_does_not_append_checkpoint():
+    """ATTACK 16: Checkpoint conflict must not append a checkpoint."""
+    runtime = MissionRuntime()
+    domain = "test-domain"
+    mission_id = "test-checkpoint-no-append"
+
+    runtime.create_mission(
+        mission_id=mission_id,
+        control_domain=domain,
+        objective="Test no append",
+        owner_identity="owner",
+    )
+
+    runtime.start_mission(domain, mission_id, 1)
+
+    # Create valid checkpoint
+    runtime.create_checkpoint(
+        control_domain=domain,
+        mission_id=mission_id,
+        mission_state=MissionLifecycle.RUNNING,
+        expected_revision=2,
+    )
+
+    checkpoints_before = runtime.list_checkpoints(domain, mission_id)
+    assert len(checkpoints_before) == 1
+
+    # ATTACK: Try to create checkpoint with stale revision
+    with pytest.raises(MissionRevisionConflictError):
+        runtime.create_checkpoint(
+            control_domain=domain,
+            mission_id=mission_id,
+            mission_state=MissionLifecycle.RUNNING,
+            expected_revision=1,  # Stale
+        )
+
+    # PROOF: No new checkpoint was appended
+    checkpoints_after = runtime.list_checkpoints(domain, mission_id)
+    assert len(checkpoints_after) == 1
+    assert checkpoints_after[0].checkpoint_id == checkpoints_before[0].checkpoint_id

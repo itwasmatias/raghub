@@ -622,7 +622,7 @@ class MissionRuntimeStore:
             if self._memory_connection is None:
                 conn.close()
 
-    def create_checkpoint(self, checkpoint: MissionCheckpoint) -> None:
+    def create_checkpoint(self, checkpoint: MissionCheckpoint, *, expected_revision: int | None = None) -> None:
         """Create a new mission checkpoint.
 
         Checkpoints can only be created for non-terminal missions, and the
@@ -630,22 +630,37 @@ class MissionRuntimeStore:
 
         Args:
             checkpoint: Mission checkpoint
+            expected_revision: Optional expected mission revision for concurrency control.
+                If supplied, checkpoint creation fails with MissionRevisionConflictError
+                if the mission revision has changed. MUST be a positive integer (not bool).
 
         Raises:
             MissionNotFoundError: If mission does not exist
+            MissionRevisionConflictError: If expected_revision is stale
             MissionRuntimeStoreError: If checkpoint sequence already exists
             IllegalMissionTransitionError: If mission is terminal or state mismatch
+            ValueError: If expected_revision validation fails
         """
         if not isinstance(checkpoint, MissionCheckpoint):
             raise TypeError("checkpoint must be a MissionCheckpoint")
 
+        # Validate expected_revision if supplied
+        if expected_revision is not None:
+            # Reject bool masquerading as int (bool is subclass of int in Python)
+            if isinstance(expected_revision, bool):
+                raise ValueError("expected_revision must be an integer, not bool")
+            if not isinstance(expected_revision, int):
+                raise ValueError("expected_revision must be an integer")
+            if expected_revision < 1:
+                raise ValueError("expected_revision must be a positive integer (>= 1)")
+
         conn = self._connect()
         try:
             with conn:
-                # Verify mission exists and get current state
+                # Verify mission exists and get current state AND revision
                 cursor = conn.execute(
                     """
-                    SELECT current_state FROM mission_state
+                    SELECT current_state, revision FROM mission_state
                     WHERE control_domain = ? AND mission_id = ?
                     """,
                     (checkpoint.control_domain, checkpoint.mission_id),
@@ -657,6 +672,14 @@ class MissionRuntimeStore:
                     )
 
                 current_state = MissionLifecycle(row[0])
+                current_revision = row[1]
+
+                # If expected_revision supplied, verify it matches current revision
+                if expected_revision is not None:
+                    if current_revision != expected_revision:
+                        raise MissionRevisionConflictError(
+                            f"Revision conflict: expected {expected_revision}, current {current_revision}"
+                        )
 
                 # Reject checkpoints for terminal missions
                 if _is_terminal_state(current_state):
