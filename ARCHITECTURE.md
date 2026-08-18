@@ -1,4 +1,15 @@
-# RAGHub Architecture
+# Architecture Context and Status
+
+This file preserves several architectural layers from the repository's history.
+They are labeled explicitly so historical RAGHub/SIP descriptions are not
+mistaken for the current MissionaryX control model, and future direction is not
+mistaken for implemented behavior.
+
+# Legacy/Historical RAGHub Architecture
+
+The following RAGHub material is retained as historical context. Statements such
+as "Today" describe that earlier architecture and are not current MissionaryX
+runtime claims.
 
 ## Overview
 
@@ -264,7 +275,7 @@ Before implementing a change, ask:
 If yes, continue.
 
 If not, redesign first.
-# RAGHub/SIP v1.0 Architecture
+# Legacy/Historical RAGHub/SIP v1.0 Architecture
 
 ```text
 NBA and sportsbook providers
@@ -315,17 +326,23 @@ Observed source facts, derived analytical claims, model forecasts, qualitative
 context, and historical replay data retain distinct labels. Empty live sources
 remain empty; they are never replaced with fictional production rows.
 
-## Federated AI Operating System Direction
+## Future/Target Federated AI Operating System Direction
 
-RAGHub's canonical long-term architecture, including its Fedora and Windows compute nodes, iPhone command center, persistent workers, host supervisors, and capability broker, is documented in:
+The historical RAGHub target direction, including Fedora and Windows compute
+nodes, an iPhone command center, persistent workers, host supervisors, and a
+capability broker, is documented in:
 
 `RAGHUB_AI_OS_VISION.md`
 
 ---
 
-# MissionaryX Federated Architecture
+# Current MissionaryX Architecture
 
-MissionaryX provides a federated AI operating system architecture built on four independent truths: **Mission**, **Authority**, **Access/Credential**, and **Effect**. Each truth maintains its own invariants and boundaries.
+The current repository contains MissionaryX contracts organized around four
+independent truths: **Mission**, **Authority**, **Access/Credential**, and
+**Effect**. Each truth maintains its own invariants and boundaries. This section
+describes implemented contracts and explicitly qualifies integration scope; it
+does not claim that every repository entry point uses the entire control model.
 
 ## The Four Independent Truths
 
@@ -398,7 +415,10 @@ Authentication: Proof of identity (session-scoped)
 
 **Location**: `federation/access_credential_broker.py`, `federation/access_credential_store.py`, `federation/access_connection.py`, `federation/access_requirement.py`, `federation/credential_backend.py`, `federation/credential_broker.py`, `federation/authentication_session.py`
 
-**Purpose**: Manages access requirements, credential retrieval authorization, credential backend selection, and secret handling.
+**Purpose**: Separates access authorization from credential retrieval and records
+provider/canonical scope bindings. The newer `AccessCredentialBroker.authorize()`
+returns non-secret `AccessCredentialAuthorization` and does not resolve or return
+reusable credentials.
 
 **Key Invariants**:
 - Authorization ≠ credential retrieval
@@ -406,7 +426,8 @@ Authentication: Proof of identity (session-scoped)
 - Access requirements are evaluated independently
 - Credential backend selection respects provider scope
 - Canonical digest binds credentials to specific contexts
-- Secret leases are not exposed in public interfaces
+- The newer authorization result is non-secret and performs no raw-secret resolution
+- The inherited legacy `CredentialBroker` remains a separate public raw-secret boundary
 - Authentication ≠ authorization
 
 **Critical Distinctions**:
@@ -418,13 +439,18 @@ Provider Scope:        Backend constraint binding
 Canonical Scope:       Cryptographic context binding
 ```
 
-**Responsibilities**:
+**Responsibilities of the newer AccessCredentialBroker**:
 - Access requirement evaluation
 - Credential retrieval authorization
 - Credential backend selection and routing
-- Secret lease management (internal only)
 - Authentication session management
 - Provider and canonical scope binding
+
+**Inherited legacy debt**: `federation.credential_broker.CredentialLease` remains
+root-exported and publicly exposes `secret_bytes()` and `secret_text()`. That
+legacy API predates Access & Credential Broker v0.1; the newer broker did not
+introduce it and must not be described as eliminating the repository-wide
+raw-secret boundary.
 
 **Does NOT Handle**:
 - Authority evaluation (handled by Authority Truth)
@@ -473,9 +499,11 @@ Schema Migration:     Safe evolution of effect storage
 
 ---
 
-## Control Chain
+## MissionaryX Control Model and Intended Governed Path
 
-The MissionaryX control chain flows through all four truths in a specific order:
+The MissionaryX control model defines the following intended governed path. It
+is a contract for integrations that adopt the model, not proof of universal
+production wiring across every repository entry point:
 
 ```
 1. ControlDomain
@@ -515,13 +543,21 @@ The MissionaryX control chain flows through all four truths in a specific order:
     └─> Mission state update based on effect outcome
 ```
 
-**Critical Principle**: Each truth enforces its own invariants. Bypassing any truth violates the architectural contract.
+**Currently verified Pavilion integration**: `CanonicalPavilionCoordinator`
+constructs the canonical intent, reservation, and dispatch records and routes
+Pavilion local-shell actions through `GovernedEffectGateway` before invoking its
+adapter. This establishes a concrete Pavilion canonical-gateway integration; it
+does not prove that every repository entry point is routed through that class.
+
+**Critical Principle**: Operations claiming this governed control model must
+preserve each truth's invariants along the path they actually use.
 
 ---
 
 ## Architectural Invariants
 
-These invariants must hold across all MissionaryX operations:
+These invariants must hold for governed MissionaryX operations implementing this
+control model:
 
 ### Identity vs. Authority
 - `identity != authority`
@@ -577,15 +613,20 @@ These invariants must hold across all MissionaryX operations:
 
 The following files implement core MissionaryX subsystem boundaries and should not be modified without careful architectural review:
 
+<!-- PROTECTED_INVENTORY_START -->
+
 **Effect Truth**:
 - `federation/durable_effect_store.py`
 - `federation/effect_gateway.py`
 - `federation/effect_boundary.py`
+- `federation/effect_safety.py`
 - `federation/canonical_digest.py`
 - `pavilionos/canonical_adapter.py`
 - `pavilionos/canonical_coordinator.py`
 
 **Authority Truth**:
+- `federation/agent_identity.py`
+- `federation/agent_identity_registry.py`
 - `federation/authority_evaluator.py`
 - `federation/delegation_grant.py`
 - `federation/delegation_grant_registry.py`
@@ -604,6 +645,8 @@ The following files implement core MissionaryX subsystem boundaries and should n
 - `federation/mission_state.py`
 - `federation/mission_runtime.py`
 - `federation/mission_runtime_store.py`
+
+<!-- PROTECTED_INVENTORY_END -->
 
 Changes to these files should preserve the architectural invariants documented above.
 

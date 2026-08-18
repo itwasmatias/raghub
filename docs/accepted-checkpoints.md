@@ -8,7 +8,7 @@ This document records the accepted MissionaryX checkpoints and their significanc
 
 2. **Independent Acceptance**: A checkpoint identifies when a subsystem was independently accepted. A later commit does not automatically invalidate an earlier subsystem checkpoint; the SHA identifies the point at which that subsystem was verified.
 
-3. **Subsystem Independence**: Different subsystems may have different accepted checkpoints. The most recent integrated checkpoint combines all accepted subsystems.
+3. **Subsystem Independence**: Different subsystems may have different accepted checkpoints. Integration can preserve accepted semantics through an exact ancestor or a documented patch-equivalent commit; these relationships must not be conflated.
 
 4. **Non-Blocking Observations**: Known observations that do not violate required invariants are documented but do not prevent checkpoint acceptance.
 
@@ -58,16 +58,22 @@ This document records the accepted MissionaryX checkpoints and their significanc
 - Access requirements are evaluated independently
 - Credential backend selection respects provider scope
 - Canonical digest binds credentials to specific contexts
-- Secret leases are not exposed in public interfaces
+- `AccessCredentialBroker.authorize()` returns non-secret `AccessCredentialAuthorization`
+- The newer broker does not resolve or return reusable credentials
 
 **Supersedes**: None (new subsystem)
 
 **Key Commits in Foundation**:
-- `c29ad67`: Remove public secret lease and complete broker proofs
-- `5ef8456`: Bind authority evaluation to grant grantee identity
-- `20558fa`: Separate credential authorization from secret use
-- `f55f92f`: Gate credential use on MissionaryX authority
-- `451e32f`: Add Access and Credential Broker v0.1 foundation
+- `c29ad67c7a33917d2bab48d0b140eb315b25cfc7`: Remove the newer broker's secret-bearing authorization result and complete broker proofs
+- `5ef84562cffb2e3227e75e6b66d740bf39650927`: Bind authority evaluation to grant grantee identity in the integrated lineage
+- `20558face2f84d4d03a0f9bf0ca193e97fc7aaf6`: Separate credential authorization from secret use
+- `f55f92f1d9a5fcde2314da5228cae7d0d5d01298`: Gate credential use on MissionaryX authority
+- `451e32f71f44bfc5e4192a85c6e3e6643b3009b1`: Add Access and Credential Broker v0.1 foundation
+
+**Inherited legacy secret boundary**: The older `CredentialBroker` was not
+introduced by Access & Credential Broker v0.1. Its root-exported
+`CredentialLease` still exposes `secret_bytes()` and `secret_text()`. Therefore
+the repository does not yet have a global "no public raw-secret lease" property.
 
 **Validation Evidence**: Comprehensive broker foundation tests covering authorization, scope binding, and secret handling.
 
@@ -78,6 +84,16 @@ This document records the accepted MissionaryX checkpoints and their significanc
 ### Agent Identity & Delegation v0.1
 
 **Checkpoint SHA**: `840d7645045a02174509559637ab9af1ad215e89`
+
+**Integrated Lineage Commit**: `5ef84562cffb2e3227e75e6b66d740bf39650927`
+
+**Provenance**: `840d7645045a02174509559637ab9af1ad215e89` is
+the independently accepted authority checkpoint. It is not an ancestor of the
+current lineage. Its patch-equivalent commit
+`5ef84562cffb2e3227e75e6b66d740bf39650927` is an ancestor of the current
+integrated base. Independent review confirmed matching stable patch identity and
+matching source content. The accepted authority semantics are integrated; the
+original accepted SHA itself is not an ancestor.
 
 **Date**: 2026-08-17 (approximate)
 
@@ -96,9 +112,9 @@ This document records the accepted MissionaryX checkpoints and their significanc
 **Supersedes**: None (foundational subsystem)
 
 **Key Related Commits**:
-- `cfc2164`: Extend MissionaryX Agent Identity & Delegation to v0.1 authority-contract compliance
-- `c1382ac`: Correct authority enforcement and durability semantics
-- `686457e`: Complete legacy authority migration proof
+- `cfc2164888f2822dca42940967ac5f68734f64ed`: Extend MissionaryX Agent Identity & Delegation to v0.1 authority-contract compliance
+- `c1382aca52452f4a1a75ec4e7b70ce9cefe5fdb2`: Correct authority enforcement and durability semantics
+- `686457e5ab72e43449016cd64d5789c1a5b3149c`: Complete legacy authority migration proof
 
 **Validation Evidence**: Comprehensive authority foundation and correction test suites pass, including durability and enforcement tests.
 
@@ -159,13 +175,22 @@ These foundational components were established through earlier development cycle
 
 **Current Integrated Checkpoint**: `5637f813ce1669cd288b47edc946a71ea53dc63e`
 
-**Integration Status**: This checkpoint represents the most recent integration of all accepted subsystems:
+**Integration Status**: This checkpoint is the accepted integrated base for all
+accepted subsystem semantics. Mission Runtime, Access/Credential, and the durable
+store correction are present through exact ancestry. Authority semantics are
+present through patch-equivalent integrated commit
+`5ef84562cffb2e3227e75e6b66d740bf39650927`; the independently accepted
+authority SHA `840d7645045a02174509559637ab9af1ad215e89` itself is not an
+ancestor:
 - Mission Runtime v0.1
 - Agent Identity & Delegation v0.1
 - Access & Credential Broker v0.1
 - DurableEffectStore concurrent migration correction
 
 **Development Continuity**: Future development should ordinarily start from this integrated checkpoint unless working on an independent subsystem that requires a different base.
+
+Development Continuity v0.1 is currently a candidate awaiting fresh independent
+review. It is not listed here as an accepted or designated checkpoint.
 
 ---
 
@@ -203,7 +228,7 @@ test "$(git rev-parse HEAD)" = "5637f813ce1669cd288b47edc946a71ea53dc63e" && \
 
 For automated verification, use:
 ```bash
-./tools/verify-checkpoint 5637f813ce1669cd288b47edc946a71ea53dc63e
+./tools/verify-checkpoint --require-clean 5637f813ce1669cd288b47edc946a71ea53dc63e
 ```
 
 ---

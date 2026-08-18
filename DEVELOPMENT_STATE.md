@@ -37,18 +37,28 @@ The project also includes **SIP (Sports Intelligence Platform)**, a sports analy
 
 **Commit Message**: "Make concurrent durable-store migration converge"
 
-This checkpoint integrates all four accepted MissionaryX subsystems:
-- Mission Runtime v0.1
-- Agent Identity & Delegation v0.1
-- Access & Credential Broker v0.1
-- DurableEffectStore concurrent migration correction
+This checkpoint integrates all four accepted MissionaryX subsystem semantics:
+
+| Subsystem | Independently accepted checkpoint | Current-lineage integration |
+|---|---|---|
+| Mission Runtime v0.1 | `721f75683fd53ae0549645c70653bf981c713c6d` | Exact ancestor |
+| Agent Identity & Delegation v0.1 | `840d7645045a02174509559637ab9af1ad215e89` | Patch-equivalent commit `5ef84562cffb2e3227e75e6b66d740bf39650927` |
+| Access & Credential Broker v0.1 | `dba334668608034c19efc3e2d9c791b7b8f74583` | Exact ancestor |
+| DurableEffectStore correction | `5637f813ce1669cd288b47edc946a71ea53dc63e` | Exact ancestor and integrated base |
+
+The independently accepted authority checkpoint
+`840d7645045a02174509559637ab9af1ad215e89` is not an ancestor of this
+lineage. Independent review confirmed that
+`5ef84562cffb2e3227e75e6b66d740bf39650927` has matching patch identity and
+source content. The accepted authority semantics are integrated through that
+patch-equivalent commit; the original accepted SHA itself is not an ancestor.
 
 **Verification**:
 ```bash
 git rev-parse HEAD
 # Should output: 5637f813ce1669cd288b47edc946a71ea53dc63e
 
-./tools/verify-checkpoint 5637f813ce1669cd288b47edc946a71ea53dc63e
+./tools/verify-checkpoint --require-clean 5637f813ce1669cd288b47edc946a71ea53dc63e
 ```
 
 See `docs/accepted-checkpoints.md` for full checkpoint history and subsystem details.
@@ -72,7 +82,8 @@ branch: feature/development-continuity-v0-1
 Create a dedicated worktree for focused development:
 ```bash
 cd /home/matias/raghub
-git worktree add /path/to/new-worktree -b feature/your-feature-name 5637f813
+git worktree add /path/to/new-worktree -b feature/your-feature-name \
+  5637f813ce1669cd288b47edc946a71ea53dc63e
 ```
 
 ### Environment Setup
@@ -88,14 +99,13 @@ See `ENVIRONMENT_SETUP.md` for detailed environment setup instructions.
 ### Verification Before Starting
 
 ```bash
-# Verify checkpoint
-git rev-parse HEAD
-
-# Verify clean tree
-git status
+# Verify exact checkpoint and clean tree
+./tools/verify-checkpoint --require-clean \
+  5637f813ce1669cd288b47edc946a71ea53dc63e
 
 # Run quick validation
-./tools/validate-missionaryx --quick
+./tools/validate-missionaryx --quick \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 ```
 
 ---
@@ -135,19 +145,36 @@ pytest --deselect=tests/test_llamacpp_adapter.py::test_timeout_returns_error_res
 
 ---
 
+## Inherited Architectural Debt
+
+The newer `AccessCredentialBroker.authorize()` returns non-secret
+`AccessCredentialAuthorization` and neither resolves nor returns reusable
+credentials. Separately, the inherited legacy `CredentialBroker` remains a
+public raw-secret boundary: its root-exported `CredentialLease` exposes
+`secret_bytes()` and `secret_text()`. Access & Credential Broker v0.1 did not
+introduce that legacy API and does not establish a repository-wide "no public
+raw-secret lease" property.
+
+---
+
 ## Architecture Boundaries: DO NOT CROSS
 
 The following implementation files enforce critical MissionaryX invariants and must **NOT** be modified without architectural review and explicit justification:
+
+<!-- PROTECTED_INVENTORY_START -->
 
 **Effect Truth**:
 - `federation/durable_effect_store.py`
 - `federation/effect_gateway.py`
 - `federation/effect_boundary.py`
+- `federation/effect_safety.py`
 - `federation/canonical_digest.py`
 - `pavilionos/canonical_adapter.py`
 - `pavilionos/canonical_coordinator.py`
 
 **Authority Truth**:
+- `federation/agent_identity.py`
+- `federation/agent_identity_registry.py`
 - `federation/authority_evaluator.py`
 - `federation/delegation_grant.py`
 - `federation/delegation_grant_registry.py`
@@ -167,6 +194,8 @@ The following implementation files enforce critical MissionaryX invariants and m
 - `federation/mission_runtime.py`
 - `federation/mission_runtime_store.py`
 
+<!-- PROTECTED_INVENTORY_END -->
+
 **If your work appears to require changing these files, STOP and report why.**
 
 See `ARCHITECTURE.md` for full architectural documentation.
@@ -179,14 +208,16 @@ See `ARCHITECTURE.md` for full architectural documentation.
 
 Runs high-value focused tests:
 ```bash
-./tools/validate-missionaryx --quick
+./tools/validate-missionaryx --quick \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 ```
 
 ### Full Validation
 
 Runs complete test suite with documented deselections:
 ```bash
-./tools/validate-missionaryx --full
+./tools/validate-missionaryx --full \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 ```
 
 Or manually:
@@ -199,40 +230,26 @@ PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider -q \
 
 ```bash
 git diff --check
-python3 -m compileall .
+bytecode_cache="$(mktemp -d)"
+PYTHONPYCACHEPREFIX="$bytecode_cache" python3 -m compileall -q -f .
+rm -rf -- "$bytecode_cache"
 ```
 
 ---
 
-## AI Development Model Usage
+## Optional AI Assistance
 
-MissionaryX development uses multiple AI assistants in specific roles:
+MissionaryX development is model- and provider-independent. No hosted model,
+specific model family, or AI coding tool is required. Human development, Git,
+and deterministic tests remain sufficient and authoritative.
 
-### Fedora HP Pavilion (This Machine)
+**Historical environment observation**: On 2026-08-17 the Fedora HP Pavilion
+reported Python 3.14.6 and a CPU without AVX support. Tool and model availability
+are mutable machine observations and must be rechecked; they are not project
+requirements and do not justify pinning a hosted model in this state record.
 
-**AI Tool**: Claude Code (pinned v2.0.14, npm-installed, no AVX support)
-
-**Role**: Programming and development
-
-**Constraint**: This CPU has zero AVX support. Native `claude` builds (Bun runtime, 2.0.15+) crash with "Illegal instruction." Do NOT run `claude update`.
-
-**Model**: Sonnet 4.5 (no /effort settings on this version)
-
-### Claude.ai Chat
-
-**Role**: Planning and idea review ONLY — not programming
-
-### Windows HP 14
-
-**AI Tools**: ChatGPT, Codex, GitHub Copilot
-
-**Role**: Programming on Windows-specific features
-
-### Planning Workflow
-
-- Compare approaches using both Claude.ai chat and ChatGPT
-- Implementation happens on the appropriate machine
-- Handoff between machines requires explicit preparation
+AI-assisted handoffs must identify the actual tool/environment used and preserve
+the same checkpoint, scope, and validation evidence required of human work.
 
 ---
 
@@ -259,7 +276,8 @@ Work is considered accepted when:
 
 **Purpose**: Ensure MissionaryX remains understandable, testable, and developable without hosted AI services.
 
-**Status**: In progress (this document is part of this milestone)
+**Status**: Candidate awaiting fresh independent review. This milestone has not
+been independently accepted or designated as a checkpoint.
 
 **Next After This**: To be determined based on architectural priorities and subsystem needs.
 
@@ -269,9 +287,11 @@ See `DEVELOPMENT_PROTOCOL.md` for the full development lifecycle.
 
 ## Local Model Support
 
-MissionaryX includes comprehensive local model infrastructure:
+MissionaryX contains local-model adapter, lifecycle, registry, capacity, and
+governed-inference code support.
 
-**Status**: AVAILABLE NOW
+**Status**: CODE SUPPORT PRESENT; RUNNABLE LOCAL ENVIRONMENT NOT PROVEN BY THIS
+CHECKOUT
 
 **Components**:
 - `federation/llamacpp_adapter.py`: llama.cpp integration
@@ -286,6 +306,10 @@ MissionaryX includes comprehensive local model infrastructure:
 - `docs/governed-local-inference-integration-v0.1.md`
 
 **Usage**: See `LOCAL_AI_DEVELOPMENT.md` for local model development workflow.
+
+This checkout does not itself prove that `llama-server`, compatible model
+weights, an offline wheelhouse, or a live attested inference environment is
+present. Local AI is optional assistance.
 
 **Important**: Local models are not automatically trusted. Deterministic tests and Git remain the acceptance authority.
 
@@ -366,7 +390,7 @@ Before starting development:
 - [ ] Verify checkpoint: `5637f813ce1669cd288b47edc946a71ea53dc63e`
 - [ ] Verify clean tree: `git status`
 - [ ] Create/activate Python environment
-- [ ] Run quick validation: `./tools/validate-missionaryx --quick`
+- [ ] Run quick validation with exact base: `./tools/validate-missionaryx --quick --base 5637f813ce1669cd288b47edc946a71ea53dc63e`
 - [ ] Review `ARCHITECTURE.md` for relevant subsystems
 - [ ] Understand protected boundaries for your work
 - [ ] Create focused worktree/branch for your feature

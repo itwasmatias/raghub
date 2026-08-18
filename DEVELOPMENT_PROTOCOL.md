@@ -40,7 +40,7 @@ git status --short
 
 **Checkpoint verification tool**:
 ```bash
-./tools/verify-checkpoint 5637f813ce1669cd288b47edc946a71ea53dc63e
+./tools/verify-checkpoint --require-clean 5637f813ce1669cd288b47edc946a71ea53dc63e
 ```
 
 **If checkpoint doesn't match**: STOP. Do not proceed until the mismatch is resolved.
@@ -93,10 +93,14 @@ git status --short --branch
 
 **Automated verification**:
 ```bash
-./tools/verify-checkpoint <expected-sha>
+./tools/verify-checkpoint --require-clean <expected-full-sha>
 ```
 
 **If verification fails**: STOP. Report the discrepancy.
+
+`--require-clean` makes tree cleanliness part of the gate instead of merely
+reporting a warning. The helper performs read-only Git queries and never cleans,
+stages, resets, or otherwise changes repository state.
 
 ---
 
@@ -145,8 +149,12 @@ See `ENVIRONMENT_SETUP.md` for detailed environment setup.
 
 ```bash
 # Quick validation (high-value focused tests)
-./tools/validate-missionaryx --quick
+./tools/validate-missionaryx --quick --base <full-base-sha>
 ```
+
+`--base` must receive the exact 40-character milestone base. When supplied, the
+validator verifies that it is an ancestor and checks the committed
+`<base>..HEAD` range in addition to working-tree diffs. Do not guess a base.
 
 **Or run subsystem-specific tests**:
 ```bash
@@ -167,7 +175,7 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest -q tests/test_your_subsystem.py
 **Run complete test suite**:
 
 ```bash
-./tools/validate-missionaryx --full
+./tools/validate-missionaryx --full --base <full-base-sha>
 ```
 
 **Or manually**:
@@ -201,8 +209,10 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest -p no:cacheprovider -q \
 # Check for whitespace errors
 git diff --check
 
-# Verify Python compilation
-python3 -m compileall .
+# Verify Python compilation without writing caches into the worktree
+bytecode_cache="$(mktemp -d)"
+PYTHONPYCACHEPREFIX="$bytecode_cache" python3 -m compileall -q -f .
+rm -rf -- "$bytecode_cache"
 ```
 
 **Both checks must pass** before commit.
@@ -355,7 +365,7 @@ git status
 **Pass criteria**:
 - All tests pass (except documented deselections)
 - No whitespace errors (`git diff --check`)
-- No compilation errors (`python3 -m compileall .`)
+- No compilation errors (compileall with an external bytecode cache)
 
 **Evidence required**:
 - Exact test counts (passed/failed/skipped/deselected)

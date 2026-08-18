@@ -7,7 +7,7 @@
     "commit_message": "Make concurrent durable-store migration converge",
     "date": "2026-08-17",
     "branch": "feature/development-continuity-v0-1",
-    "description": "Integrated checkpoint combining all accepted MissionaryX subsystems"
+    "description": "Accepted integrated base containing all accepted subsystem semantics; authority provenance includes a patch-equivalent lineage commit"
   },
   "accepted_subsystem_checkpoints": [
     {
@@ -27,6 +27,9 @@
     {
       "name": "Agent Identity & Delegation v0.1",
       "commit_sha": "840d7645045a02174509559637ab9af1ad215e89",
+      "integrated_commit_sha": "5ef84562cffb2e3227e75e6b66d740bf39650927",
+      "integration_relationship": "patch_equivalent",
+      "accepted_commit_is_ancestor": false,
       "subsystem": "Authority Truth",
       "purpose": "Establish agent identity and delegation grant system",
       "status": "accepted"
@@ -57,14 +60,21 @@
       "related_subsystem": "Effect Truth"
     }
   ],
+  "inherited_architectural_debt": [
+    {
+      "component": "Legacy CredentialBroker",
+      "description": "CredentialLease remains root-exported and publicly exposes secret_bytes()/secret_text(); this predates Access & Credential Broker v0.1",
+      "introduced_by_access_credential_broker_v0_1": false
+    }
+  ],
   "python_version": "3.11+",
   "tested_python_version": "3.14.6",
-  "standard_validation_command": "./tools/validate-missionaryx",
+  "standard_validation_command": "./tools/validate-missionaryx --full --base 5637f813ce1669cd288b47edc946a71ea53dc63e",
   "validation_modes": {
-    "quick": "./tools/validate-missionaryx --quick",
-    "full": "./tools/validate-missionaryx --full"
+    "quick": "./tools/validate-missionaryx --quick --base 5637f813ce1669cd288b47edc946a71ea53dc63e",
+    "full": "./tools/validate-missionaryx --full --base 5637f813ce1669cd288b47edc946a71ea53dc63e"
   },
-  "checkpoint_verification_command": "./tools/verify-checkpoint",
+  "checkpoint_verification_command": "./tools/verify-checkpoint --require-clean <expected-full-sha>",
   "environment_setup": {
     "venv_creation": "python3 -m venv .venv",
     "dependency_installation": ".venv/bin/pip install -r requirements-dev.txt",
@@ -72,7 +82,7 @@
   },
   "next_milestone": {
     "name": "Development Continuity v0.1",
-    "status": "in_progress",
+    "status": "candidate_awaiting_independent_review",
     "purpose": "Ensure MissionaryX remains developable without hosted AI services",
     "expected_deliverables": [
       "Checkpoint record documentation",
@@ -131,6 +141,7 @@
         "federation/durable_effect_store.py",
         "federation/effect_gateway.py",
         "federation/effect_boundary.py",
+        "federation/effect_safety.py",
         "federation/canonical_digest.py",
         "pavilionos/canonical_adapter.py",
         "pavilionos/canonical_coordinator.py"
@@ -167,28 +178,10 @@
     "primary_branch": "feature/development-continuity-v0-1",
     "main_branch_for_prs": "feature/ai-controller-platform-v1"
   },
-  "development_machines": {
-    "fedora_hp_pavilion": {
-      "role": "Claude Code programming and development",
-      "ai_tool": "Claude Code v2.0.14 (npm, pinned, no AVX support)",
-      "model": "Sonnet 4.5",
-      "constraint": "No AVX CPU support, native builds crash"
-    },
-    "claude_ai_chat": {
-      "role": "Planning and idea review only (not programming)"
-    },
-    "windows_hp_14": {
-      "role": "Programming for Windows-specific features",
-      "ai_tools": "ChatGPT, Codex, GitHub Copilot"
-    }
-  },
-  "acceptance_criteria": {
-    "implementation_complete": true,
-    "focused_validation_passed": true,
-    "full_validation_passed": true,
-    "independent_review_verified": true,
-    "reviewer_reproduced_invariants": true,
-    "checkpoint_designated": true
+  "candidate_review_state": {
+    "status": "candidate",
+    "independent_review": "awaiting_fresh_review",
+    "checkpoint_designated": false
   },
   "last_updated": "2026-08-17",
   "state_document_maintainer": "Development Continuity Toolkit"

@@ -8,6 +8,7 @@ Usage:
     ./tools/validate-missionaryx                 # Full validation (default)
     ./tools/validate-missionaryx --full          # Full validation
     ./tools/validate-missionaryx --quick         # Quick validation
+    ./tools/validate-missionaryx --quick --base <full-sha>
     ./tools/validate-missionaryx --help          # Show help
 
 Exit codes:
@@ -16,10 +17,29 @@ Exit codes:
     2: Invalid usage or environment error
 """
 
+import argparse
+import os
+import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+
+
+QUICK_TESTS = (
+    "tests/test_mission_runtime_foundation.py",
+    "tests/test_authority_foundation.py",
+    "tests/test_access_credential_broker_foundation.py",
+    "tests/test_durable_effect_store.py",
+    "tests/test_effect_gateway_foundation.py",
+)
+
+KNOWN_DESELECTIONS = (
+    "tests/test_llamacpp_adapter.py::test_timeout_returns_error_response",
+)
+
+FULL_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 def run_command(args, description, cwd=None, env=None):
@@ -60,22 +80,20 @@ def run_command(args, description, cwd=None, env=None):
 
 def get_repository_root():
     """Get repository root."""
-    try:
-        result = subprocess.run(
-            ['git', 'rev-parse', '--show-toplevel'],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        return Path(result.stdout.strip())
-    except:
-        print("ERROR: Not in a git repository", file=sys.stderr)
-        sys.exit(2)
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        detail = result.stderr.strip() or "not in a Git repository"
+        print(f"ERROR: Cannot establish repository root: {detail}", file=sys.stderr)
+        raise SystemExit(2)
+    return Path(result.stdout.strip())
 
 
-def get_python_path():
+def get_python_path(root):
     """Get Python path, preferring .venv if it exists."""
-    root = get_repository_root()
     venv_python = root / '.venv' / 'bin' / 'python'
 
     if venv_python.exists():
@@ -84,9 +102,8 @@ def get_python_path():
         return 'python3'
 
 
-def get_pytest_path():
+def get_pytest_path(root):
     """Get pytest path, preferring .venv if it exists."""
-    root = get_repository_root()
     venv_pytest = root / '.venv' / 'bin' / 'pytest'
 
     if venv_pytest.exists():
@@ -102,15 +119,14 @@ def print_header(title):
     print("=" * 70)
 
 
-def report_environment():
+def report_environment(root):
     """Report validation environment."""
     print_header("VALIDATION ENVIRONMENT")
 
-    root = get_repository_root()
-    python_path = get_python_path()
+    python_path = get_python_path(root)
 
     # Python version
-    success, stdout, _ = run_command(
+    all_passed, _, _ = run_command(
         [python_path, '--version'],
         'Python version',
         cwd=root
@@ -119,116 +135,104 @@ def report_environment():
     # Repository path
     print(f"\nRepository: {root}")
 
-    # Branch
-    try:
-        result = subprocess.run(
-            ['git', 'branch', '--show-current'],
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=root
-        )
-        print(f"Branch: {result.stdout.strip()}")
-    except:
-        pass
+    for args, label in (
+        (["git", "branch", "--show-current"], "Git branch"),
+        (["git", "rev-parse", "HEAD"], "Git HEAD"),
+        (["git", "status", "--porcelain=v1", "--untracked-files=all"], "Git status"),
+    ):
+        success, _, _ = run_command(args, label, cwd=root)
+        all_passed = success and all_passed
 
-    # HEAD
-    try:
-        result = subprocess.run(
-            ['git', 'rev-parse', 'HEAD'],
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=root
-        )
-        print(f"HEAD: {result.stdout.strip()}")
-    except:
-        pass
-
-    # Git status
-    try:
-        result = subprocess.run(
-            ['git', 'status', '--short'],
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=root
-        )
-        status = result.stdout.strip()
-        if status:
-            print(f"Status: DIRTY")
-            print("Working tree has uncommitted changes")
-        else:
-            print(f"Status: CLEAN")
-    except:
-        pass
+    return all_passed
 
 
-def run_git_diff_check():
-    """Run git diff --check for whitespace errors."""
+def validate_base(root, base):
+    """Validate an explicit full-SHA milestone base and its ancestry."""
+    if base is None:
+        return True
+    if FULL_SHA_PATTERN.fullmatch(base) is None:
+        print("ERROR: --base requires a full 40-character hexadecimal SHA", file=sys.stderr)
+        return False
+
+    exists, _, _ = run_command(
+        ["git", "cat-file", "-e", f"{base}^{{commit}}"],
+        "Verify milestone base is a commit",
+        cwd=root,
+    )
+    if not exists:
+        return False
+
+    ancestor, _, _ = run_command(
+        ["git", "merge-base", "--is-ancestor", base, "HEAD"],
+        "Verify milestone base is an ancestor of HEAD",
+        cwd=root,
+    )
+    return ancestor
+
+
+def run_git_diff_checks(root, base=None):
+    """Check unstaged, staged, and optional committed milestone diffs."""
     print_header("GIT DIFF CHECK")
 
-    root = get_repository_root()
-    success, _, _ = run_command(
-        ['git', 'diff', '--check'],
-        'Check for whitespace errors',
-        cwd=root
+    all_passed, _, _ = run_command(
+        ["git", "diff", "--check"],
+        "Check unstaged working-tree diff",
+        cwd=root,
     )
+    staged, _, _ = run_command(
+        ["git", "diff", "--cached", "--check"],
+        "Check staged working-tree diff",
+        cwd=root,
+    )
+    all_passed = staged and all_passed
 
-    return success
+    if base is not None:
+        range_success, _, _ = run_command(
+            ["git", "diff", "--check", f"{base}..HEAD"],
+            "Check committed milestone range",
+            cwd=root,
+        )
+        all_passed = range_success and all_passed
+
+    return all_passed
 
 
-def run_compile_check():
-    """Run Python compilation check."""
+def run_compile_check(root):
+    """Compile Python with bytecode redirected outside the worktree."""
     print_header("PYTHON COMPILE CHECK")
 
-    root = get_repository_root()
-    python_path = get_python_path()
-
-    success, _, _ = run_command(
-        [python_path, '-m', 'compileall', '-q', '.'],
-        'Compile all Python files',
-        cwd=root
-    )
-
+    python_path = get_python_path(root)
+    with tempfile.TemporaryDirectory(prefix="missionaryx-bytecode-") as cache_dir:
+        env = os.environ.copy()
+        env.pop("PYTHONDONTWRITEBYTECODE", None)
+        env["PYTHONPYCACHEPREFIX"] = cache_dir
+        success, _, _ = run_command(
+            [python_path, "-m", "compileall", "-q", "-f", "."],
+            "Compile all Python files with external bytecode cache",
+            cwd=root,
+            env=env,
+        )
     return success
 
 
-def run_quick_validation():
+def run_quick_validation(root):
     """Run quick validation tests."""
     print_header("QUICK VALIDATION")
 
-    root = get_repository_root()
-    pytest_path = get_pytest_path()
-
-    # High-value focused tests
-    test_patterns = [
-        'tests/test_mission_runtime_foundation.py',
-        'tests/test_authority_foundation.py',
-        'tests/test_access_credential_broker_foundation.py',
-        'tests/test_durable_effect_store.py',
-        'tests/test_effect_gateway_foundation.py'
-    ]
-
-    # Check which test files exist
-    existing_tests = []
-    for pattern in test_patterns:
-        test_path = root / pattern
-        if test_path.exists():
-            existing_tests.append(pattern)
-
-    if not existing_tests:
-        print("WARNING: No quick validation tests found")
-        print("Falling back to full test suite")
-        return run_full_validation()
+    pytest_path = get_pytest_path(root)
+    missing_tests = [path for path in QUICK_TESTS if not (root / path).is_file()]
+    if missing_tests:
+        print("ERROR: Required quick-validation test files are missing:", file=sys.stderr)
+        for path in missing_tests:
+            print(f"  - {path}", file=sys.stderr)
+        return False
 
     # Set environment to prevent bytecode generation
-    import os
     env = os.environ.copy()
     env['PYTHONDONTWRITEBYTECODE'] = '1'
 
     success, stdout, _ = run_command(
-        [pytest_path, '-p', 'no:cacheprovider', '-q'] + existing_tests,
+        [pytest_path, '-p', 'no:cacheprovider', '-q', *QUICK_TESTS],
         'Quick validation tests',
         cwd=root,
         env=env
@@ -243,22 +247,17 @@ def run_quick_validation():
     return success
 
 
-def run_full_validation():
+def run_full_validation(root):
     """Run full validation with known deselections."""
     print_header("FULL VALIDATION")
 
-    root = get_repository_root()
-    pytest_path = get_pytest_path()
+    pytest_path = get_pytest_path(root)
 
     # Set environment to prevent bytecode generation
-    import os
     env = os.environ.copy()
     env['PYTHONDONTWRITEBYTECODE'] = '1'
 
-    # Known deselections
-    deselections = [
-        '--deselect=tests/test_llamacpp_adapter.py::test_timeout_returns_error_response'
-    ]
+    deselections = [f"--deselect={node_id}" for node_id in KNOWN_DESELECTIONS]
 
     success, stdout, _ = run_command(
         [pytest_path, '-p', 'no:cacheprovider', '-q'] + deselections,
@@ -274,7 +273,8 @@ def run_full_validation():
             print(f"  {line}")
 
     print("\nKnown Deselections:")
-    print("  - tests/test_llamacpp_adapter.py::test_timeout_returns_error_response")
+    for node_id in KNOWN_DESELECTIONS:
+        print(f"  - {node_id}")
     print("    Reason: Inherited flaky timeout test")
 
     return success
@@ -285,54 +285,53 @@ def show_help():
     print(__doc__)
 
 
+def parse_arguments(argv):
+    """Parse validation mode and optional exact milestone base."""
+    parser = argparse.ArgumentParser(
+        description="Run deterministic MissionaryX validation.",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--quick", action="store_const", const="quick", dest="mode")
+    mode.add_argument("--full", action="store_const", const="full", dest="mode")
+    parser.add_argument(
+        "--base",
+        metavar="FULL_SHA",
+        help="check the committed milestone range FULL_SHA..HEAD",
+    )
+    parser.set_defaults(mode="full")
+    return parser.parse_args(argv)
+
+
 def main():
     """Main entry point."""
-    args = sys.argv[1:]
+    args = parse_arguments(sys.argv[1:])
+    root = get_repository_root()
 
-    # Parse arguments
-    mode = 'full'  # default
+    if args.base is not None and not validate_base(root, args.base):
+        raise SystemExit(2)
 
-    if len(args) == 0:
-        mode = 'full'
-    elif len(args) == 1:
-        arg = args[0]
-        if arg in ('-h', '--help', 'help'):
-            show_help()
-            sys.exit(0)
-        elif arg in ('--full', 'full'):
-            mode = 'full'
-        elif arg in ('--quick', 'quick'):
-            mode = 'quick'
-        else:
-            print(f"ERROR: Unknown option: {arg}", file=sys.stderr)
-            print("Run './tools/validate-missionaryx --help' for usage", file=sys.stderr)
-            sys.exit(2)
-    else:
-        print("ERROR: Too many arguments", file=sys.stderr)
-        print("Run './tools/validate-missionaryx --help' for usage", file=sys.stderr)
-        sys.exit(2)
-
-    # Report environment
-    report_environment()
+    if not report_environment(root):
+        print("ERROR: Could not establish the required validation environment", file=sys.stderr)
+        raise SystemExit(1)
 
     # Track overall success
     all_passed = True
 
+    # Working-tree integrity always applies; milestone range applies when explicit.
+    all_passed = run_git_diff_checks(root, args.base) and all_passed
+
     # Run validations
-    if mode == 'quick':
+    if args.mode == 'quick':
         print_header("QUICK VALIDATION MODE")
-        all_passed = run_quick_validation() and all_passed
+        all_passed = run_quick_validation(root) and all_passed
     else:  # full
         print_header("FULL VALIDATION MODE")
 
-        # Git diff check
-        all_passed = run_git_diff_check() and all_passed
-
         # Compile check
-        all_passed = run_compile_check() and all_passed
+        all_passed = run_compile_check(root) and all_passed
 
         # Full test suite
-        all_passed = run_full_validation() and all_passed
+        all_passed = run_full_validation(root) and all_passed
 
     # Final summary
     print_header("VALIDATION SUMMARY")

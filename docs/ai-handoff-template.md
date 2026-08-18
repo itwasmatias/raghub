@@ -45,6 +45,9 @@ Human Reviewer: <name-or-identifier>
 
 **Verification required**: AI must verify HEAD matches before starting.
 
+Use `./tools/verify-checkpoint --require-clean <full-40-character-SHA>` when a
+clean first gate is required.
+
 ### TREE_STATUS
 ```
 [ ] CLEAN (required at start)
@@ -161,13 +164,13 @@ pytest tests/test_<subsystem>.py
 
 ### FULL_VALIDATION
 ```
-./tools/validate-missionaryx --full
+./tools/validate-missionaryx --full --base <full-base-sha>
 ```
 
 ### STATIC_CHECKS
 ```
 [ ] git diff --check (whitespace errors)
-[ ] python3 -m compileall . (compilation)
+[ ] compileall with PYTHONPYCACHEPREFIX set to a temporary external directory
 ```
 
 ### EXPECTED_TEST_DESELECTIONS
@@ -369,7 +372,7 @@ OUT OF SCOPE:
 1. Tool must accept optional expected SHA argument
 2. Tool must report: repo root, branch, HEAD, parent, tree status
 3. Tool must verify full 40-character SHAs only
-4. Tool must exit 0 on match, 1 on mismatch, 2 on error
+4. Tool must exit 0 on match, 1 on mismatch/clean-tree failure, and 2 on invalid usage or Git environment error
 
 # SUCCESS_CRITERIA:
 1. Tool correctly reports repository state

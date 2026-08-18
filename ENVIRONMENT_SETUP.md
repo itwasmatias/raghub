@@ -34,6 +34,10 @@ pip install -r requirements-dev.txt
 
 The `requirements-dev.txt` automatically includes `requirements-fedora-core.txt`.
 
+These install commands require network access or a previously populated package
+cache. The repository does not vendor an offline wheelhouse, so this is not a
+guaranteed fresh-machine offline bootstrap procedure.
+
 ---
 
 ## Detailed Setup
@@ -174,7 +178,8 @@ After setup, verify your environment:
 .venv/bin/python -c "import flask; import openai; import pytest; print('OK')"
 
 # 4. Run quick validation
-./tools/validate-missionaryx --quick
+./tools/validate-missionaryx --quick \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 ```
 
 All commands should succeed without errors.
@@ -321,6 +326,10 @@ make setup
 # (plus other setup tasks)
 ```
 
+`make setup` installs the core requirements, not the complete development test
+requirements. Install `requirements-dev.txt` before expecting pytest validation
+to work.
+
 See the `Makefile` for other available targets.
 
 ---
@@ -356,7 +365,8 @@ deactivate
 .venv/bin/pytest -q
 
 # Run validation without activation
-./tools/validate-missionaryx --full
+./tools/validate-missionaryx --full \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 
 # Run any Python script without activation
 .venv/bin/python script.py
@@ -386,7 +396,8 @@ python3 -m venv .venv
 .venv/bin/pytest --version
 
 # Run validation
-./tools/validate-missionaryx --full
+./tools/validate-missionaryx --full \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 ```
 
 ---
@@ -438,7 +449,7 @@ Common variables:
 - [ ] Installed dependencies: `pip install -r requirements-dev.txt`
 - [ ] Verified Python version: `.venv/bin/python --version`
 - [ ] Verified pytest available: `.venv/bin/pytest --version`
-- [ ] Ran quick validation: `./tools/validate-missionaryx --quick`
+- [ ] Ran quick validation with the exact milestone base
 - [ ] Environment works correctly
 
 **Your environment is ready for MissionaryX development!**

@@ -8,7 +8,9 @@ This document provides a step-by-step procedure for continuing MissionaryX devel
 
 ## Core Truth
 
-**MissionaryX remains fully usable without AI assistance.**
+MissionaryX does not require AI assistance for human review, Git operations, or
+testing on an **existing prepared machine** with the repository, Python
+environment, and dependencies already available.
 
 All essential capabilities are preserved:
 - Repository with complete code and history
@@ -39,7 +41,14 @@ If hosted AI services are unavailable, first determine your situation:
 - Others still accessible
 - Selective fallback needed
 
-**This procedure works for ALL scenarios, including complete AI loss.**
+Hosted-AI loss and machine bootstrap are different problems:
+
+- **Existing prepared machine**: human/Git/test development can continue with
+  already-installed dependencies.
+- **Fresh machine with no network**: bootstrap is not guaranteed because this
+  repository does not vendor Python wheels or every required system package.
+- **Local AI**: optional; requires a compatible executable, verified model
+  artifacts, and governed lifecycle/inference prerequisites.
 
 ---
 
@@ -109,6 +118,11 @@ source .venv/bin/activate
 pip install -r requirements-dev.txt
 ```
 
+This installation requires network access or a pre-populated package cache. On
+a fresh machine with no network and no cached dependencies, stop and report that
+the environment is not bootstrap-ready. `make setup` installs core requirements
+only, not the complete development/test requirements.
+
 **Alternative using Makefile**:
 ```bash
 make setup
@@ -121,7 +135,8 @@ make setup
 Verify your environment works:
 
 ```bash
-./tools/validate-missionaryx --quick
+./tools/validate-missionaryx --quick \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 ```
 
 Expected output: Quick tests pass (or report specific failures).
@@ -135,7 +150,8 @@ If validation fails, troubleshoot before proceeding.
 Verify complete system:
 
 ```bash
-./tools/validate-missionaryx --full
+./tools/validate-missionaryx --full \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 ```
 
 Expected output: Full suite passes except documented deselections.
@@ -168,24 +184,19 @@ cat ENVIRONMENT_SETUP.md
 
 ## Step 8: Use Local Model (Optional)
 
-If local models are available:
+If a governed local-model environment has already been prepared and attested:
 
 ```bash
 # Read local AI development workflow
 cat LOCAL_AI_DEVELOPMENT.md
 
-# Start llama-server (if you have model weights)
-llama-server \
-  --model /path/to/model.gguf \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --ctx-size 4096
-
-# Query model for code explanation, drafting, etc.
-# See LOCAL_AI_DEVELOPMENT.md for usage examples
+# Verify and use the lifecycle-controlled loopback endpoint:
+# http://127.0.0.1:18080
+# Follow LOCAL_AI_DEVELOPMENT.md and the governed lifecycle documentation.
 ```
 
-**Remember**: Local models assist but do not replace testing and validation.
+Do not start or trust an unmanaged server as a shortcut. Local models assist but
+do not replace testing and validation.
 
 ---
 
@@ -219,10 +230,12 @@ pytest tests/test_related.py -v
 # (repeat until tests pass)
 
 # 4. Run quick validation
-./tools/validate-missionaryx --quick
+./tools/validate-missionaryx --quick \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 
 # 5. Run full validation
-./tools/validate-missionaryx --full
+./tools/validate-missionaryx --full \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 ```
 
 ---
@@ -235,14 +248,18 @@ Before committing:
 # 1. Static checks
 git diff --check
 
-# 2. Compilation
-python3 -m compileall .
+# 2. Compilation without source-tree bytecode
+bytecode_cache="$(mktemp -d)"
+PYTHONPYCACHEPREFIX="$bytecode_cache" python3 -m compileall -q -f .
+rm -rf -- "$bytecode_cache"
 
 # 3. Quick validation
-./tools/validate-missionaryx --quick
+./tools/validate-missionaryx --quick \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 
 # 4. Full validation
-./tools/validate-missionaryx --full
+./tools/validate-missionaryx --full \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 ```
 
 **All checks must pass before commit.**
@@ -352,23 +369,10 @@ python3 -m pdb script.py
 
 See `LOCAL_AI_DEVELOPMENT.md` for detailed workflow.
 
-**Quick reference**:
-
-```bash
-# Explain code
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [{"role": "user", "content": "Explain: <code>"}],
-    "max_tokens": 512
-  }'
-
-# Draft test
-# Ask model: "Draft a test for <functionality>"
-# Review output
-# Adapt to repository patterns
-# Verify test passes
-```
+Use only the attested governed inference path described in
+`LOCAL_AI_DEVELOPMENT.md`. Drafts may help explain code or suggest tests, but a
+developer must review the output, adapt it to repository contracts, and verify
+it with deterministic tests.
 
 **Critical**: Always verify model output. Models can be wrong.
 
@@ -398,7 +402,8 @@ vi path/to/buggy/file.py
 pytest tests/test_subsystem.py::test_that_fails -vv
 
 # 6. Run full validation
-./tools/validate-missionaryx --full
+./tools/validate-missionaryx --full \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 
 # 7. Commit if passed
 git add path/to/buggy/file.py
@@ -426,7 +431,8 @@ vi tests/test_new_functionality.py
 vi path/to/implementation.py
 
 # 6. Validate
-./tools/validate-missionaryx --full
+./tools/validate-missionaryx --full \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 
 # 7. Commit
 git add tests/ path/to/implementation.py
@@ -448,7 +454,8 @@ pytest tests/test_target.py -v
 # 4. Repeat until refactoring complete
 
 # 5. Full validation
-./tools/validate-missionaryx --full
+./tools/validate-missionaryx --full \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 
 # 6. Commit
 git commit -m "Refactor <component> for <reason>"
@@ -460,19 +467,13 @@ git commit -m "Refactor <component> for <reason>"
 
 ### Tests Fail After Change
 
-```bash
-# 1. Undo change and verify tests pass again
-git checkout path/to/file.py
-pytest tests/test_related.py -v
-
-# 2. Reapply change carefully
-# Make smaller, more focused edit
-
-# 3. Test immediately
-pytest tests/test_related.py -v
-
-# 4. Iterate until tests pass
-```
+1. Inspect `git status --short` and `git diff` to understand every change.
+2. Preserve collaborative and uncommitted work before experimenting: record a
+   patch or copy affected artifacts to a separate backup location.
+3. Reproduce the accepted checkpoint in a **new worktree** and run the same test
+   there to distinguish an inherited failure from the current edit.
+4. Make a smaller corrective edit in the original worktree and rerun the focused
+   test. Do not discard another contributor's changes as a debugging shortcut.
 
 ### Don't Understand Code
 
@@ -506,7 +507,8 @@ pytest path/to/test.py::test_name -vv
 # NOT the test (unless test is wrong)
 
 # 5. Revalidate
-./tools/validate-missionaryx --full
+./tools/validate-missionaryx --full \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 ```
 
 ---
@@ -516,21 +518,27 @@ pytest path/to/test.py::test_name -vv
 If repository becomes unstable:
 
 ```bash
-# 1. Return to last accepted checkpoint
-git reset --hard 5637f813ce1669cd288b47edc946a71ea53dc63e
+# 1. Inspect and preserve current work
+git status --short --branch
+git diff
+git diff --cached
 
-# 2. Verify clean state
-git status
+# 2. From the main repository, create a separate recovery worktree
+git worktree add /path/to/recovery-worktree \
+  -b recovery/inspect-accepted-base \
+  5637f813ce1669cd288b47edc946a71ea53dc63e
 
-# 3. Run validation
-./tools/validate-missionaryx --full
-
-# 4. Start over carefully
-# Make smaller changes
-# Test more frequently
+# 3. Validate the accepted base in that new worktree
+cd /path/to/recovery-worktree
+./tools/verify-checkpoint --require-clean \
+  5637f813ce1669cd288b47edc946a71ea53dc63e
+./tools/validate-missionaryx --full \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 ```
 
-**Important**: This loses uncommitted work. Use `git stash` to save changes first if needed.
+Keep the original worktree intact until its changes have been reviewed and
+deliberately reconciled. A backup branch records committed state only; copy or
+patch uncommitted artifacts separately when they must be preserved.
 
 ---
 

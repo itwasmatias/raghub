@@ -10,53 +10,56 @@ A milestone focused on documentation/tooling has a broader protected scope (most
 
 ## Protected Files by Subsystem
 
+The inventory in this section is the canonical cross-subsystem inventory mirrored
+in `missionaryx-state.json`, `ARCHITECTURE.md`, and `DEVELOPMENT_STATE.md`.
+Milestone-specific scope may protect additional files or an entire directory.
+
+<!-- PROTECTED_INVENTORY_START -->
+
 ### Effect Truth
 
 Files implementing core effect durability and governance:
 
-```
-federation/durable_effect_store.py
-federation/effect_gateway.py
-federation/effect_boundary.py
-federation/canonical_digest.py
-pavilionos/canonical_adapter.py
-pavilionos/canonical_coordinator.py
-```
+- `federation/durable_effect_store.py`
+- `federation/effect_gateway.py`
+- `federation/effect_boundary.py`
+- `federation/effect_safety.py`
+- `federation/canonical_digest.py`
+- `pavilionos/canonical_adapter.py`
+- `pavilionos/canonical_coordinator.py`
 
 ### Authority Truth
 
 Files implementing core authority evaluation and delegation:
 
-```
-federation/authority_evaluator.py
-federation/delegation_grant.py
-federation/delegation_grant_registry.py
-federation/agent_authority_store.py
-```
+- `federation/agent_identity.py`
+- `federation/agent_identity_registry.py`
+- `federation/authority_evaluator.py`
+- `federation/delegation_grant.py`
+- `federation/delegation_grant_registry.py`
+- `federation/agent_authority_store.py`
 
 ### Access/Credential Truth
 
 Files implementing credential broker and access control:
 
-```
-federation/access_credential_broker.py
-federation/access_connection.py
-federation/access_credential_store.py
-federation/access_requirement.py
-federation/authentication_session.py
-federation/credential_backend.py
-federation/credential_broker.py
-```
+- `federation/access_credential_broker.py`
+- `federation/access_connection.py`
+- `federation/access_credential_store.py`
+- `federation/access_requirement.py`
+- `federation/authentication_session.py`
+- `federation/credential_backend.py`
+- `federation/credential_broker.py`
 
 ### Mission Truth
 
 Files implementing mission runtime and lifecycle:
 
-```
-federation/mission_state.py
-federation/mission_runtime.py
-federation/mission_runtime_store.py
-```
+- `federation/mission_state.py`
+- `federation/mission_runtime.py`
+- `federation/mission_runtime_store.py`
+
+<!-- PROTECTED_INVENTORY_END -->
 
 ---
 
@@ -92,9 +95,12 @@ PROTECTED_FILES=(
   "federation/durable_effect_store.py"
   "federation/effect_gateway.py"
   "federation/effect_boundary.py"
+  "federation/effect_safety.py"
   "federation/canonical_digest.py"
   "pavilionos/canonical_adapter.py"
   "pavilionos/canonical_coordinator.py"
+  "federation/agent_identity.py"
+  "federation/agent_identity_registry.py"
   "federation/authority_evaluator.py"
   "federation/delegation_grant.py"
   "federation/delegation_grant_registry.py"

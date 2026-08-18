@@ -15,9 +15,11 @@ This document explains how to use local models for MissionaryX development when 
 
 ## Current Local Model Infrastructure
 
-### AVAILABLE NOW
+### AVAILABLE CODE SUPPORT
 
-MissionaryX includes production-ready local model infrastructure:
+MissionaryX includes local-model contracts and implementations that can support
+a governed local environment when their external prerequisites are supplied and
+attested:
 
 **Components**:
 - `federation/llamacpp_adapter.py`: llama.cpp integration with OpenAI-compatible API
@@ -38,6 +40,20 @@ MissionaryX includes production-ready local model infrastructure:
 - `tests/test_local_model_artifact_registry.py`: Registry operations
 - `tests/test_governed_local_inference.py`: Governed inference
 - `tests/test_local_only_pilot.py`: End-to-end pilot
+
+### PROVEN RUNNABLE LOCAL ENVIRONMENT
+
+**Not established by this checkout alone.** Repository code and fake-backed
+tests do not prove that the current machine has:
+
+- a `llama-server` executable
+- compatible, verified model weights
+- an offline Python wheelhouse or dependency cache
+- a live, attested server ready for governed inference
+
+Verify those prerequisites directly before claiming live readiness. Local AI is
+optional assistance; Git history and deterministic tests remain acceptance
+authority.
 
 ### NOT YET IMPLEMENTED
 
@@ -198,60 +214,39 @@ git diff > changes.diff
 
 ### Setup
 
-```bash
-# 1. Install llama.cpp (if not already available)
-# Follow llama.cpp installation instructions for your platform
-
-# 2. Download model weights
-# Example: Qwen 2.5 0.5B Q4_K_M quantization
-# Verify model SHA-256 before use
-
-# 3. Start llama-server
-llama-server \
-  --model /path/to/model.gguf \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --ctx-size 4096 \
-  --n-gpu-layers 0
-
-# 4. Verify server is running
-curl http://127.0.0.1:8080/health
-```
+1. Verify a compatible `llama-server` binary and model artifact by digest.
+2. Follow `docs/local-model-artifact-registry-v0.1.md` and
+   `docs/local-model-server-lifecycle-v0.1.md` to register and manage them.
+3. Require an eligible, attested lifecycle record at the governed endpoint
+   `http://127.0.0.1:18080`.
+4. Use `tools/ai_controller/governed_local_inference.py`; do not start an
+   unmanaged server or treat a listening loopback port as lifecycle identity.
 
 ### Basic Usage
 
-```bash
-# Query model via OpenAI-compatible API
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "model-alias",
-    "messages": [{"role": "user", "content": "Explain DelegationGrant"}],
-    "temperature": 0.1,
-    "max_tokens": 256
-  }'
-```
+The governed integration requires the exact endpoint, expected lifecycle and
+attestation fingerprints, process identity, artifact identity, and inference
+execution authority. Consult `tests/test_governed_local_inference.py` for a
+deterministic construction example. A direct unauthenticated HTTP request is not
+the governed workflow.
 
 ### Integration with Python
 
+The adapter interface shape is:
+
 ```python
-# Use federation/llamacpp_adapter.py
-from federation.llamacpp_adapter import LlamaCppAdapter
+from federation.llamacpp_adapter import LlamaCppLocalAdapter
 
-adapter = LlamaCppAdapter(
-    endpoint="http://127.0.0.1:8080",
-    model_alias="qwen2.5-0.5b-q4km",
-    timeout_seconds=30
-)
-
-response = adapter.chat(
-    messages=[{"role": "user", "content": "Explain code..."}],
-    temperature=0.1,
-    max_tokens=256
-)
-
-print(response.content)
+# adapter_config, model, inference_request, and runtime_config must come from
+# the validated runtime/lifecycle flow; this is not a standalone bootstrap.
+adapter = LlamaCppLocalAdapter(config=adapter_config)
+response = adapter.infer(model, inference_request, runtime_config)
+print(response.output_text)
 ```
+
+The governed integration additionally binds that request to the attested
+`http://127.0.0.1:18080` lifecycle. Do not replace it with an unmanaged adapter
+or server invocation.
 
 ---
 
@@ -293,11 +288,17 @@ print(response.content)
 
 ### If Hosted AI Services Disappear
 
+On an existing prepared machine with dependencies already installed:
+
 1. **Repository remains usable**: All code, tests, docs are in Git
-2. **Tests remain runnable**: pytest works without internet
-3. **Validation still works**: `./tools/validate-missionaryx` is deterministic
+2. **Tests remain runnable**: installed pytest/dependencies do not require hosted AI
+3. **Validation still works**: `./tools/validate-missionaryx --full --base 5637f813ce1669cd288b47edc946a71ea53dc63e` is deterministic
 4. **Local models optional**: Development possible without any AI assistance
 5. **Documentation readable**: Architecture and protocol docs are human-readable
+
+A fresh machine with no network is not guaranteed to bootstrap because the
+repository does not vendor its complete dependency set. See
+`OFFLINE_SURVIVAL.md`.
 
 ### Recommended Approach
 
@@ -312,16 +313,18 @@ cat DEVELOPMENT_PROTOCOL.md
 git log --oneline -20
 
 # 3. Run validation to verify environment
-./tools/validate-missionaryx --quick
+./tools/validate-missionaryx --quick \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 
-# 4. If local model available, use for exploration
-# Start llama-server and query for code explanation
+# 4. If an attested governed local environment is available, use it for exploration
+# Do not infer readiness from repository code or a listening port alone
 
 # 5. Make focused changes
 # Edit only necessary files
 
 # 6. Validate changes
-./tools/validate-missionaryx --full
+./tools/validate-missionaryx --full \
+  --base 5637f813ce1669cd288b47edc946a71ea53dc63e
 
 # 7. Commit if validation passes
 git commit -m "Clear description of change"
