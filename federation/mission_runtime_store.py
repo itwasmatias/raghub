@@ -23,6 +23,18 @@ from types import MappingProxyType
 from typing import Any
 
 from federation.control_domain import validate_domain_id
+from federation.mission_controller_lease import (
+    DEFAULT_CONTROLLER_LEASE_DURATION,
+    MissionControllerLease,
+    MissionControllerClockError,
+    MissionControllerLeaseConflictError,
+    MissionControllerLeaseExpiredError,
+    MissionControllerLeaseNotFoundError,
+    MissionControllerLeaseStaleError,
+    validate_controller_id,
+    validate_generation,
+    validate_lease_duration,
+)
 from federation.mission_state import (
     EffectReference,
     MissionCheckpoint,
@@ -33,7 +45,7 @@ from federation.mission_state import (
 
 
 # Schema version for fail-closed compatibility checking
-MISSION_SCHEMA_VERSION = 1
+MISSION_SCHEMA_VERSION = 2
 
 
 class MissionRuntimeStoreError(Exception):
@@ -158,6 +170,92 @@ def _validate_transition(from_state: MissionLifecycle, to_state: MissionLifecycl
         )
 
 
+# Schema contract definitions for migration safety
+# Schema v2 includes all v1 tables plus mission_controller_leases
+_EXPECTED_SCHEMA_TABLES_V2: dict[str, tuple[str, ...]] = {
+    "mission_runtime_schema": ("version", "applied_at"),
+    "missions": (
+        "control_domain",
+        "mission_id",
+        "specification_fingerprint",
+        "objective",
+        "owner_identity",
+        "agent_identity",
+        "success_criteria",
+        "constraints",
+        "deadline",
+        "metadata_json",
+        "created_at",
+    ),
+    "mission_state": (
+        "control_domain",
+        "mission_id",
+        "current_state",
+        "revision",
+        "updated_at",
+        "started_at",
+        "paused_at",
+        "resumed_at",
+        "terminal_at",
+        "terminal_reason",
+    ),
+    "mission_checkpoints": (
+        "control_domain",
+        "checkpoint_id",
+        "mission_id",
+        "sequence",
+        "mission_state",
+        "progress_data_json",
+        "reason",
+        "created_at",
+    ),
+    "mission_transitions": (
+        "control_domain",
+        "transition_id",
+        "mission_id",
+        "from_state",
+        "to_state",
+        "revision",
+        "reason",
+        "checkpoint_id",
+        "transitioned_at",
+    ),
+    "mission_effect_references": (
+        "control_domain",
+        "mission_id",
+        "effect_intent_id",
+        "effect_dispatch_id",
+        "gateway_claim_id",
+        "referenced_at",
+    ),
+    "mission_controller_leases": (
+        "control_domain",
+        "mission_id",
+        "generation",
+        "controller_id",
+        "acquired_at",
+        "renewed_at",
+        "expires_at",
+        "released_at",
+    ),
+}
+
+_EXPECTED_INDEXES_V2: dict[str, tuple[str, tuple[str, ...]]] = {
+    "idx_missions_state": ("mission_state", ("control_domain", "current_state", "updated_at")),
+    "idx_checkpoints_mission": ("mission_checkpoints", ("control_domain", "mission_id", "sequence")),
+    "idx_transitions_mission": ("mission_transitions", ("control_domain", "mission_id", "transitioned_at")),
+}
+
+# Schema v1 is v2 without the controller leases table
+_EXPECTED_SCHEMA_TABLES_V1: dict[str, tuple[str, ...]] = {
+    name: columns
+    for name, columns in _EXPECTED_SCHEMA_TABLES_V2.items()
+    if name != "mission_controller_leases"
+}
+
+_EXPECTED_INDEXES_V1 = _EXPECTED_INDEXES_V2
+
+
 class MissionRuntimeStore:
     """Durable, concurrency-safe storage for mission lifecycle state.
 
@@ -172,14 +270,18 @@ class MissionRuntimeStore:
     Concurrent access from multiple processes/threads is safe via optimistic locking.
     """
 
-    def __init__(self, db_path: Path | str | None = None) -> None:
+    def __init__(self, db_path: Path | str | None = None, *, clock: Any = None) -> None:
         """Initialize mission runtime store.
 
         Args:
             db_path: Path to SQLite database file. If None, uses in-memory database.
+            clock: Optional clock callable returning timezone-aware datetime.
+                   If None, uses datetime.now(timezone.utc).
+                   For testing only - production should use default clock.
         """
         self._db_path = Path(db_path) if db_path is not None else None
         self._memory_connection: sqlite3.Connection | None = None
+        self._clock = clock if clock is not None else lambda: datetime.now(timezone.utc)
 
         if self._db_path is None:
             # In-memory database for testing
@@ -216,28 +318,226 @@ class MissionRuntimeStore:
             conn.execute(f"PRAGMA journal_mode = {_FILE_JOURNAL_MODE}")
         return conn
 
+    def _validate_schema_contract(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        expected_tables: dict[str, tuple[str, ...]] = _EXPECTED_SCHEMA_TABLES_V2,
+        expected_indexes: dict[str, tuple[str, tuple[str, ...]]] = _EXPECTED_INDEXES_V2,
+        expected_version: int = MISSION_SCHEMA_VERSION,
+    ) -> None:
+        """Validate database schema contract.
+
+        Ensures exact table names, column order, indexes, and version metadata.
+        Fails closed on any mismatch.
+        """
+        # Validate tables
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        expected_table_names = set(expected_tables)
+        missing_tables = expected_table_names - tables
+        unexpected_tables = tables - expected_table_names
+        if missing_tables or unexpected_tables:
+            raise MissionSchemaVersionError(
+                "Database schema is incomplete; "
+                f"missing tables: {sorted(missing_tables)}; "
+                f"unexpected tables: {sorted(unexpected_tables)}"
+            )
+
+        # Validate column order for each table
+        for table_name, expected_columns in expected_tables.items():
+            columns = tuple(
+                row[1]
+                for row in conn.execute(f"PRAGMA table_info({table_name})")
+            )
+            if columns != expected_columns:
+                raise MissionSchemaVersionError(
+                    f"Database schema table {table_name} has incompatible columns: {columns!r}"
+                )
+
+        # Validate indexes
+        for index_name, (table_name, expected_columns) in expected_indexes.items():
+            index_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name = ?",
+                (index_name,),
+            ).fetchone()
+            if index_row is None:
+                raise MissionSchemaVersionError(f"Database schema is incomplete; missing index {index_name}")
+            indexed_columns = tuple(
+                row[2]
+                for row in conn.execute(f"PRAGMA index_info({index_name})")
+            )
+            if indexed_columns != expected_columns:
+                raise MissionSchemaVersionError(
+                    f"Database index {index_name} on {table_name} has incompatible columns: "
+                    f"{indexed_columns!r}"
+                )
+
+        # Validate version metadata
+        version_rows = [
+            int(row[0])
+            for row in conn.execute("SELECT version FROM mission_runtime_schema ORDER BY version")
+        ]
+        if not version_rows:
+            raise MissionSchemaVersionError("Database schema version metadata is empty")
+        if version_rows != [expected_version]:
+            raise MissionSchemaVersionError(
+                f"Database schema version metadata must contain exactly [{expected_version}], "
+                f"found {version_rows!r}"
+            )
+
     def _initialize_schema(self, conn: sqlite3.Connection) -> None:
-        """Initialize or validate database schema."""
+        """Initialize or migrate database schema.
+
+        Handles:
+        - Fresh database creation (v2 schema)
+        - v1 → v2 migration with concurrent safety
+        - v2 validation
+
+        Migration follows the accepted DurableEffectStore pattern:
+        schema validation occurs AFTER BEGIN IMMEDIATE to ensure
+        authoritative state observation.
+        """
         with conn:
             # Check schema version
             cursor = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='mission_runtime_schema'"
             )
             if cursor.fetchone() is None:
-                # Fresh database - create schema
-                self._create_schema(conn)
-            else:
-                # Existing database - validate version
-                cursor = conn.execute("SELECT version FROM mission_runtime_schema ORDER BY version DESC LIMIT 1")
-                row = cursor.fetchone()
-                if row is None or row[0] != MISSION_SCHEMA_VERSION:
-                    found_version = row[0] if row else None
+                # No schema table - could be fresh or invalid database
+                existing_objects = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'"
+                    )
+                }
+                if existing_objects:
                     raise MissionSchemaVersionError(
-                        f"Incompatible schema version: found {found_version}, expected {MISSION_SCHEMA_VERSION}"
+                        "Database contains schema objects but no authoritative version metadata"
                     )
 
-    def _create_schema(self, conn: sqlite3.Connection) -> None:
-        """Create mission runtime schema."""
+                # Fresh database - create v2 schema atomically
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    # Re-check after acquiring lock (another process may have initialized)
+                    refreshed_cursor = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='mission_runtime_schema'"
+                    )
+                    if refreshed_cursor.fetchone() is not None:
+                        # Another process initialized - validate and proceed
+                        conn.rollback()
+                        # Recursive call will handle validation
+                        return self._initialize_schema(conn)
+
+                    # Create fresh v2 schema
+                    self._create_schema_v2(conn)
+                    self._validate_schema_contract(conn)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+            else:
+                # Existing database - validate or migrate version
+                cursor = conn.execute("SELECT version FROM mission_runtime_schema ORDER BY version")
+                version_rows = [int(row[0]) for row in cursor.fetchall()]
+
+                if not version_rows:
+                    raise MissionSchemaVersionError("Database schema version metadata is empty")
+
+                distinct_versions = sorted(set(version_rows))
+                if len(distinct_versions) != 1:
+                    raise MissionSchemaVersionError(
+                        f"Database schema metadata contains contradictory versions: {distinct_versions}"
+                    )
+
+                current_version = distinct_versions[0]
+
+                if current_version < 1:
+                    raise MissionSchemaVersionError(
+                        f"Database schema version {current_version} is older than supported versions"
+                    )
+                if current_version > MISSION_SCHEMA_VERSION:
+                    raise MissionSchemaVersionError(
+                        f"Database schema version {current_version} is newer than "
+                        f"supported version {MISSION_SCHEMA_VERSION}. Upgrade required."
+                    )
+
+                if current_version == 1:
+                    # Migrate v1 → v2
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        # Re-read version inside transaction (authoritative read)
+                        refreshed_cursor = conn.execute(
+                            "SELECT version FROM mission_runtime_schema ORDER BY version"
+                        )
+                        refreshed_versions = [int(row[0]) for row in refreshed_cursor.fetchall()]
+
+                        if refreshed_versions != [1]:
+                            # Another process already migrated
+                            conn.rollback()
+                            if refreshed_versions == [MISSION_SCHEMA_VERSION]:
+                                # Migration complete - validate v2
+                                self._validate_schema_contract(conn)
+                                return
+                            # Unexpected state - retry
+                            return self._initialize_schema(conn)
+
+                        # Validate v1 schema before migration
+                        self._validate_schema_contract(
+                            conn,
+                            expected_tables=_EXPECTED_SCHEMA_TABLES_V1,
+                            expected_indexes=_EXPECTED_INDEXES_V1,
+                            expected_version=1,
+                        )
+
+                        # Apply v1 → v2 migration
+                        self._migrate_v1_to_v2(conn)
+
+                        # Update version metadata
+                        conn.execute("DELETE FROM mission_runtime_schema")
+                        conn.execute(
+                            "INSERT INTO mission_runtime_schema (version) VALUES (?)",
+                            (MISSION_SCHEMA_VERSION,),
+                        )
+
+                        # Validate v2 schema
+                        self._validate_schema_contract(conn)
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+                elif current_version == MISSION_SCHEMA_VERSION:
+                    # Current version - validate schema
+                    self._validate_schema_contract(conn)
+
+    def _migrate_v1_to_v2(self, conn: sqlite3.Connection) -> None:
+        """Migrate database from schema v1 to v2.
+
+        Adds mission_controller_leases table for durable controller ownership tracking.
+        All existing v1 data is preserved.
+        """
+        conn.execute("""
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id)
+                    REFERENCES missions(control_domain, mission_id)
+            )
+        """)
+
+    def _create_schema_v2(self, conn: sqlite3.Connection) -> None:
+        """Create fresh mission runtime schema v2."""
         conn.executescript(f"""
             -- Schema version tracking
             CREATE TABLE mission_runtime_schema (
@@ -323,6 +623,21 @@ class MissionRuntimeStore:
                 gateway_claim_id TEXT,
                 referenced_at TEXT NOT NULL,
                 PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id)
+                    REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- Mission controller leases (durable ownership generations)
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation),
                 FOREIGN KEY (control_domain, mission_id)
                     REFERENCES missions(control_domain, mission_id)
             );
@@ -939,6 +1254,565 @@ class MissionRuntimeStore:
                 references.append(ref)
 
             return references
+        finally:
+            if self._memory_connection is None:
+                conn.close()
+
+    def acquire_controller_lease(
+        self,
+        control_domain: str,
+        mission_id: str,
+        controller_id: str,
+        *,
+        lease_duration: timedelta = DEFAULT_CONTROLLER_LEASE_DURATION,
+    ) -> MissionControllerLease:
+        """Acquire controller lease for a mission.
+
+        If no lease exists, creates generation 1.
+        If latest lease is expired/released, creates generation N+1.
+        If latest lease is active with same controller_id, returns existing lease (idempotent).
+        If latest lease is active with different controller_id, fails with conflict.
+
+        Args:
+            control_domain: ControlDomain identifier
+            mission_id: Mission identifier
+            controller_id: Controller instance identifier
+            lease_duration: Lease duration (bounded, defaults to 30s)
+
+        Returns:
+            Acquired or existing controller lease
+
+        Raises:
+            MissionNotFoundError: If mission does not exist
+            IllegalMissionTransitionError: If mission is terminal
+            MissionControllerLeaseConflictError: If active lease held by different controller
+            MissionControllerClockError: If clock rollback detected
+        """
+        control_domain = validate_domain_id(control_domain, "control_domain")
+        controller_id = validate_controller_id(controller_id)
+        lease_duration = validate_lease_duration(lease_duration)
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Obtain authoritative time AFTER acquiring write lock
+                now = self._clock()
+
+                # Verify mission exists and not terminal
+                cursor = conn.execute(
+                    """
+                    SELECT current_state FROM mission_state
+                    WHERE control_domain = ? AND mission_id = ?
+                    """,
+                    (control_domain, mission_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise MissionNotFoundError(
+                        f"Mission {mission_id} not found in domain {control_domain}"
+                    )
+
+                current_state = MissionLifecycle(row[0])
+                if _is_terminal_state(current_state):
+                    raise IllegalMissionTransitionError(
+                        f"Cannot acquire lease for terminal mission in state {current_state.value}"
+                    )
+
+                # Load latest generation
+                cursor = conn.execute(
+                    """
+                    SELECT generation, controller_id, acquired_at, renewed_at, expires_at, released_at
+                    FROM mission_controller_leases
+                    WHERE control_domain = ? AND mission_id = ?
+                    ORDER BY generation DESC
+                    LIMIT 1
+                    """,
+                    (control_domain, mission_id),
+                )
+                latest = cursor.fetchone()
+
+                if latest is None:
+                    # No prior lease - create generation 1
+                    generation = 1
+                    acquired_at = now
+                    renewed_at = now
+                    expires_at = now + lease_duration
+
+                    # Clock rollback check
+                    if expires_at <= renewed_at:
+                        raise MissionControllerClockError("Clock rollback detected: expires_at <= renewed_at")
+
+                    conn.execute(
+                        """
+                        INSERT INTO mission_controller_leases (
+                            control_domain, mission_id, generation, controller_id,
+                            acquired_at, renewed_at, expires_at, released_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            control_domain,
+                            mission_id,
+                            generation,
+                            controller_id,
+                            _serialize_timestamp(acquired_at),
+                            _serialize_timestamp(renewed_at),
+                            _serialize_timestamp(expires_at),
+                            None,
+                        ),
+                    )
+
+                    conn.commit()
+                    return MissionControllerLease(
+                        control_domain=control_domain,
+                        mission_id=mission_id,
+                        controller_id=controller_id,
+                        generation=generation,
+                        acquired_at=acquired_at,
+                        renewed_at=renewed_at,
+                        expires_at=expires_at,
+                        released_at=None,
+                    )
+
+                # Parse latest lease
+                latest_generation = latest[0]
+                latest_controller_id = latest[1]
+                latest_acquired_at = _deserialize_timestamp(latest[2])
+                latest_renewed_at = _deserialize_timestamp(latest[3])
+                latest_expires_at = _deserialize_timestamp(latest[4])
+                latest_released_at = _deserialize_timestamp(latest[5])
+
+                # Clock rollback check
+                if now < latest_renewed_at or (latest_released_at and now < latest_released_at):
+                    raise MissionControllerClockError(
+                        f"Clock rollback detected: now {now} < latest lease timestamps"
+                    )
+
+                # Check if latest lease is active
+                is_active = (latest_released_at is None) and (now < latest_expires_at)
+
+                if is_active:
+                    if latest_controller_id == controller_id:
+                        # Same controller - return existing lease (idempotent)
+                        conn.commit()
+                        return MissionControllerLease(
+                            control_domain=control_domain,
+                            mission_id=mission_id,
+                            controller_id=latest_controller_id,
+                            generation=latest_generation,
+                            acquired_at=latest_acquired_at,
+                            renewed_at=latest_renewed_at,
+                            expires_at=latest_expires_at,
+                            released_at=latest_released_at,
+                        )
+                    else:
+                        # Different controller - conflict
+                        raise MissionControllerLeaseConflictError(
+                            f"Lease held by controller {latest_controller_id} "
+                            f"(generation {latest_generation}, expires {latest_expires_at})"
+                        )
+
+                # Latest lease is expired or released - create generation N+1
+                new_generation = latest_generation + 1
+                acquired_at = now
+                renewed_at = now
+                expires_at = now + lease_duration
+
+                # Clock rollback check
+                if expires_at <= renewed_at:
+                    raise MissionControllerClockError("Clock rollback detected: expires_at <= renewed_at")
+
+                conn.execute(
+                    """
+                    INSERT INTO mission_controller_leases (
+                        control_domain, mission_id, generation, controller_id,
+                        acquired_at, renewed_at, expires_at, released_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        control_domain,
+                        mission_id,
+                        new_generation,
+                        controller_id,
+                        _serialize_timestamp(acquired_at),
+                        _serialize_timestamp(renewed_at),
+                        _serialize_timestamp(expires_at),
+                        None,
+                    ),
+                )
+
+                conn.commit()
+                return MissionControllerLease(
+                    control_domain=control_domain,
+                    mission_id=mission_id,
+                    controller_id=controller_id,
+                    generation=new_generation,
+                    acquired_at=acquired_at,
+                    renewed_at=renewed_at,
+                    expires_at=expires_at,
+                    released_at=None,
+                )
+            except Exception:
+                conn.rollback()
+                raise
+        finally:
+            if self._memory_connection is None:
+                conn.close()
+
+    def renew_controller_lease(
+        self,
+        control_domain: str,
+        mission_id: str,
+        controller_id: str,
+        generation: int,
+        *,
+        lease_duration: timedelta = DEFAULT_CONTROLLER_LEASE_DURATION,
+    ) -> MissionControllerLease:
+        """Renew an active controller lease.
+
+        Args:
+            control_domain: ControlDomain identifier
+            mission_id: Mission identifier
+            controller_id: Controller instance identifier
+            generation: Expected current generation
+            lease_duration: Lease duration (bounded, defaults to 30s)
+
+        Returns:
+            Renewed controller lease
+
+        Raises:
+            MissionControllerLeaseNotFoundError: If no lease exists
+            MissionControllerLeaseStaleError: If generation is not current
+            MissionControllerLeaseExpiredError: If lease has expired
+            MissionControllerLeaseConflictError: If controller_id mismatch
+            MissionControllerClockError: If clock rollback detected
+        """
+        control_domain = validate_domain_id(control_domain, "control_domain")
+        controller_id = validate_controller_id(controller_id)
+        generation = validate_generation(generation)
+        lease_duration = validate_lease_duration(lease_duration)
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Obtain authoritative time AFTER acquiring write lock
+                now = self._clock()
+
+                # Load latest generation
+                cursor = conn.execute(
+                    """
+                    SELECT generation, controller_id, acquired_at, renewed_at, expires_at, released_at
+                    FROM mission_controller_leases
+                    WHERE control_domain = ? AND mission_id = ?
+                    ORDER BY generation DESC
+                    LIMIT 1
+                    """,
+                    (control_domain, mission_id),
+                )
+                latest = cursor.fetchone()
+
+                if latest is None:
+                    raise MissionControllerLeaseNotFoundError(
+                        f"No controller lease exists for mission {mission_id} in domain {control_domain}"
+                    )
+
+                latest_generation = latest[0]
+                latest_controller_id = latest[1]
+                latest_acquired_at = _deserialize_timestamp(latest[2])
+                latest_renewed_at = _deserialize_timestamp(latest[3])
+                latest_expires_at = _deserialize_timestamp(latest[4])
+                latest_released_at = _deserialize_timestamp(latest[5])
+
+                # Clock rollback check
+                if now < latest_renewed_at or (latest_released_at and now < latest_released_at):
+                    raise MissionControllerClockError(
+                        f"Clock rollback detected: now {now} < latest lease timestamps"
+                    )
+
+                # Validate generation
+                if generation != latest_generation:
+                    raise MissionControllerLeaseStaleError(
+                        f"Stale generation: expected {generation}, current {latest_generation}"
+                    )
+
+                # Validate controller_id
+                if controller_id != latest_controller_id:
+                    raise MissionControllerLeaseConflictError(
+                        f"Lease held by different controller: {latest_controller_id}"
+                    )
+
+                # Check if released
+                if latest_released_at is not None:
+                    raise MissionControllerLeaseExpiredError(
+                        f"Lease was released at {latest_released_at}"
+                    )
+
+                # Check if expired
+                if now >= latest_expires_at:
+                    raise MissionControllerLeaseExpiredError(
+                        f"Lease expired at {latest_expires_at} (now: {now})"
+                    )
+
+                # Renew lease
+                renewed_at = now
+                expires_at = now + lease_duration
+
+                # Clock rollback check
+                if expires_at <= renewed_at:
+                    raise MissionControllerClockError("Clock rollback detected: expires_at <= renewed_at")
+
+                conn.execute(
+                    """
+                    UPDATE mission_controller_leases
+                    SET renewed_at = ?, expires_at = ?
+                    WHERE control_domain = ? AND mission_id = ? AND generation = ?
+                    """,
+                    (
+                        _serialize_timestamp(renewed_at),
+                        _serialize_timestamp(expires_at),
+                        control_domain,
+                        mission_id,
+                        generation,
+                    ),
+                )
+
+                conn.commit()
+                return MissionControllerLease(
+                    control_domain=control_domain,
+                    mission_id=mission_id,
+                    controller_id=controller_id,
+                    generation=generation,
+                    acquired_at=latest_acquired_at,
+                    renewed_at=renewed_at,
+                    expires_at=expires_at,
+                    released_at=None,
+                )
+            except Exception:
+                conn.rollback()
+                raise
+        finally:
+            if self._memory_connection is None:
+                conn.close()
+
+    def release_controller_lease(
+        self,
+        control_domain: str,
+        mission_id: str,
+        controller_id: str,
+        generation: int,
+    ) -> MissionControllerLease:
+        """Release a controller lease.
+
+        Args:
+            control_domain: ControlDomain identifier
+            mission_id: Mission identifier
+            controller_id: Controller instance identifier
+            generation: Expected current generation
+
+        Returns:
+            Released controller lease
+
+        Raises:
+            MissionControllerLeaseNotFoundError: If no lease exists
+            MissionControllerLeaseStaleError: If generation is not current
+            MissionControllerLeaseConflictError: If controller_id mismatch
+            MissionControllerClockError: If clock rollback detected
+        """
+        control_domain = validate_domain_id(control_domain, "control_domain")
+        controller_id = validate_controller_id(controller_id)
+        generation = validate_generation(generation)
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Obtain authoritative time AFTER acquiring write lock
+                now = self._clock()
+
+                # Load latest generation
+                cursor = conn.execute(
+                    """
+                    SELECT generation, controller_id, acquired_at, renewed_at, expires_at, released_at
+                    FROM mission_controller_leases
+                    WHERE control_domain = ? AND mission_id = ?
+                    ORDER BY generation DESC
+                    LIMIT 1
+                    """,
+                    (control_domain, mission_id),
+                )
+                latest = cursor.fetchone()
+
+                if latest is None:
+                    raise MissionControllerLeaseNotFoundError(
+                        f"No controller lease exists for mission {mission_id} in domain {control_domain}"
+                    )
+
+                latest_generation = latest[0]
+                latest_controller_id = latest[1]
+                latest_acquired_at = _deserialize_timestamp(latest[2])
+                latest_renewed_at = _deserialize_timestamp(latest[3])
+                latest_expires_at = _deserialize_timestamp(latest[4])
+                latest_released_at = _deserialize_timestamp(latest[5])
+
+                # Clock rollback check
+                if now < latest_renewed_at or (latest_released_at and now < latest_released_at):
+                    raise MissionControllerClockError(
+                        f"Clock rollback detected: now {now} < latest lease timestamps"
+                    )
+
+                # Validate generation
+                if generation != latest_generation:
+                    raise MissionControllerLeaseStaleError(
+                        f"Stale generation: expected {generation}, current {latest_generation}"
+                    )
+
+                # Validate controller_id
+                if controller_id != latest_controller_id:
+                    raise MissionControllerLeaseConflictError(
+                        f"Lease held by different controller: {latest_controller_id}"
+                    )
+
+                # Idempotent release check
+                if latest_released_at is not None:
+                    # Already released - idempotent return
+                    conn.commit()
+                    return MissionControllerLease(
+                        control_domain=control_domain,
+                        mission_id=mission_id,
+                        controller_id=controller_id,
+                        generation=generation,
+                        acquired_at=latest_acquired_at,
+                        renewed_at=latest_renewed_at,
+                        expires_at=latest_expires_at,
+                        released_at=latest_released_at,
+                    )
+
+                # Release lease
+                released_at = now
+
+                conn.execute(
+                    """
+                    UPDATE mission_controller_leases
+                    SET released_at = ?
+                    WHERE control_domain = ? AND mission_id = ? AND generation = ?
+                    """,
+                    (
+                        _serialize_timestamp(released_at),
+                        control_domain,
+                        mission_id,
+                        generation,
+                    ),
+                )
+
+                conn.commit()
+                return MissionControllerLease(
+                    control_domain=control_domain,
+                    mission_id=mission_id,
+                    controller_id=controller_id,
+                    generation=generation,
+                    acquired_at=latest_acquired_at,
+                    renewed_at=latest_renewed_at,
+                    expires_at=latest_expires_at,
+                    released_at=released_at,
+                )
+            except Exception:
+                conn.rollback()
+                raise
+        finally:
+            if self._memory_connection is None:
+                conn.close()
+
+    def get_current_controller_lease(
+        self,
+        control_domain: str,
+        mission_id: str,
+    ) -> MissionControllerLease | None:
+        """Get current controller lease for a mission.
+
+        Args:
+            control_domain: ControlDomain identifier
+            mission_id: Mission identifier
+
+        Returns:
+            Current controller lease, or None if no lease exists
+        """
+        control_domain = validate_domain_id(control_domain, "control_domain")
+
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                """
+                SELECT generation, controller_id, acquired_at, renewed_at, expires_at, released_at
+                FROM mission_controller_leases
+                WHERE control_domain = ? AND mission_id = ?
+                ORDER BY generation DESC
+                LIMIT 1
+                """,
+                (control_domain, mission_id),
+            )
+            row = cursor.fetchone()
+
+            if row is None:
+                return None
+
+            return MissionControllerLease(
+                control_domain=control_domain,
+                mission_id=mission_id,
+                controller_id=row[1],
+                generation=row[0],
+                acquired_at=_deserialize_timestamp(row[2]),
+                renewed_at=_deserialize_timestamp(row[3]),
+                expires_at=_deserialize_timestamp(row[4]),
+                released_at=_deserialize_timestamp(row[5]),
+            )
+        finally:
+            if self._memory_connection is None:
+                conn.close()
+
+    def list_controller_lease_history(
+        self,
+        control_domain: str,
+        mission_id: str,
+    ) -> tuple[MissionControllerLease, ...]:
+        """List all controller lease generations for a mission.
+
+        Args:
+            control_domain: ControlDomain identifier
+            mission_id: Mission identifier
+
+        Returns:
+            Tuple of controller leases ordered by generation (oldest first)
+        """
+        control_domain = validate_domain_id(control_domain, "control_domain")
+
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                """
+                SELECT generation, controller_id, acquired_at, renewed_at, expires_at, released_at
+                FROM mission_controller_leases
+                WHERE control_domain = ? AND mission_id = ?
+                ORDER BY generation ASC
+                """,
+                (control_domain, mission_id),
+            )
+
+            leases = []
+            for row in cursor.fetchall():
+                lease = MissionControllerLease(
+                    control_domain=control_domain,
+                    mission_id=mission_id,
+                    controller_id=row[1],
+                    generation=row[0],
+                    acquired_at=_deserialize_timestamp(row[2]),
+                    renewed_at=_deserialize_timestamp(row[3]),
+                    expires_at=_deserialize_timestamp(row[4]),
+                    released_at=_deserialize_timestamp(row[5]),
+                )
+                leases.append(lease)
+
+            return tuple(leases)
         finally:
             if self._memory_connection is None:
                 conn.close()
