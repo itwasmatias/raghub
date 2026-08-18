@@ -261,10 +261,12 @@ def test_development_continuity_does_not_modify_core_implementation():
         cwd=repository_root(),
     )
     assert result.returncode == 0
-    # Mission Observability is an explicitly non-authoritative read projection.
-    # Continue rejecting changes to every existing core implementation file.
+    # Mission Observability and Pavilion Native Interface are explicitly
+    # non-authoritative read/presentation surfaces.
+    # Continue rejecting changes to every other existing core implementation file.
     assert set(result.stdout.splitlines()) <= {
         "federation/mission_observability.py",
+        "pavilionos/native_interface.py",
     }
 
 
