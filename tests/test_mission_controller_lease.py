@@ -956,3 +956,681 @@ def test_schema_validation_rejects_malformed_v1():
 
     finally:
         db_path.unlink(missing_ok=True)
+
+
+# ============================================================================
+# BLOCKER REGRESSION TESTS
+# ============================================================================
+
+def test_fresh_schema_rollback_on_post_ddl_failure():
+    """Test that fresh schema creation rolls back if validation fails after DDL.
+
+    This regression test proves that _create_schema_v2 no longer uses executescript(),
+    which would implicitly commit and prevent rollback.
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        # Create a fresh database and force validation failure by corrupting it mid-init
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+
+        # Manually start transaction and create schema
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Create schema tables
+            store = MissionRuntimeStore.__new__(MissionRuntimeStore)
+            store._clock = lambda: datetime.now(timezone.utc)
+            store._create_schema_v2(conn)
+
+            # Force a validation failure by corrupting the schema before commit
+            conn.execute("DROP TABLE mission_controller_leases")
+
+            # Attempt validation - should fail
+            store._validate_schema_contract(conn)
+
+            # Should not reach here
+            assert False, "Validation should have failed"
+        except MissionSchemaVersionError:
+            # Expected failure - rollback
+            conn.rollback()
+
+        # Verify database is clean (rollback succeeded)
+        tables = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        ]
+        assert len(tables) == 0, f"Rollback failed - tables remain: {tables}"
+
+        # Verify not in transaction
+        assert not conn.in_transaction, "Connection still in transaction after rollback"
+
+        conn.close()
+
+        # Verify normal initialization still works
+        store = MissionRuntimeStore(db_path)
+        spec = MissionSpecification(
+            mission_id="test-mission",
+            control_domain="test-domain",
+            objective="Test",
+            owner_identity="owner",
+            metadata=None,
+        )
+        store.create_mission(spec)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_malformed_v2_missing_primary_key():
+    """Test that v2 schema without PRIMARY KEY on leases fails validation."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        # Create v2 schema with lease table missing PRIMARY KEY
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+
+        # Create base v2 tables (simplified)
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT);
+            INSERT INTO mission_runtime_schema (version) VALUES (2);
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (
+                    current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')
+                ),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- MALFORMED: lease table WITHOUT PRIMARY KEY
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        # Attempt to open should fail validation
+        with pytest.raises(MissionSchemaVersionError, match="PRIMARY KEY"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_malformed_v2_missing_foreign_key():
+    """Test that v2 schema without FOREIGN KEY on leases fails validation."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+
+        # Create base tables
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT);
+            INSERT INTO mission_runtime_schema (version) VALUES (2);
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (
+                    current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')
+                ),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- MALFORMED: lease table WITHOUT FOREIGN KEY
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="FOREIGN KEY"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_malformed_v2_missing_check_constraint():
+    """Test that v2 schema without CHECK constraint on generation fails validation."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT);
+            INSERT INTO mission_runtime_schema (version) VALUES (2);
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (
+                    current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')
+                ),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- MALFORMED: lease table WITHOUT generation CHECK
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="CHECK"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_naive_clock_on_first_acquire():
+    """Test that naive clock on first acquire raises before commit."""
+    fake_clock = FakeClock()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        # Create store with valid clock
+        store = MissionRuntimeStore(db_path, clock=fake_clock)
+        spec = MissionSpecification(
+            mission_id="mission-naive-clock",
+            control_domain="test-domain",
+            objective="Test",
+            owner_identity="owner",
+            metadata=None,
+        )
+        store.create_mission(spec)
+
+        # Replace clock with naive datetime generator
+        def naive_clock():
+            return datetime(2026, 8, 18, 12, 0, 0)  # No timezone
+
+        store._clock = naive_clock
+
+        # Attempt acquire with naive clock - should raise before commit
+        with pytest.raises(MissionControllerClockError):
+            store.acquire_controller_lease("test-domain", "mission-naive-clock", "controller-a")
+
+        # Verify NO lease row was persisted
+        conn = store._connect()
+        try:
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM mission_controller_leases WHERE mission_id = ?",
+                ("mission-naive-clock",)
+            )
+            count = cursor.fetchone()[0]
+            assert count == 0, f"Expected 0 lease rows, found {count}"
+
+            # Verify not in transaction
+            assert not conn.in_transaction, "Connection in transaction after naive clock failure"
+        finally:
+            conn.close()
+
+        # Verify subsequent valid operation succeeds
+        store._clock = fake_clock
+        lease = store.acquire_controller_lease("test-domain", "mission-naive-clock", "controller-a")
+        assert lease.generation == 1
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_naive_clock_on_renew():
+    """Test that naive clock on renew raises before commit and leaves old lease unchanged."""
+    fake_clock = FakeClock()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        store = MissionRuntimeStore(db_path, clock=fake_clock)
+        spec = MissionSpecification(
+            mission_id="mission-renew-naive",
+            control_domain="test-domain",
+            objective="Test",
+            owner_identity="owner",
+            metadata=None,
+        )
+        store.create_mission(spec)
+
+        # Acquire valid lease
+        lease1 = store.acquire_controller_lease("test-domain", "mission-renew-naive", "controller-a")
+        original_renewed_at = lease1.renewed_at
+
+        # Replace clock with naive generator
+        store._clock = lambda: datetime(2026, 8, 18, 13, 0, 0)
+
+        # Attempt renew - should raise before commit
+        with pytest.raises(MissionControllerClockError):
+            store.renew_controller_lease("test-domain", "mission-renew-naive", "controller-a", 1)
+
+        # Verify lease row unchanged
+        current = store.get_current_controller_lease("test-domain", "mission-renew-naive")
+        assert current.renewed_at == original_renewed_at, "Lease was mutated despite naive clock failure"
+
+        # Subsequent valid operation succeeds
+        store._clock = fake_clock
+        fake_clock.advance(timedelta(seconds=5))
+        lease2 = store.renew_controller_lease("test-domain", "mission-renew-naive", "controller-a", 1)
+        assert lease2.renewed_at > original_renewed_at
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_naive_clock_on_release():
+    """Test that naive clock on release raises before commit and leaves released_at unchanged."""
+    fake_clock = FakeClock()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        store = MissionRuntimeStore(db_path, clock=fake_clock)
+        spec = MissionSpecification(
+            mission_id="mission-release-naive",
+            control_domain="test-domain",
+            objective="Test",
+            owner_identity="owner",
+            metadata=None,
+        )
+        store.create_mission(spec)
+
+        # Acquire valid lease
+        store.acquire_controller_lease("test-domain", "mission-release-naive", "controller-a")
+
+        # Replace clock with naive generator
+        store._clock = lambda: datetime(2026, 8, 18, 14, 0, 0)
+
+        # Attempt release - should raise before commit
+        with pytest.raises(MissionControllerClockError):
+            store.release_controller_lease("test-domain", "mission-release-naive", "controller-a", 1)
+
+        # Verify lease NOT released
+        current = store.get_current_controller_lease("test-domain", "mission-release-naive")
+        assert current.released_at is None, "Lease was released despite naive clock failure"
+
+        # Subsequent valid operation succeeds
+        store._clock = fake_clock
+        fake_clock.advance(timedelta(seconds=5))
+        released = store.release_controller_lease("test-domain", "mission-release-naive", "controller-a", 1)
+        assert released.released_at is not None
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_malformed_schema_version_text():
+    """Test that non-integer schema version metadata yields typed error."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE mission_runtime_schema (version TEXT PRIMARY KEY, applied_at TEXT)")
+        conn.execute("INSERT INTO mission_runtime_schema (version, applied_at) VALUES ('malformed', '2026-08-18')")
+        conn.commit()
+        conn.close()
+
+        # Attempt to open should raise typed MissionSchemaVersionError
+        with pytest.raises(MissionSchemaVersionError, match="non-integer"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def _concurrent_fresh_init_worker(db_path, barrier, result_queue):
+    """Worker for deterministic concurrent fresh initialization test."""
+    try:
+        # Synchronize before opening store
+        barrier.wait(timeout=5)
+
+        # All processes attempt fresh initialization simultaneously
+        store = MissionRuntimeStore(db_path)
+
+        result_queue.put(("success", "initialized"))
+    except Exception as e:
+        result_queue.put(("error", str(e), type(e).__name__))
+
+
+def test_fresh_concurrent_initialization_converges():
+    """Test that fresh database concurrent initialization converges without raw lock errors.
+
+    Uses deterministic synchronization (Barrier) to force true simultaneity.
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        num_processes = 3
+        barrier = multiprocessing.Barrier(num_processes)
+        result_queue = multiprocessing.Queue()
+        processes = []
+
+        for i in range(num_processes):
+            p = multiprocessing.Process(
+                target=_concurrent_fresh_init_worker,
+                args=(db_path, barrier, result_queue)
+            )
+            processes.append(p)
+            p.start()
+
+        for p in processes:
+            p.join(timeout=10)
+            assert p.exitcode == 0, f"Process failed with exit code {p.exitcode}"
+
+        # Collect results
+        results = []
+        while not result_queue.empty():
+            results.append(result_queue.get())
+
+        # All processes should succeed
+        assert len(results) == num_processes, f"Expected {num_processes} results, got {len(results)}"
+        for result in results:
+            assert result[0] == "success", f"Process failed: {result}"
+
+        # Verify final database state
+        store = MissionRuntimeStore(db_path)
+        conn = store._connect()
+        try:
+            # Exactly one version row
+            cursor = conn.execute("SELECT version FROM mission_runtime_schema")
+            versions = [row[0] for row in cursor.fetchall()]
+            assert versions == [2], f"Expected [2], found {versions}"
+
+            # All v2 tables exist once
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='mission_controller_leases'"
+            )
+            assert cursor.fetchone() is not None, "mission_controller_leases table missing"
+
+        finally:
+            conn.close()
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_v1_migration_preserves_effect_references():
+    """Test that v1→v2 migration preserves mission_effect_references data."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        # Create v1 database with effect reference
+        _create_v1_database_with_data(db_path)
+
+        # Add effect reference to v1 database
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            INSERT INTO mission_effect_references (
+                control_domain, mission_id, effect_intent_id,
+                effect_dispatch_id, gateway_claim_id, referenced_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "test-domain",
+                "migration-test-mission",
+                "intent-001",
+                "dispatch-001",
+                "claim-001",
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        # Migrate to v2
+        store = MissionRuntimeStore(db_path)
+
+        # Verify effect reference preserved
+        refs = store.list_effect_references("test-domain", "migration-test-mission")
+        assert len(refs) == 1
+        assert refs[0].effect_intent_id == "intent-001"
+        assert refs[0].effect_dispatch_id == "dispatch-001"
+        assert refs[0].gateway_claim_id == "claim-001"
+
+    finally:
+        db_path.unlink(missing_ok=True)

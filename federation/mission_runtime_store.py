@@ -282,6 +282,7 @@ class MissionRuntimeStore:
         self._db_path = Path(db_path) if db_path is not None else None
         self._memory_connection: sqlite3.Connection | None = None
         self._clock = clock if clock is not None else lambda: datetime.now(timezone.utc)
+        self._wal_established = False
 
         if self._db_path is None:
             # In-memory database for testing
@@ -292,17 +293,23 @@ class MissionRuntimeStore:
             )
             self._memory_connection.execute("PRAGMA foreign_keys = ON")
             self._initialize_schema(self._memory_connection)
+            self._wal_established = True  # Not applicable for memory DB
         else:
-            # File-backed database
+            # File-backed database - initialize schema first, then establish WAL
             self._db_path.parent.mkdir(parents=True, exist_ok=True)
             conn = self._connect()
             try:
                 self._initialize_schema(conn)
+                self._establish_wal_mode(conn)
             finally:
                 conn.close()
 
     def _connect(self) -> sqlite3.Connection:
-        """Create a new database connection."""
+        """Create a new database connection.
+
+        For file-backed databases, WAL mode is established separately after
+        schema initialization to avoid lock conflicts during concurrent fresh initialization.
+        """
         if self._memory_connection is not None:
             return self._memory_connection
 
@@ -314,9 +321,76 @@ class MissionRuntimeStore:
             timeout=_MAX_BUSY_TIMEOUT_MS / 1000.0,
         )
         conn.execute("PRAGMA foreign_keys = ON")
-        if _FILE_JOURNAL_MODE:
+
+        # Establish WAL mode if not already done (for post-initialization connections)
+        if _FILE_JOURNAL_MODE and self._wal_established:
             conn.execute(f"PRAGMA journal_mode = {_FILE_JOURNAL_MODE}")
+
         return conn
+
+    def _establish_wal_mode(self, conn: sqlite3.Connection) -> None:
+        """Establish WAL journal mode after schema initialization.
+
+        This is called once during store initialization, after the schema is ready.
+        Separating WAL establishment from connection creation prevents lock conflicts
+        when multiple processes initialize a fresh database concurrently.
+        """
+        if not _FILE_JOURNAL_MODE or self._wal_established:
+            return
+
+        # WAL mode setup with bounded retry for lock conflicts
+        max_retries = 10
+        retry_delay = 0.01  # 10ms initial delay
+
+        for attempt in range(max_retries):
+            try:
+                result = conn.execute(f"PRAGMA journal_mode = {_FILE_JOURNAL_MODE}").fetchone()
+                if result and result[0].lower() == _FILE_JOURNAL_MODE.lower():
+                    self._wal_established = True
+                    return
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower() and attempt < max_retries - 1:
+                    # Database is locked, retry with exponential backoff
+                    import time
+                    time.sleep(retry_delay * (2 ** attempt))
+                    continue
+                else:
+                    # Non-lock error or final retry exhausted
+                    raise MissionRuntimeStoreError(
+                        f"Failed to establish {_FILE_JOURNAL_MODE} journal mode after {attempt + 1} attempts"
+                    ) from e
+
+        # If we get here, we exhausted retries
+        raise MissionRuntimeStoreError(
+            f"Failed to establish {_FILE_JOURNAL_MODE} journal mode after {max_retries} attempts"
+        )
+
+    def _now_utc(self) -> datetime:
+        """Get current time from configured clock with validation.
+
+        Validates clock output before any database mutation to ensure
+        transaction integrity. Invalid clock output raises before commit.
+
+        Returns:
+            Validated UTC datetime
+
+        Raises:
+            MissionControllerClockError: If clock output is invalid
+        """
+        now = self._clock()
+
+        if not isinstance(now, datetime):
+            raise MissionControllerClockError(
+                f"Clock must return datetime, got {type(now).__name__}"
+            )
+
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise MissionControllerClockError(
+                "Clock must return timezone-aware datetime with valid UTC offset"
+            )
+
+        # Normalize to UTC
+        return now.astimezone(timezone.utc)
 
     def _validate_schema_contract(
         self,
@@ -326,10 +400,21 @@ class MissionRuntimeStore:
         expected_indexes: dict[str, tuple[str, tuple[str, ...]]] = _EXPECTED_INDEXES_V2,
         expected_version: int = MISSION_SCHEMA_VERSION,
     ) -> None:
-        """Validate database schema contract.
+        """Validate database schema contract with structural integrity checks.
 
-        Ensures exact table names, column order, indexes, and version metadata.
-        Fails closed on any mismatch.
+        Ensures exact table names, column order, column types, constraints,
+        indexes, and version metadata. Fails closed on any mismatch.
+
+        Validates:
+        - Table existence and completeness
+        - Column names, order, and types
+        - NOT NULL constraints
+        - PRIMARY KEY constraints
+        - FOREIGN KEY constraints
+        - CHECK constraints
+        - UNIQUE constraints
+        - Indexes
+        - Schema version metadata
         """
         # Validate tables
         tables = {
@@ -348,16 +433,17 @@ class MissionRuntimeStore:
                 f"unexpected tables: {sorted(unexpected_tables)}"
             )
 
-        # Validate column order for each table
+        # Validate column order and properties for each table
         for table_name, expected_columns in expected_tables.items():
-            columns = tuple(
-                row[1]
-                for row in conn.execute(f"PRAGMA table_info({table_name})")
-            )
+            table_info = list(conn.execute(f"PRAGMA table_info({table_name})"))
+            columns = tuple(row[1] for row in table_info)
             if columns != expected_columns:
                 raise MissionSchemaVersionError(
                     f"Database schema table {table_name} has incompatible columns: {columns!r}"
                 )
+
+        # Validate structural constraints
+        self._validate_table_constraints(conn, expected_version)
 
         # Validate indexes
         for index_name, (table_name, expected_columns) in expected_indexes.items():
@@ -378,10 +464,15 @@ class MissionRuntimeStore:
                 )
 
         # Validate version metadata
-        version_rows = [
-            int(row[0])
-            for row in conn.execute("SELECT version FROM mission_runtime_schema ORDER BY version")
-        ]
+        try:
+            version_rows = [
+                int(row[0])
+                for row in conn.execute("SELECT version FROM mission_runtime_schema ORDER BY version")
+            ]
+        except (ValueError, TypeError) as exc:
+            raise MissionSchemaVersionError(
+                "Database schema version metadata contains non-integer value"
+            ) from exc
         if not version_rows:
             raise MissionSchemaVersionError("Database schema version metadata is empty")
         if version_rows != [expected_version]:
@@ -389,6 +480,229 @@ class MissionRuntimeStore:
                 f"Database schema version metadata must contain exactly [{expected_version}], "
                 f"found {version_rows!r}"
             )
+
+    def _validate_table_constraints(self, conn: sqlite3.Connection, schema_version: int) -> None:
+        """Validate table structural constraints.
+
+        Validates PRIMARY KEY, FOREIGN KEY, CHECK, NOT NULL, and UNIQUE constraints
+        that the Mission Runtime safety model relies on.
+        """
+        # Define expected constraints per schema version
+        if schema_version == 1:
+            constraint_specs = self._get_v1_constraint_specs()
+        elif schema_version == 2:
+            constraint_specs = self._get_v2_constraint_specs()
+        else:
+            raise MissionSchemaVersionError(f"Unknown schema version {schema_version} for constraint validation")
+
+        for table_name, specs in constraint_specs.items():
+            # Validate PRIMARY KEY
+            if "primary_key" in specs:
+                self._validate_primary_key(conn, table_name, specs["primary_key"])
+
+            # Validate FOREIGN KEYs
+            if "foreign_keys" in specs:
+                self._validate_foreign_keys(conn, table_name, specs["foreign_keys"])
+
+            # Validate NOT NULL constraints
+            if "not_null" in specs:
+                self._validate_not_null(conn, table_name, specs["not_null"])
+
+            # Validate CHECK constraints
+            if "checks" in specs:
+                self._validate_check_constraints(conn, table_name, specs["checks"])
+
+            # Validate UNIQUE constraints
+            if "unique" in specs:
+                self._validate_unique_constraints(conn, table_name, specs["unique"])
+
+    def _get_v1_constraint_specs(self) -> dict[str, dict]:
+        """Get constraint specifications for v1 schema."""
+        return {
+            "mission_runtime_schema": {
+                "primary_key": ["version"],
+            },
+            "missions": {
+                "primary_key": ["control_domain", "mission_id"],
+            },
+            "mission_state": {
+                "primary_key": ["control_domain", "mission_id"],
+                "foreign_keys": [
+                    {
+                        "columns": ["control_domain", "mission_id"],
+                        "ref_table": "missions",
+                        "ref_columns": ["control_domain", "mission_id"],
+                    }
+                ],
+                "checks": ["current_state IN", "revision >= 1"],
+            },
+            "mission_checkpoints": {
+                "primary_key": ["control_domain", "checkpoint_id"],
+                "foreign_keys": [
+                    {
+                        "columns": ["control_domain", "mission_id"],
+                        "ref_table": "missions",
+                        "ref_columns": ["control_domain", "mission_id"],
+                    }
+                ],
+                "unique": [["control_domain", "mission_id", "sequence"]],
+                "checks": ["sequence >= 0"],
+            },
+            "mission_transitions": {
+                "primary_key": ["control_domain", "transition_id"],
+                "foreign_keys": [
+                    {
+                        "columns": ["control_domain", "mission_id"],
+                        "ref_table": "missions",
+                        "ref_columns": ["control_domain", "mission_id"],
+                    }
+                ],
+                "checks": ["revision >= 1"],
+            },
+            "mission_effect_references": {
+                "primary_key": ["control_domain", "mission_id", "effect_intent_id"],
+                "foreign_keys": [
+                    {
+                        "columns": ["control_domain", "mission_id"],
+                        "ref_table": "missions",
+                        "ref_columns": ["control_domain", "mission_id"],
+                    }
+                ],
+            },
+        }
+
+    def _get_v2_constraint_specs(self) -> dict[str, dict]:
+        """Get constraint specifications for v2 schema."""
+        specs = self._get_v1_constraint_specs()
+        specs["mission_controller_leases"] = {
+            "primary_key": ["control_domain", "mission_id", "generation"],
+            "foreign_keys": [
+                {
+                    "columns": ["control_domain", "mission_id"],
+                    "ref_table": "missions",
+                    "ref_columns": ["control_domain", "mission_id"],
+                }
+            ],
+            "checks": ["generation >= 1"],
+            "not_null": ["generation", "controller_id", "acquired_at", "renewed_at", "expires_at"],
+        }
+        return specs
+
+    def _validate_primary_key(self, conn: sqlite3.Connection, table_name: str, expected_pk: list[str]) -> None:
+        """Validate PRIMARY KEY constraint."""
+        table_info = list(conn.execute(f"PRAGMA table_info({table_name})"))
+        pk_columns = [row[1] for row in table_info if row[5] > 0]  # pk column is index 5
+        pk_columns.sort(key=lambda col: next(row[5] for row in table_info if row[1] == col))
+
+        if pk_columns != expected_pk:
+            raise MissionSchemaVersionError(
+                f"Table {table_name} has incorrect PRIMARY KEY: "
+                f"expected {expected_pk}, found {pk_columns}"
+            )
+
+    def _validate_foreign_keys(
+        self, conn: sqlite3.Connection, table_name: str, expected_fks: list[dict]
+    ) -> None:
+        """Validate FOREIGN KEY constraints."""
+        fk_list = list(conn.execute(f"PRAGMA foreign_key_list({table_name})"))
+
+        # Group by fk id
+        fks_by_id: dict[int, list] = {}
+        for row in fk_list:
+            fk_id = row[0]
+            if fk_id not in fks_by_id:
+                fks_by_id[fk_id] = []
+            fks_by_id[fk_id].append(row)
+
+        if len(fks_by_id) != len(expected_fks):
+            raise MissionSchemaVersionError(
+                f"Table {table_name} has incorrect number of FOREIGN KEYs: "
+                f"expected {len(expected_fks)}, found {len(fks_by_id)}"
+            )
+
+        for expected_fk in expected_fks:
+            # Find matching FK
+            found = False
+            for fk_rows in fks_by_id.values():
+                ref_table = fk_rows[0][2]
+                from_cols = [row[3] for row in fk_rows]
+                to_cols = [row[4] for row in fk_rows]
+
+                if (ref_table == expected_fk["ref_table"] and
+                    from_cols == expected_fk["columns"] and
+                    to_cols == expected_fk["ref_columns"]):
+                    found = True
+                    break
+
+            if not found:
+                raise MissionSchemaVersionError(
+                    f"Table {table_name} missing expected FOREIGN KEY: {expected_fk}"
+                )
+
+    def _validate_not_null(self, conn: sqlite3.Connection, table_name: str, expected_not_null: list[str]) -> None:
+        """Validate NOT NULL constraints."""
+        table_info = list(conn.execute(f"PRAGMA table_info({table_name})"))
+        not_null_cols = [row[1] for row in table_info if row[3] == 1]  # notnull is index 3
+
+        for col in expected_not_null:
+            if col not in not_null_cols:
+                raise MissionSchemaVersionError(
+                    f"Table {table_name} column {col} missing required NOT NULL constraint"
+                )
+
+    def _validate_check_constraints(self, conn: sqlite3.Connection, table_name: str, expected_checks: list[str]) -> None:
+        """Validate CHECK constraints by examining CREATE TABLE SQL."""
+        cursor = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise MissionSchemaVersionError(f"Table {table_name} not found in sqlite_master")
+
+        create_sql = row[0]
+        if not create_sql:
+            raise MissionSchemaVersionError(f"Table {table_name} has no CREATE SQL")
+
+        # Normalize whitespace for comparison
+        normalized_sql = " ".join(create_sql.split()).upper()
+
+        for check_clause in expected_checks:
+            normalized_check = " ".join(check_clause.split()).upper()
+            if normalized_check not in normalized_sql:
+                raise MissionSchemaVersionError(
+                    f"Table {table_name} missing required CHECK constraint: {check_clause}"
+                )
+
+    def _validate_unique_constraints(
+        self, conn: sqlite3.Connection, table_name: str, expected_unique: list[list[str]]
+    ) -> None:
+        """Validate UNIQUE constraints."""
+        # Get all indexes for this table
+        index_list = list(conn.execute(f"PRAGMA index_list({table_name})"))
+
+        for expected_cols in expected_unique:
+            # Find a unique index matching these columns
+            found = False
+            for idx_row in index_list:
+                idx_name = idx_row[1]
+                is_unique = idx_row[2] == 1
+
+                if not is_unique:
+                    continue
+
+                # Get columns in this index
+                idx_info = list(conn.execute(f"PRAGMA index_info({idx_name})"))
+                idx_cols = [row[2] for row in idx_info]
+
+                if idx_cols == expected_cols:
+                    found = True
+                    break
+
+            if not found:
+                raise MissionSchemaVersionError(
+                    f"Table {table_name} missing required UNIQUE constraint on {expected_cols}"
+                )
 
     def _initialize_schema(self, conn: sqlite3.Connection) -> None:
         """Initialize or migrate database schema.
@@ -443,7 +757,12 @@ class MissionRuntimeStore:
             else:
                 # Existing database - validate or migrate version
                 cursor = conn.execute("SELECT version FROM mission_runtime_schema ORDER BY version")
-                version_rows = [int(row[0]) for row in cursor.fetchall()]
+                try:
+                    version_rows = [int(row[0]) for row in cursor.fetchall()]
+                except (ValueError, TypeError) as exc:
+                    raise MissionSchemaVersionError(
+                        "Database schema version metadata contains non-integer value"
+                    ) from exc
 
                 if not version_rows:
                     raise MissionSchemaVersionError("Database schema version metadata is empty")
@@ -537,17 +856,26 @@ class MissionRuntimeStore:
         """)
 
     def _create_schema_v2(self, conn: sqlite3.Connection) -> None:
-        """Create fresh mission runtime schema v2."""
-        conn.executescript(f"""
-            -- Schema version tracking
+        """Create fresh mission runtime schema v2.
+
+        Uses statement-by-statement execution to preserve transaction atomicity.
+        executescript() implicitly commits and would break rollback semantics.
+        """
+        # Schema version tracking
+        conn.execute("""
             CREATE TABLE mission_runtime_schema (
                 version INTEGER PRIMARY KEY,
                 applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
+            )
+        """)
 
-            INSERT INTO mission_runtime_schema (version) VALUES ({MISSION_SCHEMA_VERSION});
+        conn.execute(
+            "INSERT INTO mission_runtime_schema (version) VALUES (?)",
+            (MISSION_SCHEMA_VERSION,)
+        )
 
-            -- Mission specifications (immutable identity)
+        # Mission specifications (immutable identity)
+        conn.execute("""
             CREATE TABLE missions (
                 control_domain TEXT NOT NULL,
                 mission_id TEXT NOT NULL,
@@ -561,9 +889,11 @@ class MissionRuntimeStore:
                 metadata_json TEXT,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (control_domain, mission_id)
-            );
+            )
+        """)
 
-            -- Mission lifecycle state (mutable with optimistic concurrency)
+        # Mission lifecycle state (mutable with optimistic concurrency)
+        conn.execute("""
             CREATE TABLE mission_state (
                 control_domain TEXT NOT NULL,
                 mission_id TEXT NOT NULL,
@@ -580,9 +910,11 @@ class MissionRuntimeStore:
                 PRIMARY KEY (control_domain, mission_id),
                 FOREIGN KEY (control_domain, mission_id)
                     REFERENCES missions(control_domain, mission_id)
-            );
+            )
+        """)
 
-            -- Mission checkpoints (append-only progress evidence)
+        # Mission checkpoints (append-only progress evidence)
+        conn.execute("""
             CREATE TABLE mission_checkpoints (
                 control_domain TEXT NOT NULL,
                 checkpoint_id TEXT NOT NULL,
@@ -596,9 +928,11 @@ class MissionRuntimeStore:
                 FOREIGN KEY (control_domain, mission_id)
                     REFERENCES missions(control_domain, mission_id),
                 UNIQUE (control_domain, mission_id, sequence)
-            );
+            )
+        """)
 
-            -- Mission transitions (append-only history)
+        # Mission transitions (append-only history)
+        conn.execute("""
             CREATE TABLE mission_transitions (
                 control_domain TEXT NOT NULL,
                 transition_id TEXT NOT NULL,
@@ -612,9 +946,11 @@ class MissionRuntimeStore:
                 PRIMARY KEY (control_domain, transition_id),
                 FOREIGN KEY (control_domain, mission_id)
                     REFERENCES missions(control_domain, mission_id)
-            );
+            )
+        """)
 
-            -- Effect references (bindings without truth claims)
+        # Effect references (bindings without truth claims)
+        conn.execute("""
             CREATE TABLE mission_effect_references (
                 control_domain TEXT NOT NULL,
                 mission_id TEXT NOT NULL,
@@ -625,9 +961,11 @@ class MissionRuntimeStore:
                 PRIMARY KEY (control_domain, mission_id, effect_intent_id),
                 FOREIGN KEY (control_domain, mission_id)
                     REFERENCES missions(control_domain, mission_id)
-            );
+            )
+        """)
 
-            -- Mission controller leases (durable ownership generations)
+        # Mission controller leases (durable ownership generations)
+        conn.execute("""
             CREATE TABLE mission_controller_leases (
                 control_domain TEXT NOT NULL,
                 mission_id TEXT NOT NULL,
@@ -640,15 +978,23 @@ class MissionRuntimeStore:
                 PRIMARY KEY (control_domain, mission_id, generation),
                 FOREIGN KEY (control_domain, mission_id)
                     REFERENCES missions(control_domain, mission_id)
-            );
+            )
+        """)
 
-            -- Indexes for common queries
+        # Indexes for common queries
+        conn.execute("""
             CREATE INDEX idx_missions_state
-                ON mission_state(control_domain, current_state, updated_at);
+                ON mission_state(control_domain, current_state, updated_at)
+        """)
+
+        conn.execute("""
             CREATE INDEX idx_checkpoints_mission
-                ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+                ON mission_checkpoints(control_domain, mission_id, sequence DESC)
+        """)
+
+        conn.execute("""
             CREATE INDEX idx_transitions_mission
-                ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+                ON mission_transitions(control_domain, mission_id, transitioned_at DESC)
         """)
 
     def create_mission(self, specification: MissionSpecification) -> None:
@@ -1296,8 +1642,9 @@ class MissionRuntimeStore:
         try:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                # Obtain authoritative time AFTER acquiring write lock
-                now = self._clock()
+                # Obtain and validate authoritative time AFTER acquiring write lock
+                # Clock validation must occur before any mutation
+                now = self._now_utc()
 
                 # Verify mission exists and not terminal
                 cursor = conn.execute(
@@ -1496,8 +1843,9 @@ class MissionRuntimeStore:
         try:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                # Obtain authoritative time AFTER acquiring write lock
-                now = self._clock()
+                # Obtain and validate authoritative time AFTER acquiring write lock
+                # Clock validation must occur before any mutation
+                now = self._now_utc()
 
                 # Load latest generation
                 cursor = conn.execute(
@@ -1627,8 +1975,9 @@ class MissionRuntimeStore:
         try:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                # Obtain authoritative time AFTER acquiring write lock
-                now = self._clock()
+                # Obtain and validate authoritative time AFTER acquiring write lock
+                # Clock validation must occur before any mutation
+                now = self._now_utc()
 
                 # Load latest generation
                 cursor = conn.execute(
