@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""
+MissionaryX Checkpoint Verification Tool
+
+Verifies or reports repository checkpoint state.
+
+Usage:
+    ./tools/verify-checkpoint                    # Report current state
+    ./tools/verify-checkpoint <expected-sha>     # Verify against expected
+    ./tools/verify-checkpoint --help             # Show help
+
+Exit codes:
+    0: Success (report mode) or checkpoint matches (verify mode)
+    1: Checkpoint mismatch or error
+    2: Invalid usage
+"""
+
+import subprocess
+import sys
+from pathlib import Path
+
+
+def get_git_output(args):
+    """Run git command and return output, or None on error."""
+    try:
+        result = subprocess.run(
+            ['git'] + args,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError:
+        return None
+    except FileNotFoundError:
+        print("ERROR: git command not found", file=sys.stderr)
+        sys.exit(1)
+
+
+def get_repository_root():
+    """Get the repository root directory."""
+    root = get_git_output(['rev-parse', '--show-toplevel'])
+    if root is None:
+        print("ERROR: Not in a git repository", file=sys.stderr)
+        sys.exit(1)
+    return Path(root)
+
+
+def get_current_branch():
+    """Get the current branch name."""
+    branch = get_git_output(['branch', '--show-current'])
+    if branch == '':
+        # Detached HEAD
+        return '(detached HEAD)'
+    return branch
+
+
+def get_current_head():
+    """Get the current HEAD commit (full SHA)."""
+    return get_git_output(['rev-parse', 'HEAD'])
+
+
+def get_parent_commit():
+    """Get the parent commit (full SHA)."""
+    return get_git_output(['rev-parse', 'HEAD^'])
+
+
+def get_tree_status():
+    """Get git status output."""
+    status = get_git_output(['status', '--short'])
+    if status == '':
+        return 'clean'
+    else:
+        return 'dirty'
+
+
+def report_state():
+    """Report current repository state."""
+    root = get_repository_root()
+    branch = get_current_branch()
+    head = get_current_head()
+    parent = get_parent_commit()
+    status = get_tree_status()
+
+    print("REPOSITORY STATE")
+    print("=" * 70)
+    print(f"Repository root: {root}")
+    print(f"Current branch:  {branch}")
+    print(f"HEAD commit:     {head}")
+    if parent:
+        print(f"Parent commit:   {parent}")
+    print(f"Tree status:     {status}")
+    print("=" * 70)
+
+    if status == 'dirty':
+        print("\nWARNING: Working tree has uncommitted changes")
+        print("Run 'git status' for details")
+
+
+def verify_checkpoint(expected_sha):
+    """Verify current HEAD matches expected checkpoint."""
+    # Validate SHA format (40 hex characters)
+    if len(expected_sha) != 40:
+        print(f"ERROR: Expected SHA must be 40 characters (got {len(expected_sha)})", file=sys.stderr)
+        print("Full SHA-1 hashes are required for checkpoint verification", file=sys.stderr)
+        return False
+
+    if not all(c in '0123456789abcdef' for c in expected_sha.lower()):
+        print("ERROR: Expected SHA contains invalid characters", file=sys.stderr)
+        print("SHA must be 40 hexadecimal characters", file=sys.stderr)
+        return False
+
+    # Get current state
+    root = get_repository_root()
+    branch = get_current_branch()
+    head = get_current_head()
+    status = get_tree_status()
+
+    # Normalize SHAs to lowercase for comparison
+    expected_sha = expected_sha.lower()
+    head = head.lower() if head else None
+
+    # Report state
+    print("CHECKPOINT VERIFICATION")
+    print("=" * 70)
+    print(f"Repository root: {root}")
+    print(f"Current branch:  {branch}")
+    print(f"Expected SHA:    {expected_sha}")
+    print(f"Actual HEAD:     {head}")
+    print(f"Tree status:     {status}")
+    print("=" * 70)
+
+    # Check match
+    if head != expected_sha:
+        print("\nCHECKPOINT MISMATCH")
+        print(f"Expected: {expected_sha}")
+        print(f"Actual:   {head}")
+        return False
+
+    print("\nCHECKPOINT MATCH")
+
+    if status == 'dirty':
+        print("\nWARNING: Checkpoint matches but tree has uncommitted changes")
+        print("Run 'git status' for details")
+
+    return True
+
+
+def show_help():
+    """Show help message."""
+    print(__doc__)
+
+
+def main():
+    """Main entry point."""
+    args = sys.argv[1:]
+
+    if len(args) == 0:
+        # Report mode
+        report_state()
+        sys.exit(0)
+
+    elif len(args) == 1:
+        arg = args[0]
+
+        if arg in ('-h', '--help', 'help'):
+            show_help()
+            sys.exit(0)
+
+        # Verify mode
+        expected_sha = arg
+        if verify_checkpoint(expected_sha):
+            sys.exit(0)
+        else:
+            sys.exit(1)
+
+    else:
+        print("ERROR: Invalid usage", file=sys.stderr)
+        print("Run './tools/verify-checkpoint --help' for usage information", file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == '__main__':
+    main()

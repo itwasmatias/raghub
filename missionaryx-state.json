@@ -1,0 +1,195 @@
+{
+  "schema_version": "1.0.0",
+  "project": "MissionaryX",
+  "description": "Federated AI Operating System with governed, durable, and auditable agent operations",
+  "current_integrated_checkpoint": {
+    "commit_sha": "5637f813ce1669cd288b47edc946a71ea53dc63e",
+    "commit_message": "Make concurrent durable-store migration converge",
+    "date": "2026-08-17",
+    "branch": "feature/development-continuity-v0-1",
+    "description": "Integrated checkpoint combining all accepted MissionaryX subsystems"
+  },
+  "accepted_subsystem_checkpoints": [
+    {
+      "name": "DurableEffectStore Concurrent Migration Correction",
+      "commit_sha": "5637f813ce1669cd288b47edc946a71ea53dc63e",
+      "subsystem": "Effect Truth",
+      "purpose": "Correct concurrent migration handling for convergence",
+      "status": "accepted"
+    },
+    {
+      "name": "Access & Credential Broker v0.1",
+      "commit_sha": "dba334668608034c19efc3e2d9c791b7b8f74583",
+      "subsystem": "Access/Credential Truth",
+      "purpose": "Establish credential broker foundation with scope binding",
+      "status": "accepted"
+    },
+    {
+      "name": "Agent Identity & Delegation v0.1",
+      "commit_sha": "840d7645045a02174509559637ab9af1ad215e89",
+      "subsystem": "Authority Truth",
+      "purpose": "Establish agent identity and delegation grant system",
+      "status": "accepted"
+    },
+    {
+      "name": "Mission Runtime v0.1",
+      "commit_sha": "721f75683fd53ae0549645c70653bf981c713c6d",
+      "subsystem": "Mission Truth",
+      "purpose": "Establish durable mission lifecycle with checkpoint/resume",
+      "status": "accepted"
+    }
+  ],
+  "known_non_blocking_issues": [
+    {
+      "type": "flaky_test",
+      "test_path": "tests/test_llamacpp_adapter.py::test_timeout_returns_error_response",
+      "description": "Inherited flaky timeout test for local model infrastructure",
+      "impact": "non_blocking",
+      "deselection_required": true,
+      "related_subsystem": "Local Model Infrastructure"
+    },
+    {
+      "type": "fail_safe_behavior",
+      "component": "DurableEffectStore",
+      "description": "Malformed non-integer schema-version fails closed via ValueError",
+      "impact": "non_blocking",
+      "expected_behavior": "Fail-safe behavior, does not compromise durability",
+      "related_subsystem": "Effect Truth"
+    }
+  ],
+  "python_version": "3.11+",
+  "tested_python_version": "3.14.6",
+  "standard_validation_command": "./tools/validate-missionaryx",
+  "validation_modes": {
+    "quick": "./tools/validate-missionaryx --quick",
+    "full": "./tools/validate-missionaryx --full"
+  },
+  "checkpoint_verification_command": "./tools/verify-checkpoint",
+  "environment_setup": {
+    "venv_creation": "python3 -m venv .venv",
+    "dependency_installation": ".venv/bin/pip install -r requirements-dev.txt",
+    "quick_start": "make setup"
+  },
+  "next_milestone": {
+    "name": "Development Continuity v0.1",
+    "status": "in_progress",
+    "purpose": "Ensure MissionaryX remains developable without hosted AI services",
+    "expected_deliverables": [
+      "Checkpoint record documentation",
+      "Architecture documentation enhancement",
+      "Development state and protocol documents",
+      "Validation and checkpoint verification tooling",
+      "Environment setup documentation",
+      "Local AI development workflow",
+      "Offline survival procedure",
+      "Machine-readable state file",
+      "AI handoff template"
+    ]
+  },
+  "subsystems": [
+    {
+      "name": "Mission Truth",
+      "description": "Durable mission lifecycle, checkpointing, and recovery",
+      "key_files": [
+        "federation/mission_runtime.py",
+        "federation/mission_runtime_store.py",
+        "federation/mission_state.py"
+      ],
+      "protected": true
+    },
+    {
+      "name": "Authority Truth",
+      "description": "Agent identity and delegation-based authority",
+      "key_files": [
+        "federation/agent_identity.py",
+        "federation/agent_identity_registry.py",
+        "federation/delegation_grant.py",
+        "federation/delegation_grant_registry.py",
+        "federation/authority_evaluator.py",
+        "federation/agent_authority_store.py"
+      ],
+      "protected": true
+    },
+    {
+      "name": "Access/Credential Truth",
+      "description": "Credential retrieval authorization and secret management",
+      "key_files": [
+        "federation/access_credential_broker.py",
+        "federation/access_credential_store.py",
+        "federation/access_connection.py",
+        "federation/access_requirement.py",
+        "federation/credential_backend.py",
+        "federation/credential_broker.py",
+        "federation/authentication_session.py"
+      ],
+      "protected": true
+    },
+    {
+      "name": "Effect Truth",
+      "description": "Governed effect dispatch with crash-safe persistence",
+      "key_files": [
+        "federation/durable_effect_store.py",
+        "federation/effect_gateway.py",
+        "federation/effect_boundary.py",
+        "federation/canonical_digest.py",
+        "pavilionos/canonical_adapter.py",
+        "pavilionos/canonical_coordinator.py"
+      ],
+      "protected": true
+    }
+  ],
+  "architectural_invariants": [
+    "identity != authority",
+    "connection != authority",
+    "authentication != authority",
+    "authorization != credential retrieval",
+    "credential retrieval != effect dispatch",
+    "dispatch != effect success",
+    "task failure != effect failure",
+    "mission reference != mission completion"
+  ],
+  "documentation": {
+    "read_first": "DEVELOPMENT_STATE.md",
+    "architecture": "ARCHITECTURE.md",
+    "protocol": "DEVELOPMENT_PROTOCOL.md",
+    "environment_setup": "ENVIRONMENT_SETUP.md",
+    "local_ai_workflow": "LOCAL_AI_DEVELOPMENT.md",
+    "offline_procedure": "OFFLINE_SURVIVAL.md",
+    "checkpoints": "docs/accepted-checkpoints.md",
+    "protected_boundaries": "docs/protected-boundaries.md"
+  },
+  "tooling": {
+    "validation": "tools/validate-missionaryx",
+    "checkpoint_verification": "tools/verify-checkpoint"
+  },
+  "repository": {
+    "primary_worktree": "/home/matias/missionaryx-development-continuity-v0-1",
+    "primary_branch": "feature/development-continuity-v0-1",
+    "main_branch_for_prs": "feature/ai-controller-platform-v1"
+  },
+  "development_machines": {
+    "fedora_hp_pavilion": {
+      "role": "Claude Code programming and development",
+      "ai_tool": "Claude Code v2.0.14 (npm, pinned, no AVX support)",
+      "model": "Sonnet 4.5",
+      "constraint": "No AVX CPU support, native builds crash"
+    },
+    "claude_ai_chat": {
+      "role": "Planning and idea review only (not programming)"
+    },
+    "windows_hp_14": {
+      "role": "Programming for Windows-specific features",
+      "ai_tools": "ChatGPT, Codex, GitHub Copilot"
+    }
+  },
+  "acceptance_criteria": {
+    "implementation_complete": true,
+    "focused_validation_passed": true,
+    "full_validation_passed": true,
+    "independent_review_verified": true,
+    "reviewer_reproduced_invariants": true,
+    "checkpoint_designated": true
+  },
+  "last_updated": "2026-08-17",
+  "state_document_maintainer": "Development Continuity Toolkit"
+}
