@@ -168,7 +168,6 @@ class MissionSpecificationObservation(_ProjectionModel):
     success_criteria: str | None
     constraints: str | None
     deadline: datetime | None
-    metadata_json: str
     created_at: datetime
     specification_fingerprint: str
 
@@ -549,7 +548,6 @@ class MissionObservability:
             success_criteria=specification.success_criteria,
             constraints=specification.constraints,
             deadline=specification.deadline,
-            metadata_json=_canonical_json(dict(specification.metadata)),
             created_at=specification.created_at,
             specification_fingerprint=specification.specification_fingerprint(),
         )
@@ -624,6 +622,30 @@ class MissionObservability:
             raise MissionObservabilityIntegrityError(
                 "Mission transition history contradicts current lifecycle"
             )
+
+        # Validate state chain continuity: each transition must continue from previous to_state
+        for i, transition in enumerate(transitions):
+            if i == 0:
+                # First transition must be from the initial lifecycle state (CREATED)
+                continue
+            previous = transitions[i - 1]
+            if transition.from_state != previous.to_state:
+                raise MissionObservabilityIntegrityError(
+                    f"Mission transition chain broken at revision {transition.revision}: "
+                    f"transition from {transition.from_state.value!r} but previous ended at "
+                    f"{previous.to_state.value!r}"
+                )
+
+        # Validate timestamp ordering: transitions must not regress in time
+        for i in range(1, len(transitions)):
+            previous = transitions[i - 1]
+            current = transitions[i]
+            if current.transitioned_at < previous.transitioned_at:
+                raise MissionObservabilityIntegrityError(
+                    f"Mission transition timestamp regression at revision {current.revision}: "
+                    f"timestamp {current.transitioned_at.isoformat()} precedes previous "
+                    f"transition timestamp {previous.transitioned_at.isoformat()}"
+                )
 
     def _read_checkpoints(
         self,
@@ -782,12 +804,27 @@ class MissionObservability:
                         f"Gateway claim {claim.gateway_claim_id!r} binds dispatch "
                         f"{claim.effect_dispatch_id!r}, expected {reference.effect_dispatch_id!r}"
                     )
+                # Validate exact adapter correlation between claim and dispatch
+                if dispatch is not None:
+                    if claim.adapter_id != dispatch.provider_adapter:
+                        raise MissionObservabilityIntegrityError(
+                            f"Gateway claim {claim.gateway_claim_id!r} adapter_id "
+                            f"{claim.adapter_id!r} contradicts dispatch provider_adapter "
+                            f"{dispatch.provider_adapter!r}"
+                        )
             else:
                 dispatch = self._read_dispatch(
                     claim.effect_dispatch_id,
                     control_domain,
                     intent,
                 )
+                # Validate exact adapter correlation between claim and dispatch
+                if claim.adapter_id != dispatch.provider_adapter:
+                    raise MissionObservabilityIntegrityError(
+                        f"Gateway claim {claim.gateway_claim_id!r} adapter_id "
+                        f"{claim.adapter_id!r} contradicts dispatch provider_adapter "
+                        f"{dispatch.provider_adapter!r}"
+                    )
 
         reservation = self._effect_store.get_reservation(
             intent.authority_reservation_id,
@@ -985,30 +1022,116 @@ class MissionObservability:
             raise MissionObservabilityIntegrityError(
                 f"Gateway claim {claim_id!r} expires_at must follow claimed_at"
             )
-        if state in {"prepared", "claimed"} and any(
-            value is not None
-            for value in (handoff_started_at, receipt_recorded_at, terminal_at)
-        ):
-            raise MissionObservabilityIntegrityError(
-                f"Gateway claim {claim_id!r} state {state!r} contradicts phase timestamps"
-            )
-        if state in {"handoff_started", "receipt_recorded", "terminal", "indeterminate"}:
+
+        # Validate required phase timestamps for each state
+        if state in {"prepared", "claimed"}:
+            if handoff_started_at is not None:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} state {state!r} must not have handoff_started_at"
+                )
+            if receipt_recorded_at is not None:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} state {state!r} must not have receipt_recorded_at"
+                )
+            if terminal_at is not None:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} state {state!r} must not have terminal_at"
+                )
+
+        if state == "handoff_started":
             if handoff_started_at is None:
                 raise MissionObservabilityIntegrityError(
-                    f"Gateway claim {claim_id!r} state {state!r} lacks handoff_started_at"
+                    f"Gateway claim {claim_id!r} state {state!r} requires handoff_started_at"
                 )
-        if state in {"receipt_recorded", "terminal"} and receipt_recorded_at is None:
-            raise MissionObservabilityIntegrityError(
-                f"Gateway claim {claim_id!r} state {state!r} lacks receipt_recorded_at"
-            )
-        if state in {"terminal", "indeterminate"} and terminal_at is None:
-            raise MissionObservabilityIntegrityError(
-                f"Gateway claim {claim_id!r} state {state!r} lacks terminal_at"
-            )
-        if state == "indeterminate" and receipt_recorded_at is not None:
-            raise MissionObservabilityIntegrityError(
-                f"Gateway claim {claim_id!r} indeterminate state contradicts receipt_recorded_at"
-            )
+            if receipt_recorded_at is not None:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} state {state!r} must not have receipt_recorded_at"
+                )
+            if terminal_at is not None:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} state {state!r} must not have terminal_at"
+                )
+
+        if state == "receipt_recorded":
+            if handoff_started_at is None:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} state {state!r} requires handoff_started_at"
+                )
+            if receipt_recorded_at is None:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} state {state!r} requires receipt_recorded_at"
+                )
+            if terminal_at is not None:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} state {state!r} must not have terminal_at"
+                )
+
+        if state == "terminal":
+            if handoff_started_at is None:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} state {state!r} requires handoff_started_at"
+                )
+            if receipt_recorded_at is None:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} state {state!r} requires receipt_recorded_at"
+                )
+            if terminal_at is None:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} state {state!r} requires terminal_at"
+                )
+
+        if state == "indeterminate":
+            if handoff_started_at is None:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} state {state!r} requires handoff_started_at"
+                )
+            if receipt_recorded_at is not None:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} indeterminate state must not have receipt_recorded_at"
+                )
+            if terminal_at is None:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} state {state!r} requires terminal_at"
+                )
+
+        # Validate chronological ordering of phase timestamps
+        if handoff_started_at is not None:
+            if handoff_started_at <= claimed_at:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} handoff_started_at must follow claimed_at"
+                )
+
+        if receipt_recorded_at is not None:
+            if handoff_started_at is None:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} receipt_recorded_at requires handoff_started_at"
+                )
+            if receipt_recorded_at <= handoff_started_at:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} receipt_recorded_at must follow handoff_started_at"
+                )
+
+        if terminal_at is not None:
+            if state == "terminal":
+                # Terminal path requires full handoff -> receipt -> terminal progression
+                if receipt_recorded_at is None:
+                    raise MissionObservabilityIntegrityError(
+                        f"Gateway claim {claim_id!r} terminal_at requires receipt_recorded_at"
+                    )
+                if terminal_at <= receipt_recorded_at:
+                    raise MissionObservabilityIntegrityError(
+                        f"Gateway claim {claim_id!r} terminal_at must follow receipt_recorded_at"
+                    )
+            elif state == "indeterminate":
+                # Indeterminate path: handoff -> indeterminate (no receipt)
+                if handoff_started_at is None:
+                    raise MissionObservabilityIntegrityError(
+                        f"Gateway claim {claim_id!r} terminal_at requires handoff_started_at"
+                    )
+                if terminal_at <= handoff_started_at:
+                    raise MissionObservabilityIntegrityError(
+                        f"Gateway claim {claim_id!r} terminal_at must follow handoff_started_at"
+                    )
 
         return GatewayClaimObservation(
             gateway_claim_id=claim_id,

@@ -207,9 +207,27 @@ the result under that documented non-atomic limitation.
 
 ## Security and non-secret projection
 
-The projection copies only explicitly selected fields. It never exposes gateway
-`permit_verifier`, permit tokens, credential scopes or leases, raw credentials,
-authentication secrets, integrity keys, or raw evidence payload/metadata.
+The projection copies only explicitly selected fields. It never exposes:
+
+- Gateway `permit_verifier` or permit tokens
+- Credential scopes, leases, or raw credentials
+- Authentication secrets or integrity keys
+- Raw evidence payload or metadata
+- Raw mission specification metadata
+
+Known exclusions:
+
+- Mission metadata is not projected. Metadata source-content changes remain
+  observable through the authoritative specification fingerprint.
+- Gateway permit material is excluded.
+- Raw credential and broker secret objects are excluded.
+- Evidence Spine raw payload and metadata are excluded.
+
+Observability is not a general secret classifier or DLP system. It does not
+perform heuristic secret detection. Intentionally observable mission text
+fields (objective, success criteria, constraints) remain mission-owned data,
+and callers remain responsible for what is placed there.
+
 Stable non-secret IDs, operation digests, and fingerprints needed for
 correlation remain visible.
 

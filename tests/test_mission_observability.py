@@ -385,7 +385,7 @@ def test_basic_observation_of_created_mission(tmp_path: Path) -> None:
     assert observation.lifecycle is MissionLifecycle.CREATED
     assert observation.revision == 1
     assert observation.specification.objective == f"Observe {DOMAIN_A}"
-    assert observation.specification.metadata_json == '{"immutable":{"value":1}}'
+    assert observation.specification.specification_fingerprint is not None
     assert observation.effects == ()
     assert observation.evidence_available is False
     assert len(observation.projection_fingerprint) == 64
@@ -1092,6 +1092,363 @@ def test_authoritative_store_integrity_error_is_not_swallowed(tmp_path: Path) ->
         _observe(runtime, BrokenStore(store))
 
 
+# ======================================================================
+# BLOCKER 1 REGRESSION: Gateway claim state/timestamp validation
+# ======================================================================
+
+
+def test_gateway_claim_terminal_at_before_receipt_recorded_at_fails(tmp_path: Path) -> None:
+    runtime, store = _runtime_and_store(tmp_path)
+    intent, dispatch = _commit_effect(store, include_claim=True)
+    assert dispatch is not None
+    _add_reference(runtime, intent, dispatch, claim_id="claim-1")
+    claim = store.get_gateway_claim("claim-1", DOMAIN_A)
+    assert claim is not None
+    claimed_at_ts = datetime.fromisoformat(claim["claimed_at"])
+    malformed = {
+        **claim,
+        "state": "terminal",
+        "handoff_started_at": (claimed_at_ts + timedelta(minutes=1)).isoformat(),
+        "receipt_recorded_at": (claimed_at_ts + timedelta(minutes=5)).isoformat(),
+        "terminal_at": (claimed_at_ts + timedelta(minutes=4)).isoformat(),  # Before receipt!
+    }
+
+    with pytest.raises(MissionObservabilityIntegrityError, match="terminal_at must follow receipt_recorded_at"):
+        _observe(runtime, _EffectReadOverride(store, claim=malformed))
+
+
+def test_gateway_claim_receipt_recorded_at_before_handoff_started_at_fails(tmp_path: Path) -> None:
+    runtime, store = _runtime_and_store(tmp_path)
+    intent, dispatch = _commit_effect(store, include_claim=True)
+    assert dispatch is not None
+    _add_reference(runtime, intent, dispatch, claim_id="claim-1")
+    claim = store.get_gateway_claim("claim-1", DOMAIN_A)
+    assert claim is not None
+    malformed = {
+        **claim,
+        "state": "receipt_recorded",
+        "handoff_started_at": (NOW + timedelta(minutes=5)).isoformat(),
+        "receipt_recorded_at": (NOW + timedelta(minutes=4)).isoformat(),  # Before handoff!
+    }
+
+    with pytest.raises(MissionObservabilityIntegrityError, match="receipt_recorded_at must follow handoff_started_at"):
+        _observe(runtime, _EffectReadOverride(store, claim=malformed))
+
+
+def test_gateway_claim_handoff_started_at_before_claimed_at_fails(tmp_path: Path) -> None:
+    runtime, store = _runtime_and_store(tmp_path)
+    intent, dispatch = _commit_effect(store, include_claim=True)
+    assert dispatch is not None
+    _add_reference(runtime, intent, dispatch, claim_id="claim-1")
+    claim = store.get_gateway_claim("claim-1", DOMAIN_A)
+    assert claim is not None
+    claimed_at_ts = datetime.fromisoformat(claim["claimed_at"])
+    malformed = {
+        **claim,
+        "state": "handoff_started",
+        "handoff_started_at": (claimed_at_ts - timedelta(seconds=1)).isoformat(),  # Before claimed!
+    }
+
+    with pytest.raises(MissionObservabilityIntegrityError, match="handoff_started_at must follow claimed_at"):
+        _observe(runtime, _EffectReadOverride(store, claim=malformed))
+
+
+def test_gateway_claim_handoff_started_with_forbidden_receipt_timestamp_fails(tmp_path: Path) -> None:
+    runtime, store = _runtime_and_store(tmp_path)
+    intent, dispatch = _commit_effect(store, include_claim=True)
+    assert dispatch is not None
+    _add_reference(runtime, intent, dispatch, claim_id="claim-1")
+    claim = store.get_gateway_claim("claim-1", DOMAIN_A)
+    assert claim is not None
+    malformed = {
+        **claim,
+        "state": "handoff_started",
+        "handoff_started_at": (NOW + timedelta(minutes=3)).isoformat(),
+        "receipt_recorded_at": (NOW + timedelta(minutes=4)).isoformat(),  # Forbidden for handoff_started!
+    }
+
+    with pytest.raises(MissionObservabilityIntegrityError, match="handoff_started.*must not have receipt_recorded_at"):
+        _observe(runtime, _EffectReadOverride(store, claim=malformed))
+
+
+def test_gateway_claim_claimed_with_forbidden_terminal_timestamp_fails(tmp_path: Path) -> None:
+    runtime, store = _runtime_and_store(tmp_path)
+    intent, dispatch = _commit_effect(store, include_claim=True)
+    assert dispatch is not None
+    _add_reference(runtime, intent, dispatch, claim_id="claim-1")
+    claim = store.get_gateway_claim("claim-1", DOMAIN_A)
+    assert claim is not None
+    malformed = {
+        **claim,
+        "state": "claimed",
+        "terminal_at": (NOW + timedelta(minutes=10)).isoformat(),  # Forbidden for claimed!
+    }
+
+    with pytest.raises(MissionObservabilityIntegrityError, match="claimed.*must not have terminal_at"):
+        _observe(runtime, _EffectReadOverride(store, claim=malformed))
+
+
+def test_gateway_claim_terminal_missing_required_receipt_timestamp_fails(tmp_path: Path) -> None:
+    runtime, store = _runtime_and_store(tmp_path)
+    intent, dispatch = _commit_effect(store, include_claim=True)
+    assert dispatch is not None
+    _add_reference(runtime, intent, dispatch, claim_id="claim-1")
+    claim = store.get_gateway_claim("claim-1", DOMAIN_A)
+    assert claim is not None
+    malformed = {
+        **claim,
+        "state": "terminal",
+        "handoff_started_at": (NOW + timedelta(minutes=3)).isoformat(),
+        "terminal_at": (NOW + timedelta(minutes=5)).isoformat(),
+        # Missing receipt_recorded_at!
+    }
+
+    with pytest.raises(MissionObservabilityIntegrityError, match="terminal.*requires receipt_recorded_at"):
+        _observe(runtime, _EffectReadOverride(store, claim=malformed))
+
+
+def test_gateway_claim_indeterminate_with_forbidden_receipt_timestamp_fails(tmp_path: Path) -> None:
+    runtime, store = _runtime_and_store(tmp_path)
+    intent, dispatch = _commit_effect(store, include_claim=True)
+    assert dispatch is not None
+    _add_reference(runtime, intent, dispatch, claim_id="claim-1")
+    claim = store.get_gateway_claim("claim-1", DOMAIN_A)
+    assert claim is not None
+    malformed = {
+        **claim,
+        "state": "indeterminate",
+        "handoff_started_at": (NOW + timedelta(minutes=3)).isoformat(),
+        "receipt_recorded_at": (NOW + timedelta(minutes=4)).isoformat(),  # Forbidden for indeterminate!
+        "terminal_at": (NOW + timedelta(minutes=5)).isoformat(),
+    }
+
+    with pytest.raises(MissionObservabilityIntegrityError, match="indeterminate.*must not have receipt_recorded_at"):
+        _observe(runtime, _EffectReadOverride(store, claim=malformed))
+
+
+def test_gateway_claim_valid_terminal_chronology_succeeds(tmp_path: Path) -> None:
+    runtime, store = _runtime_and_store(tmp_path)
+    intent, dispatch = _commit_effect(store, include_claim=True)
+    assert dispatch is not None
+    _make_claim_terminal(store, intent, dispatch, effect_status="nothing_landed")
+    _add_reference(runtime, intent, dispatch, claim_id="claim-1")
+
+    observation = _observe(runtime, store)
+
+    assert observation.effects[0].gateway_claim is not None
+    assert observation.effects[0].gateway_claim.state == "terminal"
+
+
+def test_gateway_claim_valid_indeterminate_chronology_succeeds(tmp_path: Path) -> None:
+    runtime, store = _runtime_and_store(tmp_path)
+    intent, dispatch = _commit_effect(store, include_claim=True)
+    assert dispatch is not None
+    _make_claim_indeterminate(store, intent, dispatch)
+    _add_reference(runtime, intent, dispatch, claim_id="claim-1")
+
+    observation = _observe(runtime, store)
+
+    assert observation.effects[0].gateway_claim is not None
+    assert observation.effects[0].gateway_claim.state == "indeterminate"
+
+
+# ======================================================================
+# BLOCKER 2 REGRESSION: Mission transition chain integrity
+# ======================================================================
+
+
+def test_mission_transition_broken_from_to_state_chain_fails(tmp_path: Path) -> None:
+    runtime, store = _runtime_and_store(tmp_path)
+    runtime.start_mission(DOMAIN_A, MISSION_ID, expected_revision=1)
+    runtime.pause_mission(DOMAIN_A, MISSION_ID, expected_revision=2)
+
+    class BrokenTransitionRuntime:
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+        def get_mission(self, control_domain: str, mission_id: str):
+            return self.delegate.get_mission(control_domain, mission_id)
+
+        def list_transitions(self, control_domain: str, mission_id: str):
+            transitions = list(self.delegate.list_transitions(control_domain, mission_id))
+            # Break the chain: make second transition start from COMPLETED instead of RUNNING
+            broken = replace(transitions[1], from_state=MissionLifecycle.COMPLETED)
+            transitions[1] = broken
+            return transitions
+
+        def list_checkpoints(self, control_domain: str, mission_id: str):
+            return self.delegate.list_checkpoints(control_domain, mission_id)
+
+        def list_effect_references(self, control_domain: str, mission_id: str):
+            return self.delegate.list_effect_references(control_domain, mission_id)
+
+    with pytest.raises(MissionObservabilityIntegrityError, match="transition chain broken"):
+        _observe(BrokenTransitionRuntime(runtime), store)
+
+
+def test_mission_transition_timestamp_regression_fails(tmp_path: Path) -> None:
+    runtime, store = _runtime_and_store(tmp_path)
+    runtime.start_mission(DOMAIN_A, MISSION_ID, expected_revision=1)
+    runtime.pause_mission(DOMAIN_A, MISSION_ID, expected_revision=2)
+
+    class RegressingTransitionRuntime:
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+        def get_mission(self, control_domain: str, mission_id: str):
+            return self.delegate.get_mission(control_domain, mission_id)
+
+        def list_transitions(self, control_domain: str, mission_id: str):
+            transitions = list(self.delegate.list_transitions(control_domain, mission_id))
+            # Make second transition earlier than first
+            regressed = replace(
+                transitions[1],
+                transitioned_at=transitions[0].transitioned_at - timedelta(seconds=1)
+            )
+            transitions[1] = regressed
+            return transitions
+
+        def list_checkpoints(self, control_domain: str, mission_id: str):
+            return self.delegate.list_checkpoints(control_domain, mission_id)
+
+        def list_effect_references(self, control_domain: str, mission_id: str):
+            return self.delegate.list_effect_references(control_domain, mission_id)
+
+    with pytest.raises(MissionObservabilityIntegrityError, match="timestamp regression"):
+        _observe(RegressingTransitionRuntime(runtime), store)
+
+
+def test_mission_valid_pause_resume_complete_chain_succeeds(tmp_path: Path) -> None:
+    runtime, store = _runtime_and_store(tmp_path)
+    runtime.start_mission(DOMAIN_A, MISSION_ID, expected_revision=1)
+    runtime.pause_mission(DOMAIN_A, MISSION_ID, expected_revision=2)
+    runtime.resume_mission(DOMAIN_A, MISSION_ID, expected_revision=3)
+    runtime.complete_mission(DOMAIN_A, MISSION_ID, expected_revision=4)
+
+    observation = _observe(runtime, store)
+
+    assert observation.lifecycle is MissionLifecycle.COMPLETED
+    assert tuple(t.to_state for t in observation.transitions) == (
+        MissionLifecycle.CREATED,
+        MissionLifecycle.RUNNING,
+        MissionLifecycle.PAUSED,
+        MissionLifecycle.RUNNING,
+        MissionLifecycle.COMPLETED,
+    )
+
+
+# ======================================================================
+# BLOCKER 3 REGRESSION: Exact claim/dispatch correlation
+# ======================================================================
+
+
+def test_gateway_claim_adapter_id_mismatch_with_dispatch_fails(tmp_path: Path) -> None:
+    runtime, store = _runtime_and_store(tmp_path)
+    intent, dispatch = _commit_effect(store, include_claim=True)
+    assert dispatch is not None
+    _add_reference(runtime, intent, dispatch, claim_id="claim-1")
+    claim = store.get_gateway_claim("claim-1", DOMAIN_A)
+    assert claim is not None
+    malformed_claim = {**claim, "adapter_id": "different-adapter"}
+
+    with pytest.raises(MissionObservabilityIntegrityError, match="adapter_id.*contradicts.*provider_adapter"):
+        _observe(runtime, _EffectReadOverride(store, claim=malformed_claim))
+
+
+def test_gateway_claim_adapter_id_exact_binding_succeeds(tmp_path: Path) -> None:
+    runtime, store = _runtime_and_store(tmp_path)
+    intent, dispatch = _commit_effect(store, include_claim=True)
+    assert dispatch is not None
+    _add_reference(runtime, intent, dispatch, claim_id="claim-1")
+
+    observation = _observe(runtime, store)
+
+    assert observation.effects[0].dispatch is not None
+    assert observation.effects[0].gateway_claim is not None
+    assert observation.effects[0].gateway_claim.adapter_id == observation.effects[0].dispatch.provider_adapter
+
+
+# ======================================================================
+# BLOCKER 4 REGRESSION: Mission metadata exposure
+# ======================================================================
+
+
+def test_mission_metadata_absent_from_to_dict(tmp_path: Path) -> None:
+    runtime, store = _runtime_and_store(tmp_path, objective="Test metadata exclusion")
+
+    observation = _observe(runtime, store)
+    projected = observation.to_dict()
+
+    assert "MISSION-METADATA-SECRET" not in json.dumps(projected)
+    assert "metadata" not in projected["specification"]
+    assert "metadata_json" not in projected["specification"]
+    assert projected["specification"]["specification_fingerprint"] is not None
+
+
+def test_mission_metadata_absent_from_to_json(tmp_path: Path) -> None:
+    runtime, store = _runtime_and_store(tmp_path)
+
+    observation = _observe(runtime, store)
+    serialized = observation.to_json()
+
+    assert "metadata" not in serialized or '"metadata":' not in serialized
+    assert "metadata_json" not in serialized
+    assert '"immutable"' not in serialized  # From test metadata
+    assert "specification_fingerprint" in serialized
+
+
+def test_mission_metadata_absent_from_repr(tmp_path: Path) -> None:
+    runtime, store = _runtime_and_store(tmp_path)
+
+    observation = _observe(runtime, store)
+    representation = repr(observation.specification)
+
+    assert "immutable" not in representation
+    assert "metadata" not in representation or "metadata_json" not in representation
+
+
+def test_mission_metadata_absent_from_timeline(tmp_path: Path) -> None:
+    runtime, store = _runtime_and_store(tmp_path)
+
+    timeline = _observe(runtime, store).timeline
+    timeline_json = json.dumps([event.to_dict() for event in timeline])
+
+    assert "metadata" not in timeline_json or '"metadata":' not in timeline_json
+    assert "immutable" not in timeline_json
+
+
+def test_mission_metadata_change_alters_projection_fingerprint(tmp_path: Path) -> None:
+    runtime_a, store_a = _runtime_and_store(
+        tmp_path,
+        suffix="a",
+        mission_id="mission-a",
+        objective="Objective A",
+    )
+    runtime_b, store_b = _runtime_and_store(
+        tmp_path,
+        suffix="b",
+        mission_id="mission-b",
+        objective="Objective A",  # Same objective
+    )
+    # Create mission-b with different metadata
+    runtime_b_alt = MissionRuntime(db_path=tmp_path / "missions-b.sqlite3")
+    runtime_b_alt.create_mission(
+        mission_id="mission-c",
+        control_domain=DOMAIN_A,
+        objective="Objective A",
+        owner_identity=f"owner-{DOMAIN_A}",
+        metadata={"different": {"value": 2}},  # Different metadata
+    )
+
+    observation_a = _observe(runtime_a, store_a, mission_id="mission-a")
+    observation_c = _observe(runtime_b_alt, store_b, mission_id="mission-c")
+
+    # Different metadata should produce different specification fingerprints
+    assert observation_a.specification.specification_fingerprint != observation_c.specification.specification_fingerprint
+    # Which should produce different projection fingerprints
+    assert observation_a.projection_fingerprint != observation_c.projection_fingerprint
+
+
 def test_serialization_is_deterministic_and_contains_no_secret_material(tmp_path: Path) -> None:
     runtime, store = _runtime_and_store(tmp_path)
     intent, dispatch = _commit_effect(store, include_claim=True)
@@ -1111,3 +1468,5 @@ def test_serialization_is_deterministic_and_contains_no_secret_material(tmp_path
     assert "must-not-be-projected" not in first.to_json()
     assert "permit_token" not in first.to_json()
     assert "credential" not in first.to_json()
+    assert "metadata_json" not in first.to_json()
+    assert '"immutable"' not in first.to_json()
