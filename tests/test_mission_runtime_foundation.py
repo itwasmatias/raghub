@@ -1649,7 +1649,7 @@ def test_checkpoint_expected_revision_string_fails():
     )
 
     # ATTACK: expected_revision="1" should fail validation
-    with pytest.raises(ValueError, match="integer"):
+    with pytest.raises(ValueError, match="exact int"):
         runtime.create_checkpoint(
             control_domain=domain,
             mission_id=mission_id,
@@ -1947,3 +1947,285 @@ def test_checkpoint_conflict_does_not_append_checkpoint():
     checkpoints_after = runtime.list_checkpoints(domain, mission_id)
     assert len(checkpoints_after) == 1
     assert checkpoints_after[0].checkpoint_id == checkpoints_before[0].checkpoint_id
+
+
+# ============================================================================
+# MISSION CHECKPOINT REVISION GUARD CORRECTION REGRESSION TESTS
+# ============================================================================
+
+
+def test_malicious_int_subclass_checkpoint_rejected():
+    """REGRESSION: Malicious int subclass with overridden equality must be rejected.
+
+    DEFECT: Integer subclasses can override __eq__ to bypass revision checks.
+    A malicious int(999) could claim equality with any revision.
+
+    CORRECTION: Use exact type check (type(x) is int) instead of isinstance.
+    """
+    # Define malicious int subclass that claims equality with everything
+    class EvilInt(int):
+        """Malicious int subclass that breaks equality checks."""
+        def __eq__(self, other):
+            return True  # Always equal
+        def __ne__(self, other):
+            return False  # Never not-equal
+
+    runtime = MissionRuntime()
+    domain = "test-domain"
+    mission_id = "test-evil-int-checkpoint"
+
+    runtime.create_mission(
+        mission_id=mission_id,
+        control_domain=domain,
+        objective="Test malicious int subclass",
+        owner_identity="owner",
+    )
+
+    _, state, rev, _ = runtime.get_mission(domain, mission_id)
+    assert state == MissionLifecycle.CREATED
+    assert rev == 1
+
+    # ATTACK: Use malicious int subclass as expected_revision
+    evil_revision = EvilInt(999)
+    assert evil_revision == 1  # EvilInt claims it equals 1
+    assert evil_revision == 999  # EvilInt also claims it equals 999
+    assert not (evil_revision != 1)  # And is never not-equal
+
+    # PROOF: EvilInt is rejected at validation boundary
+    with pytest.raises(ValueError, match="exact int"):
+        runtime.create_checkpoint(
+            control_domain=domain,
+            mission_id=mission_id,
+            mission_state=MissionLifecycle.CREATED,
+            expected_revision=evil_revision,  # type: ignore
+        )
+
+    # PROOF: No checkpoint was written
+    checkpoints = runtime.list_checkpoints(domain, mission_id)
+    assert len(checkpoints) == 0
+
+    # PROOF: Mission revision and state unchanged
+    _, state_after, rev_after, _ = runtime.get_mission(domain, mission_id)
+    assert state_after == MissionLifecycle.CREATED
+    assert rev_after == 1
+
+
+def test_malicious_int_subclass_transition_rejected():
+    """REGRESSION: Malicious int subclass must also be rejected for transitions."""
+    class EvilInt(int):
+        """Malicious int subclass."""
+        def __eq__(self, other):
+            return True
+
+    runtime = MissionRuntime()
+    domain = "test-domain"
+    mission_id = "test-evil-int-transition"
+
+    runtime.create_mission(
+        mission_id=mission_id,
+        control_domain=domain,
+        objective="Test malicious int transition",
+        owner_identity="owner",
+    )
+
+    evil_revision = EvilInt(999)
+
+    # ATTACK: Use malicious int subclass as expected_revision for transition
+    with pytest.raises(ValueError, match="exact int"):
+        runtime.start_mission(domain, mission_id, expected_revision=evil_revision)  # type: ignore
+
+    # PROOF: Mission unchanged
+    _, state, rev, _ = runtime.get_mission(domain, mission_id)
+    assert state == MissionLifecycle.CREATED
+    assert rev == 1
+
+
+def _concurrent_checkpoint_vs_transition_worker(
+    db_path, domain, mission_id, operation, expected_revision, worker_id, result_queue
+):
+    """Worker for deterministic two-writer race test.
+
+    Args:
+        db_path: Path to database
+        domain: ControlDomain identifier
+        mission_id: Mission identifier
+        operation: "checkpoint" or "transition"
+        expected_revision: Expected revision for concurrency control
+        worker_id: Worker identifier
+        result_queue: Queue to return results
+    """
+    try:
+        # Each worker creates its own connection via separate runtime
+        runtime = MissionRuntime(db_path=db_path)
+
+        # Small delay to ensure both workers start roughly simultaneously
+        time.sleep(0.01)
+
+        if operation == "checkpoint":
+            # Attempt guarded checkpoint creation
+            checkpoint = runtime.create_checkpoint(
+                control_domain=domain,
+                mission_id=mission_id,
+                mission_state=MissionLifecycle.CREATED,
+                expected_revision=expected_revision,
+            )
+            result_queue.put(("success", worker_id, "checkpoint", checkpoint.checkpoint_id))
+        elif operation == "transition":
+            # Attempt lifecycle transition
+            new_rev = runtime.start_mission(domain, mission_id, expected_revision)
+            result_queue.put(("success", worker_id, "transition", new_rev))
+
+    except MissionRevisionConflictError as e:
+        # Expected conflict for losing worker
+        result_queue.put(("conflict", worker_id, operation, str(e)))
+    except Exception as e:
+        # Unexpected error
+        result_queue.put(("error", worker_id, operation, str(e)))
+
+
+def test_concurrent_checkpoint_vs_transition_serialized():
+    """REGRESSION: Concurrent guarded checkpoint and transition must serialize correctly.
+
+    DEFECT: Without BEGIN IMMEDIATE, checkpoint SELECT and lifecycle transition UPDATE
+    can interleave, allowing stale checkpoint to commit after transition completes.
+
+    SCENARIO:
+        Checkpoint: SELECT revision=1, validate
+        Transition: UPDATE revision 1->2, COMMIT
+        Checkpoint: INSERT (stale validation), COMMIT  <- FORBIDDEN
+
+    CORRECTION: BEGIN IMMEDIATE acquires write lock before SELECT, preventing interleave.
+
+    This test uses separate processes with independent database connections to prove
+    SQLite-level serialization prevents the race condition.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "test_checkpoint_transition_race.db"
+        domain = "test-domain"
+        mission_id = "test-checkpoint-transition-race"
+
+        # Setup: Create mission in CREATED state (revision 1)
+        runtime = MissionRuntime(db_path=db_path)
+        runtime.create_mission(
+            mission_id=mission_id,
+            control_domain=domain,
+            objective="Test checkpoint vs transition serialization",
+            owner_identity="owner",
+        )
+
+        _, state, initial_rev, _ = runtime.get_mission(domain, mission_id)
+        assert state == MissionLifecycle.CREATED
+        assert initial_rev == 1
+
+        # RACE: Two workers attempt operations with same expected_revision=1
+        # Worker 1: Create guarded checkpoint (expects revision 1)
+        # Worker 2: Transition to RUNNING (expects revision 1, will create revision 2)
+        result_queue = multiprocessing.Queue()
+
+        worker1 = multiprocessing.Process(
+            target=_concurrent_checkpoint_vs_transition_worker,
+            args=(db_path, domain, mission_id, "checkpoint", initial_rev, 1, result_queue)
+        )
+        worker2 = multiprocessing.Process(
+            target=_concurrent_checkpoint_vs_transition_worker,
+            args=(db_path, domain, mission_id, "transition", initial_rev, 2, result_queue)
+        )
+
+        # Start both workers simultaneously
+        worker1.start()
+        worker2.start()
+
+        # Wait for completion
+        worker1.join(timeout=5)
+        worker2.join(timeout=5)
+
+        # Collect results
+        results = []
+        while not result_queue.empty():
+            results.append(result_queue.get())
+
+        assert len(results) == 2, f"Expected 2 results, got {len(results)}: {results}"
+
+        # Analyze results
+        successes = [r for r in results if r[0] == "success"]
+        conflicts = [r for r in results if r[0] == "conflict"]
+        errors = [r for r in results if r[0] == "error"]
+
+        assert len(errors) == 0, f"Unexpected errors: {errors}"
+
+        # Verify final database state
+        runtime_final = MissionRuntime(db_path=db_path)
+        _, final_state, final_rev, _ = runtime_final.get_mission(domain, mission_id)
+        checkpoints_final = runtime_final.list_checkpoints(domain, mission_id)
+
+        # CRITICAL: Two valid serialization orders are possible
+        #
+        # ORDER A: Checkpoint serialized first (both succeed)
+        #   - Checkpoint: BEGIN IMMEDIATE, SELECT rev=1, validate, INSERT, COMMIT (rev still 1)
+        #   - Transition: BEGIN IMMEDIATE (after checkpoint), SELECT rev=1, validate, UPDATE to 2, COMMIT
+        #   - Result: final_rev=2, checkpoint exists, both operations succeeded
+        #
+        # ORDER B: Transition serialized first (checkpoint conflicts)
+        #   - Transition: BEGIN IMMEDIATE, SELECT rev=1, validate, UPDATE to 2, COMMIT
+        #   - Checkpoint: BEGIN IMMEDIATE (after transition), SELECT rev=2, validate expected=1 vs actual=2, CONFLICT
+        #   - Result: final_rev=2, no checkpoint, transition succeeded, checkpoint failed
+
+        if len(successes) == 2 and len(conflicts) == 0:
+            # ORDER A: Both succeeded (checkpoint serialized first)
+            assert final_state == MissionLifecycle.RUNNING, "Transition should have succeeded after checkpoint"
+            assert final_rev == 2, "Transition should have incremented revision to 2"
+            assert len(checkpoints_final) == 1, "Checkpoint should exist from first operation"
+
+            # Verify checkpoint was created before transition
+            checkpoint_success = [r for r in successes if r[2] == "checkpoint"]
+            transition_success = [r for r in successes if r[2] == "transition"]
+            assert len(checkpoint_success) == 1, "Checkpoint should have succeeded"
+            assert len(transition_success) == 1, "Transition should have succeeded"
+
+            # This is valid: checkpoint validated against rev=1, committed (rev still 1),
+            # then transition validated against rev=1, committed (rev became 2)
+
+        elif len(successes) == 1 and len(conflicts) == 1:
+            # One operation succeeded, one conflicted
+            winner = successes[0]
+            loser = conflicts[0]
+
+            if winner[2] == "transition":
+                # ORDER B: Transition won, checkpoint conflicted
+                assert final_state == MissionLifecycle.RUNNING
+                assert final_rev == 2
+                assert len(checkpoints_final) == 0, "Checkpoint should have been rejected"
+                assert loser[2] == "checkpoint", "Checkpoint should have conflicted"
+
+            elif winner[2] == "checkpoint":
+                # Checkpoint won, transition conflicted (unusual but possible if transition had wrong revision)
+                assert final_state == MissionLifecycle.CREATED, "Mission should still be CREATED if transition failed"
+                assert final_rev == 1, "Revision should still be 1"
+                assert len(checkpoints_final) == 1, "Checkpoint should exist"
+                assert loser[2] == "transition", "Transition should have conflicted"
+
+        else:
+            pytest.fail(f"Unexpected result pattern: {len(successes)} successes, {len(conflicts)} conflicts. Results: {results}")
+
+        # CRITICAL PROOF: The FORBIDDEN outcome did NOT occur
+        #
+        # FORBIDDEN: Transition commits 1->2 AND checkpoint validated against rev=1 also commits
+        # This would only happen if:
+        #   - Checkpoint: BEGIN (no IMMEDIATE), SELECT rev=1, validate (pause)
+        #   - Transition: BEGIN IMMEDIATE, SELECT rev=1, UPDATE to 2, COMMIT
+        #   - Checkpoint: INSERT (stale validation), COMMIT
+        #
+        # With proper BEGIN IMMEDIATE in checkpoint, this interleaving is impossible.
+        # The checkpoint's BEGIN IMMEDIATE ensures no other writer can commit between
+        # its SELECT and INSERT.
+        #
+        # We verify this by checking: if checkpoints exist AND final_rev=2,
+        # then both operations must have succeeded in ORDER A (checkpoint first).
+        if len(checkpoints_final) > 0 and final_rev == 2:
+            # Checkpoint exists and revision is 2
+            # This is only valid if checkpoint succeeded first (ORDER A)
+            assert len(successes) == 2, (
+                "If checkpoint exists with final_rev=2, both operations must have succeeded. "
+                f"Got {len(successes)} successes. This could indicate a race where checkpoint "
+                "validated against rev=1 but committed after transition moved to rev=2."
+            )

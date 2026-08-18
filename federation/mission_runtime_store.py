@@ -512,8 +512,11 @@ class MissionRuntimeStore:
         if not isinstance(to_state, MissionLifecycle):
             raise TypeError("to_state must be a MissionLifecycle")
 
-        if not isinstance(expected_revision, int) or expected_revision < 1:
-            raise ValueError("expected_revision must be a positive integer")
+        # Validate expected_revision - exact type check to prevent int subclass attacks
+        if type(expected_revision) is not int:
+            raise ValueError("expected_revision must be an exact int (not bool, not subclass)")
+        if expected_revision < 1:
+            raise ValueError("expected_revision must be a positive integer (>= 1)")
 
         conn = self._connect()
         try:
@@ -644,19 +647,19 @@ class MissionRuntimeStore:
         if not isinstance(checkpoint, MissionCheckpoint):
             raise TypeError("checkpoint must be a MissionCheckpoint")
 
-        # Validate expected_revision if supplied
+        # Validate expected_revision if supplied - exact type check to prevent int subclass attacks
         if expected_revision is not None:
-            # Reject bool masquerading as int (bool is subclass of int in Python)
-            if isinstance(expected_revision, bool):
-                raise ValueError("expected_revision must be an integer, not bool")
-            if not isinstance(expected_revision, int):
-                raise ValueError("expected_revision must be an integer")
+            if type(expected_revision) is not int:
+                raise ValueError("expected_revision must be an exact int (not bool, not subclass)")
             if expected_revision < 1:
                 raise ValueError("expected_revision must be a positive integer (>= 1)")
 
         conn = self._connect()
         try:
-            with conn:
+            # Execute BEGIN IMMEDIATE explicitly to acquire write lock
+            # This blocks other writers until we commit, preventing revision races
+            conn.execute("BEGIN IMMEDIATE")
+            try:
                 # Verify mission exists and get current state AND revision
                 cursor = conn.execute(
                     """
@@ -713,6 +716,11 @@ class MissionRuntimeStore:
                         _serialize_timestamp(checkpoint.created_at),
                     ),
                 )
+
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         except sqlite3.IntegrityError as exc:
             raise MissionRuntimeStoreError(
                 f"Checkpoint sequence {checkpoint.sequence} already exists for mission {checkpoint.mission_id}"
