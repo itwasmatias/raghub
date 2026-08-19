@@ -16,7 +16,7 @@ import multiprocessing
 import secrets
 import sqlite3
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 
 import pytest
@@ -488,20 +488,27 @@ def test_validation_duration_exceeds_maximum(store, mission, test_domain, test_m
 # CONCURRENCY ATTACKS
 # ============================================================================
 
-def _concurrent_first_acquire_worker(db_path, domain, mission_id, controller_id, result_queue):
-    """Worker for concurrent first-acquire test."""
+def _concurrent_first_acquire_worker(db_path, domain, mission_id, controller_id, barrier, result_queue):
+    """Worker for concurrent first-acquire test with deterministic synchronization."""
     try:
+        # Synchronize before opening store
+        barrier.wait(timeout=5)
+
+        # All processes attempt acquisition simultaneously
         store = MissionRuntimeStore(db_path)
         lease = store.acquire_controller_lease(domain, mission_id, controller_id)
         result_queue.put(("success", controller_id, lease.generation))
     except MissionControllerLeaseConflictError as e:
         result_queue.put(("conflict", controller_id, str(e)))
     except Exception as e:
-        result_queue.put(("error", controller_id, str(e)))
+        result_queue.put(("error", controller_id, str(e), type(e).__name__))
 
 
 def test_concurrent_first_acquire_single_winner(mission):
-    """Test that concurrent first acquire results in single generation 1."""
+    """Test that concurrent first acquire results in single generation 1.
+
+    Uses deterministic Barrier synchronization to force true simultaneity.
+    """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
         db_path = Path(tmp.name)
 
@@ -517,52 +524,72 @@ def test_concurrent_first_acquire_single_winner(mission):
         )
         store.create_mission(spec)
 
-        # Launch concurrent acquire attempts
+        # Launch concurrent acquire attempts with barrier synchronization
+        num_processes = 3
+        barrier = multiprocessing.Barrier(num_processes)
         result_queue = multiprocessing.Queue()
         processes = []
 
-        for i in range(3):
+        for i in range(num_processes):
             p = multiprocessing.Process(
                 target=_concurrent_first_acquire_worker,
-                args=(db_path, "test-domain", "mission-concurrent", f"controller-{i}", result_queue)
+                args=(db_path, "test-domain", "mission-concurrent", f"controller-{i}", barrier, result_queue)
             )
             processes.append(p)
             p.start()
 
+        # Wait for all processes with timeout and assert exit codes
         for p in processes:
-            p.join()
+            p.join(timeout=10)
+            assert p.exitcode == 0, f"Process failed with exit code {p.exitcode}"
 
-        # Collect results
+        # Collect exactly num_processes results (no Queue.empty())
         results = []
-        while not result_queue.empty():
-            results.append(result_queue.get())
+        for _ in range(num_processes):
+            results.append(result_queue.get(timeout=1))
 
         # Exactly one success with generation 1
         successes = [r for r in results if r[0] == "success"]
         conflicts = [r for r in results if r[0] == "conflict"]
+        errors = [r for r in results if r[0] == "error"]
 
+        assert len(results) == num_processes, f"Expected {num_processes} results, got {len(results)}"
+        assert len(errors) == 0, f"Unexpected errors: {errors}"
         assert len(successes) == 1, f"Expected exactly 1 success, got {len(successes)}: {results}"
-        assert successes[0][2] == 1  # generation 1
-        assert len(conflicts) == 2  # Other two got conflicts
+        assert successes[0][2] == 1, "Winner must have generation 1"
+        assert len(conflicts) == num_processes - 1, f"Expected {num_processes - 1} conflicts, got {len(conflicts)}"
+
+        # Verify exactly one generation-1 durable row
+        verify_store = MissionRuntimeStore(db_path)
+        history = verify_store.list_controller_lease_history("test-domain", "mission-concurrent")
+        assert len(history) == 1, f"Expected exactly 1 lease in history, got {len(history)}"
+        assert history[0].generation == 1, "Durable lease must be generation 1"
 
     finally:
         db_path.unlink(missing_ok=True)
 
 
-def _concurrent_expired_takeover_worker(db_path, domain, mission_id, controller_id, result_queue):
-    """Worker for concurrent expired-takeover test."""
+def _concurrent_expired_takeover_worker(db_path, domain, mission_id, controller_id, barrier, result_queue):
+    """Worker for concurrent expired-takeover test with deterministic synchronization."""
     try:
+        # Synchronize before opening store
+        barrier.wait(timeout=5)
+
+        # All processes attempt acquisition simultaneously
         store = MissionRuntimeStore(db_path)
         lease = store.acquire_controller_lease(domain, mission_id, controller_id)
         result_queue.put(("success", controller_id, lease.generation))
     except MissionControllerLeaseConflictError as e:
         result_queue.put(("conflict", controller_id, str(e)))
     except Exception as e:
-        result_queue.put(("error", controller_id, str(e)))
+        result_queue.put(("error", controller_id, str(e), type(e).__name__))
 
 
 def test_concurrent_expired_takeover_single_generation_2(mission, fake_clock):
-    """Test that concurrent takeover after expiry results in single generation 2."""
+    """Test that concurrent takeover after expiry results in single generation 2.
+
+    Uses deterministic Barrier synchronization to force true simultaneity.
+    """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
         db_path = Path(tmp.name)
 
@@ -588,33 +615,47 @@ def test_concurrent_expired_takeover_single_generation_2(mission, fake_clock):
         import time
         time.sleep(2)
 
-        # Launch concurrent takeover attempts
+        # Launch concurrent takeover attempts with barrier synchronization
+        num_processes = 3
+        barrier = multiprocessing.Barrier(num_processes)
         result_queue = multiprocessing.Queue()
         processes = []
 
-        for i in range(3):
+        for i in range(num_processes):
             p = multiprocessing.Process(
                 target=_concurrent_expired_takeover_worker,
-                args=(db_path, "test-domain", "mission-takeover", f"controller-{i}", result_queue)
+                args=(db_path, "test-domain", "mission-takeover", f"controller-{i}", barrier, result_queue)
             )
             processes.append(p)
             p.start()
 
+        # Wait for all processes with timeout and assert exit codes
         for p in processes:
-            p.join()
+            p.join(timeout=10)
+            assert p.exitcode == 0, f"Process failed with exit code {p.exitcode}"
 
-        # Collect results
+        # Collect exactly num_processes results (no Queue.empty())
         results = []
-        while not result_queue.empty():
-            results.append(result_queue.get())
+        for _ in range(num_processes):
+            results.append(result_queue.get(timeout=1))
 
         # Exactly one success with generation 2
         successes = [r for r in results if r[0] == "success"]
         conflicts = [r for r in results if r[0] == "conflict"]
+        errors = [r for r in results if r[0] == "error"]
 
+        assert len(results) == num_processes, f"Expected {num_processes} results, got {len(results)}"
+        assert len(errors) == 0, f"Unexpected errors: {errors}"
         assert len(successes) == 1, f"Expected exactly 1 success, got {len(successes)}: {results}"
-        assert successes[0][2] == 2  # generation 2
-        assert len(conflicts) == 2  # Other two got conflicts
+        assert successes[0][2] == 2, "Winner must have generation 2"
+        assert len(conflicts) == num_processes - 1, f"Expected {num_processes - 1} conflicts, got {len(conflicts)}"
+
+        # Verify exactly two durable rows (generation 1 + generation 2)
+        verify_store = MissionRuntimeStore(db_path)
+        history = verify_store.list_controller_lease_history("test-domain", "mission-takeover")
+        assert len(history) == 2, f"Expected exactly 2 leases in history, got {len(history)}"
+        assert history[0].generation == 1, "First durable lease must be generation 1"
+        assert history[1].generation == 2, "Second durable lease must be generation 2"
 
     finally:
         db_path.unlink(missing_ok=True)
@@ -637,7 +678,7 @@ def _create_v1_database_with_data(db_path: Path):
                 applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
-            INSERT INTO mission_runtime_schema (version) VALUES (1);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (1, '2026-08-18T12:00:00');
 
             CREATE TABLE missions (
                 control_domain TEXT NOT NULL,
@@ -945,7 +986,7 @@ def test_schema_validation_rejects_malformed_v1():
         # Create incomplete v1 schema
         conn = sqlite3.connect(db_path)
         conn.execute("CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT)")
-        conn.execute("INSERT INTO mission_runtime_schema (version) VALUES (1)")
+        conn.execute("INSERT INTO mission_runtime_schema (version, applied_at) VALUES (1, '2026-08-18T12:00:00')")
         conn.execute("CREATE TABLE missions (mission_id TEXT)")  # Wrong columns
         conn.commit()
         conn.close()
@@ -1037,8 +1078,8 @@ def test_malformed_v2_missing_primary_key():
 
         # Create base v2 tables (simplified)
         conn.executescript("""
-            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT);
-            INSERT INTO mission_runtime_schema (version) VALUES (2);
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
 
             CREATE TABLE missions (
                 control_domain TEXT NOT NULL,
@@ -1149,8 +1190,8 @@ def test_malformed_v2_missing_foreign_key():
 
         # Create base tables
         conn.executescript("""
-            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT);
-            INSERT INTO mission_runtime_schema (version) VALUES (2);
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
 
             CREATE TABLE missions (
                 control_domain TEXT NOT NULL,
@@ -1260,8 +1301,8 @@ def test_malformed_v2_missing_check_constraint():
         conn.execute("PRAGMA foreign_keys = ON")
 
         conn.executescript("""
-            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT);
-            INSERT INTO mission_runtime_schema (version) VALUES (2);
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
 
             CREATE TABLE missions (
                 control_domain TEXT NOT NULL,
@@ -1513,7 +1554,7 @@ def test_malformed_schema_version_text():
         conn.close()
 
         # Attempt to open should raise typed MissionSchemaVersionError
-        with pytest.raises(MissionSchemaVersionError, match="non-integer"):
+        with pytest.raises(MissionSchemaVersionError, match="INTEGER storage class|non-integer"):
             MissionRuntimeStore(db_path)
 
     finally:
@@ -1634,3 +1675,2657 @@ def test_v1_migration_preserves_effect_references():
 
     finally:
         db_path.unlink(missing_ok=True)
+
+
+# ============================================================================
+# ATTACK MATRIX TESTS - Phase A Second Correction
+# ============================================================================
+
+def test_attack_altered_generation_type():
+    """ATTACK 1: Altered generation column type rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- ATTACK: generation as REAL instead of INTEGER
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation REAL NOT NULL CHECK (generation >= 1),
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="expected type INTEGER, found REAL"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_altered_controller_id_type():
+    """ATTACK 2: Altered controller_id column type rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        # Create minimal v2 schema with altered controller_id type
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- ATTACK: controller_id as INTEGER instead of TEXT
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                controller_id INTEGER NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="expected type TEXT, found INTEGER"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_altered_v1_revision_type():
+    """ATTACK 3: Altered representative v1 column type (revision) rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        # Create v1 schema with altered revision type
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (1, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            -- ATTACK: revision as TEXT instead of INTEGER
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision TEXT NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="expected type INTEGER, found TEXT"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+def test_attack_altered_acquired_at_type():
+    """ATTACK 4: Altered acquired_at column type rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- ATTACK: acquired_at as INTEGER instead of TEXT
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                controller_id TEXT NOT NULL,
+                acquired_at INTEGER NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="expected type TEXT, found INTEGER"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_weakened_generation_check():
+    """ATTACK 5: Weakened generation CHECK constraint rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- ATTACK: generation CHECK allows 0 (should be >= 1)
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 0),
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="CHECK"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_version_coercion_real_2_5():
+    """ATTACK 6: Schema version REAL 2.5 coercing to 2 rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        # Create schema version table with REAL column that stores 2.5
+        conn.execute("CREATE TABLE mission_runtime_schema (version REAL PRIMARY KEY, applied_at TEXT)")
+        conn.execute("INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2.5, '2026-08-18T12:00:00')")
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="INTEGER storage class"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_version_coercion_real_2_0():
+    """ATTACK 7: Schema version REAL 2.0 coercing to 2 rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE mission_runtime_schema (version REAL PRIMARY KEY, applied_at TEXT)")
+        conn.execute("INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2.0, '2026-08-18T12:00:00')")
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="INTEGER storage class"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_version_multiple_rows():
+    """ATTACK 8: Multiple schema version rows rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE mission_runtime_schema (version INTEGER, applied_at TEXT)")
+        conn.execute("INSERT INTO mission_runtime_schema (version, applied_at) VALUES (1, '2026-08-18T12:00:00')")
+        conn.execute("INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00')")
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_missing_not_null_on_generation():
+    """ATTACK 9: Missing NOT NULL on generation rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- ATTACK: generation without NOT NULL
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER CHECK (generation >= 1),
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="NOT NULL"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_clock_rollback_on_generation_n_plus_1():
+    """ATTACK 10: Clock rollback during generation N+1 acquire rolls back."""
+    fake_clock = FakeClock()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        store = MissionRuntimeStore(db_path, clock=fake_clock)
+        spec = MissionSpecification(
+            mission_id="mission-rollback-g2",
+            control_domain="test-domain",
+            objective="Test",
+            owner_identity="owner",
+            metadata=None,
+        )
+        store.create_mission(spec)
+
+        # Create generation 1
+        lease1 = store.acquire_controller_lease(
+            "test-domain", "mission-rollback-g2", "controller-a",
+            lease_duration=timedelta(seconds=5)
+        )
+
+        # Expire generation 1
+        fake_clock.advance(timedelta(seconds=6))
+
+        # Roll clock back so expires_at <= renewed_at
+        fake_clock.rollback(timedelta(seconds=10))
+
+        # Attempt acquire generation 2 - should raise before commit
+        with pytest.raises(MissionControllerClockError, match="Clock rollback"):
+            store.acquire_controller_lease("test-domain", "mission-rollback-g2", "controller-b")
+
+        # Verify NO generation 2 row persisted
+        history = store.list_controller_lease_history("test-domain", "mission-rollback-g2")
+        assert len(history) == 1, f"Expected 1 lease, found {len(history)}"
+        assert history[0].generation == 1, "Only generation 1 should exist"
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_malicious_tzinfo_utcoffset_runtime_error():
+    """ATTACK 11: Malicious tzinfo raising RuntimeError normalized to MissionControllerClockError."""
+    class MaliciousTzInfo(tzinfo):
+        def utcoffset(self, dt):
+            raise RuntimeError("Malicious tzinfo attack")
+
+    fake_clock = FakeClock()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        store = MissionRuntimeStore(db_path, clock=fake_clock)
+        spec = MissionSpecification(
+            mission_id="mission-malicious-tz",
+            control_domain="test-domain",
+            objective="Test",
+            owner_identity="owner",
+            metadata=None,
+        )
+        store.create_mission(spec)
+
+        # Replace clock with malicious tzinfo
+        def malicious_clock():
+            return datetime(2026, 8, 18, 12, 0, 0, tzinfo=MaliciousTzInfo())
+
+        store._clock = malicious_clock
+
+        # Attempt acquire - should normalize to MissionControllerClockError
+        with pytest.raises(MissionControllerClockError, match="RuntimeError"):
+            store.acquire_controller_lease("test-domain", "mission-malicious-tz", "controller-a")
+
+        # Verify no lease row persisted
+        history = store.list_controller_lease_history("test-domain", "mission-malicious-tz")
+        assert len(history) == 0, "No lease should be persisted after tzinfo failure"
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_malicious_tzinfo_type_error():
+    """ATTACK 12: Malicious tzinfo raising TypeError normalized to MissionControllerClockError."""
+    class MaliciousTzInfo(tzinfo):
+        def utcoffset(self, dt):
+            raise TypeError("Malicious type error")
+
+    fake_clock = FakeClock()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        store = MissionRuntimeStore(db_path, clock=fake_clock)
+        spec = MissionSpecification(
+            mission_id="mission-malicious-tz2",
+            control_domain="test-domain",
+            objective="Test",
+            owner_identity="owner",
+            metadata=None,
+        )
+        store.create_mission(spec)
+
+        def malicious_clock():
+            return datetime(2026, 8, 18, 12, 0, 0, tzinfo=MaliciousTzInfo())
+
+        store._clock = malicious_clock
+
+        with pytest.raises(MissionControllerClockError, match="TypeError"):
+            store.acquire_controller_lease("test-domain", "mission-malicious-tz2", "controller-a")
+
+        history = store.list_controller_lease_history("test-domain", "mission-malicious-tz2")
+        assert len(history) == 0
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_malicious_tzinfo_custom_exception():
+    """ATTACK 13: Malicious tzinfo raising custom exception normalized."""
+    class CustomException(Exception):
+        pass
+
+    class MaliciousTzInfo(tzinfo):
+        def utcoffset(self, dt):
+            raise CustomException("Custom attack")
+
+    fake_clock = FakeClock()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        store = MissionRuntimeStore(db_path, clock=fake_clock)
+        spec = MissionSpecification(
+            mission_id="mission-custom-exc",
+            control_domain="test-domain",
+            objective="Test",
+            owner_identity="owner",
+            metadata=None,
+        )
+        store.create_mission(spec)
+
+        def malicious_clock():
+            return datetime(2026, 8, 18, 12, 0, 0, tzinfo=MaliciousTzInfo())
+
+        store._clock = malicious_clock
+
+        with pytest.raises(MissionControllerClockError, match="unexpected exception"):
+            store.acquire_controller_lease("test-domain", "mission-custom-exc", "controller-a")
+
+        history = store.list_controller_lease_history("test-domain", "mission-custom-exc")
+        assert len(history) == 0
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_invalid_lease_construction_on_renew_rollback():
+    """ATTACK 14: Invalid lease construction on renew rolls back UPDATE."""
+    fake_clock = FakeClock()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        store = MissionRuntimeStore(db_path, clock=fake_clock)
+        spec = MissionSpecification(
+            mission_id="mission-renew-rollback",
+            control_domain="test-domain",
+            objective="Test",
+            owner_identity="owner",
+            metadata=None,
+        )
+        store.create_mission(spec)
+
+        # Acquire valid lease
+        lease1 = store.acquire_controller_lease("test-domain", "mission-renew-rollback", "controller-a")
+        original_renewed_at = lease1.renewed_at
+        original_expires_at = lease1.expires_at
+
+        # Replace clock with one that returns naive datetime
+        fake_clock.advance(timedelta(seconds=5))
+
+        def naive_clock():
+            return datetime(2026, 8, 18, 13, 0, 0)  # No timezone
+
+        store._clock = naive_clock
+
+        # Attempt renew - should fail during lease construction before commit
+        with pytest.raises(MissionControllerClockError):
+            store.renew_controller_lease("test-domain", "mission-renew-rollback", "controller-a", 1)
+
+        # Verify lease row UNCHANGED in database
+        verify_store = MissionRuntimeStore(db_path)
+        current = verify_store.get_current_controller_lease("test-domain", "mission-renew-rollback")
+        assert current.renewed_at == original_renewed_at, "renewed_at should be unchanged"
+        assert current.expires_at == original_expires_at, "expires_at should be unchanged"
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_invalid_lease_construction_on_release_rollback():
+    """ATTACK 15: Invalid lease construction on release rolls back UPDATE."""
+    fake_clock = FakeClock()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        store = MissionRuntimeStore(db_path, clock=fake_clock)
+        spec = MissionSpecification(
+            mission_id="mission-release-rollback",
+            control_domain="test-domain",
+            objective="Test",
+            owner_identity="owner",
+            metadata=None,
+        )
+        store.create_mission(spec)
+
+        # Acquire valid lease
+        store.acquire_controller_lease("test-domain", "mission-release-rollback", "controller-a")
+
+        # Replace clock with naive datetime generator
+        fake_clock.advance(timedelta(seconds=5))
+
+        def naive_clock():
+            return datetime(2026, 8, 18, 14, 0, 0)  # No timezone
+
+        store._clock = naive_clock
+
+        # Attempt release - should fail before commit
+        with pytest.raises(MissionControllerClockError):
+            store.release_controller_lease("test-domain", "mission-release-rollback", "controller-a", 1)
+
+        # Verify lease NOT released in database
+        verify_store = MissionRuntimeStore(db_path)
+        current = verify_store.get_current_controller_lease("test-domain", "mission-release-rollback")
+        assert current.released_at is None, "Lease should still be active"
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_altered_control_domain_type():
+    """ATTACK 16: Altered control_domain column type in leases rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- ATTACK: control_domain as INTEGER instead of TEXT
+            CREATE TABLE mission_controller_leases (
+                control_domain INTEGER NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="expected type TEXT, found INTEGER"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_altered_mission_id_type():
+    """ATTACK 17: Altered mission_id column type in leases rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- ATTACK: mission_id as REAL instead of TEXT
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id REAL NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="expected type TEXT, found REAL"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_whitespace_in_check_constraint():
+    """ATTACK 18: CHECK constraint with different whitespace (semantically same) accepted."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- CHECK with extra whitespace/newlines (semantically identical)
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (
+                    generation    >=    1
+                ),
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        # Should succeed - whitespace differences are normalized
+        store = MissionRuntimeStore(db_path)
+        assert store is not None
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_missing_controller_id_not_null():
+    """ATTACK 19: Missing NOT NULL on controller_id rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- ATTACK: controller_id without NOT NULL
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                controller_id TEXT,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="NOT NULL"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_extra_column_in_leases():
+    """ATTACK 20: Extra column in mission_controller_leases rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- ATTACK: extra column 'evil_backdoor'
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                evil_backdoor TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="has 9 columns|column count"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_missing_column_in_leases():
+    """ATTACK 21: Missing released_at column in mission_controller_leases rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- ATTACK: missing released_at column
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="expected 8 columns|has 7 columns"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_reordered_columns():
+    """ATTACK 22: Reordered columns in mission_controller_leases rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- ATTACK: columns reordered (generation before mission_id)
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                mission_id TEXT NOT NULL,
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="expected name"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_version_as_text_string():
+    """ATTACK 23: Schema version as TEXT '2' rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE mission_runtime_schema (version TEXT PRIMARY KEY, applied_at TEXT)")
+        conn.execute("INSERT INTO mission_runtime_schema (version, applied_at) VALUES ('2', '2026-08-18T12:00:00')")
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="non-integer|INTEGER"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_version_null():
+    """ATTACK 24: Schema version NULL rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE mission_runtime_schema (version INTEGER, applied_at TEXT)")
+        conn.execute("INSERT INTO mission_runtime_schema (version, applied_at) VALUES (NULL, '2026-08-18T12:00:00')")
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_altered_renewed_at_type():
+    """ATTACK 25: Altered renewed_at column type rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- ATTACK: renewed_at as BLOB instead of TEXT
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at BLOB NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="expected type TEXT, found BLOB"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_altered_expires_at_type():
+    """ATTACK 26: Altered expires_at column type rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- ATTACK: expires_at as REAL instead of TEXT
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="expected type TEXT, found REAL"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_altered_released_at_type():
+    """ATTACK 27: Altered released_at column type rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- ATTACK: released_at as INTEGER instead of TEXT
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at INTEGER,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="expected type TEXT, found INTEGER"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_missing_generation_check_constraint():
+    """ATTACK 28: Missing CHECK constraint on generation rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- ATTACK: missing CHECK constraint on generation
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="CHECK"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_wrong_primary_key_columns():
+    """ATTACK 29: Wrong PRIMARY KEY columns rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- ATTACK: PRIMARY KEY on (mission_id, generation) instead of (control_domain, mission_id, generation)
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (mission_id, generation),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="PRIMARY KEY"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+def test_attack_wrong_foreign_key_columns():
+    """ATTACK 30: Wrong FOREIGN KEY columns rejected."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript("""
+            CREATE TABLE mission_runtime_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO mission_runtime_schema (version, applied_at) VALUES (2, '2026-08-18T12:00:00');
+
+            CREATE TABLE missions (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                specification_fingerprint TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                owner_identity TEXT NOT NULL,
+                agent_identity TEXT,
+                success_criteria TEXT,
+                constraints TEXT,
+                deadline TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_state (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                current_state TEXT NOT NULL CHECK (current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                paused_at TEXT,
+                resumed_at TEXT,
+                terminal_at TEXT,
+                terminal_reason TEXT,
+                PRIMARY KEY (control_domain, mission_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_checkpoints (
+                control_domain TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                mission_state TEXT NOT NULL,
+                progress_data_json TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, checkpoint_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id),
+                UNIQUE (control_domain, mission_id, sequence)
+            );
+
+            CREATE TABLE mission_transitions (
+                control_domain TEXT NOT NULL,
+                transition_id TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                reason TEXT,
+                checkpoint_id TEXT,
+                transitioned_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, transition_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            CREATE TABLE mission_effect_references (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                effect_intent_id TEXT NOT NULL,
+                effect_dispatch_id TEXT,
+                gateway_claim_id TEXT,
+                referenced_at TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, effect_intent_id),
+                FOREIGN KEY (control_domain, mission_id) REFERENCES missions(control_domain, mission_id)
+            );
+
+            -- ATTACK: FOREIGN KEY on (mission_id) instead of (control_domain, mission_id)
+            CREATE TABLE mission_controller_leases (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                controller_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                renewed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                released_at TEXT,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                FOREIGN KEY (mission_id) REFERENCES missions(mission_id)
+            );
+
+            CREATE INDEX idx_missions_state ON mission_state(control_domain, current_state, updated_at);
+            CREATE INDEX idx_checkpoints_mission ON mission_checkpoints(control_domain, mission_id, sequence DESC);
+            CREATE INDEX idx_transitions_mission ON mission_transitions(control_domain, mission_id, transitioned_at DESC);
+        """)
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(MissionSchemaVersionError, match="FOREIGN KEY"):
+            MissionRuntimeStore(db_path)
+
+    finally:
+        db_path.unlink(missing_ok=True)
+
+
+
+# PHASE A EXACT STRUCTURAL SEMANTICS REGRESSIONS
+
+
+def test_attack_extra_check_constraint_rejected_exact_set():
+    import sqlite3
+    from federation.mission_runtime_store import (
+        MissionRuntimeStore,
+        MissionSchemaVersionError,
+    )
+
+    store = MissionRuntimeStore()
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("""
+            CREATE TABLE probe (
+                generation INTEGER NOT NULL
+                    CHECK (generation >= 1)
+                    CHECK (generation <= 1)
+            )
+        """)
+
+        with pytest.raises(MissionSchemaVersionError):
+            store._validate_check_constraints(
+                conn, "probe", ["generation >= 1"]
+            )
+    finally:
+        conn.close()
+
+
+def test_attack_extra_unique_constraint_rejected_exact_set():
+    import sqlite3
+    from federation.mission_runtime_store import (
+        MissionRuntimeStore,
+        MissionSchemaVersionError,
+    )
+
+    store = MissionRuntimeStore()
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("""
+            CREATE TABLE probe (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                PRIMARY KEY (control_domain, mission_id, generation),
+                UNIQUE (control_domain, mission_id)
+            )
+        """)
+
+        with pytest.raises(MissionSchemaVersionError):
+            store._validate_unique_constraints(conn, "probe", [])
+    finally:
+        conn.close()
+
+
+def test_attack_foreign_key_actions_rejected():
+    import sqlite3
+    from federation.mission_runtime_store import (
+        MissionRuntimeStore,
+        MissionSchemaVersionError,
+    )
+
+    store = MissionRuntimeStore()
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("""
+            CREATE TABLE parent (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE child (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                FOREIGN KEY (control_domain, mission_id)
+                    REFERENCES parent(control_domain, mission_id)
+                    ON DELETE CASCADE
+                    ON UPDATE CASCADE
+            )
+        """)
+
+        expected = [{
+            "columns": ["control_domain", "mission_id"],
+            "ref_table": "parent",
+            "ref_columns": ["control_domain", "mission_id"],
+        }]
+
+        with pytest.raises(MissionSchemaVersionError):
+            store._validate_foreign_keys(conn, "child", expected)
+    finally:
+        conn.close()
+
+
+def test_attack_primary_key_nocase_collation_rejected():
+    import sqlite3
+    from federation.mission_runtime_store import (
+        MissionRuntimeStore,
+        MissionSchemaVersionError,
+    )
+
+    store = MissionRuntimeStore()
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("""
+            CREATE TABLE probe (
+                control_domain TEXT NOT NULL COLLATE NOCASE,
+                mission_id TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            )
+        """)
+
+        with pytest.raises(MissionSchemaVersionError):
+            store._validate_primary_key(
+                conn,
+                "probe",
+                ["control_domain", "mission_id"],
+            )
+    finally:
+        conn.close()
+
+
+def test_attack_unique_nocase_collation_rejected():
+    import sqlite3
+    from federation.mission_runtime_store import (
+        MissionRuntimeStore,
+        MissionSchemaVersionError,
+    )
+
+    store = MissionRuntimeStore()
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("""
+            CREATE TABLE probe (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                UNIQUE (
+                    control_domain COLLATE NOCASE,
+                    mission_id,
+                    sequence
+                )
+            )
+        """)
+
+        with pytest.raises(MissionSchemaVersionError):
+            store._validate_unique_constraints(
+                conn,
+                "probe",
+                [["control_domain", "mission_id", "sequence"]],
+            )
+    finally:
+        conn.close()
+
+
+# PHASE A FOREIGN KEY DEFERRABILITY REGRESSIONS
+
+
+def test_attack_deferrable_initially_deferred_foreign_key_rejected():
+    import sqlite3
+    from federation.mission_runtime_store import (
+        MissionRuntimeStore,
+        MissionSchemaVersionError,
+    )
+
+    store = MissionRuntimeStore()
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("""
+            CREATE TABLE parent (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE child (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                FOREIGN KEY (control_domain, mission_id)
+                    REFERENCES parent(control_domain, mission_id)
+                    ON DELETE NO ACTION
+                    ON UPDATE NO ACTION
+                    DEFERRABLE INITIALLY DEFERRED
+            )
+        """)
+
+        expected = [{
+            "columns": ["control_domain", "mission_id"],
+            "ref_table": "parent",
+            "ref_columns": ["control_domain", "mission_id"],
+        }]
+
+        with pytest.raises(
+            MissionSchemaVersionError,
+            match="DEFERRABLE|INITIALLY DEFERRED",
+        ):
+            store._validate_foreign_keys(conn, "child", expected)
+    finally:
+        conn.close()
+
+
+def test_explicit_not_deferrable_initially_immediate_foreign_key_accepted():
+    import sqlite3
+    from federation.mission_runtime_store import MissionRuntimeStore
+
+    store = MissionRuntimeStore()
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("""
+            CREATE TABLE parent (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                PRIMARY KEY (control_domain, mission_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE child (
+                control_domain TEXT NOT NULL,
+                mission_id TEXT NOT NULL,
+                FOREIGN KEY (control_domain, mission_id)
+                    REFERENCES parent(control_domain, mission_id)
+                    ON DELETE NO ACTION
+                    ON UPDATE NO ACTION
+                    NOT DEFERRABLE INITIALLY IMMEDIATE
+            )
+        """)
+
+        expected = [{
+            "columns": ["control_domain", "mission_id"],
+            "ref_table": "parent",
+            "ref_columns": ["control_domain", "mission_id"],
+        }]
+
+        store._validate_foreign_keys(conn, "child", expected)
+    finally:
+        conn.close()

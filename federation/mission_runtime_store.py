@@ -172,72 +172,84 @@ def _validate_transition(from_state: MissionLifecycle, to_state: MissionLifecycl
 
 # Schema contract definitions for migration safety
 # Schema v2 includes all v1 tables plus mission_controller_leases
-_EXPECTED_SCHEMA_TABLES_V2: dict[str, tuple[str, ...]] = {
-    "mission_runtime_schema": ("version", "applied_at"),
+
+# Expected column definitions: (name, type, notnull)
+# notnull: 1 for NOT NULL, 0 for nullable
+_EXPECTED_SCHEMA_COLUMNS_V2: dict[str, tuple[tuple[str, str, int], ...]] = {
+    "mission_runtime_schema": (
+        ("version", "INTEGER", 0),
+        ("applied_at", "TEXT", 1),
+    ),
     "missions": (
-        "control_domain",
-        "mission_id",
-        "specification_fingerprint",
-        "objective",
-        "owner_identity",
-        "agent_identity",
-        "success_criteria",
-        "constraints",
-        "deadline",
-        "metadata_json",
-        "created_at",
+        ("control_domain", "TEXT", 1),
+        ("mission_id", "TEXT", 1),
+        ("specification_fingerprint", "TEXT", 1),
+        ("objective", "TEXT", 1),
+        ("owner_identity", "TEXT", 1),
+        ("agent_identity", "TEXT", 0),
+        ("success_criteria", "TEXT", 0),
+        ("constraints", "TEXT", 0),
+        ("deadline", "TEXT", 0),
+        ("metadata_json", "TEXT", 0),
+        ("created_at", "TEXT", 1),
     ),
     "mission_state": (
-        "control_domain",
-        "mission_id",
-        "current_state",
-        "revision",
-        "updated_at",
-        "started_at",
-        "paused_at",
-        "resumed_at",
-        "terminal_at",
-        "terminal_reason",
+        ("control_domain", "TEXT", 1),
+        ("mission_id", "TEXT", 1),
+        ("current_state", "TEXT", 1),
+        ("revision", "INTEGER", 1),
+        ("updated_at", "TEXT", 1),
+        ("started_at", "TEXT", 0),
+        ("paused_at", "TEXT", 0),
+        ("resumed_at", "TEXT", 0),
+        ("terminal_at", "TEXT", 0),
+        ("terminal_reason", "TEXT", 0),
     ),
     "mission_checkpoints": (
-        "control_domain",
-        "checkpoint_id",
-        "mission_id",
-        "sequence",
-        "mission_state",
-        "progress_data_json",
-        "reason",
-        "created_at",
+        ("control_domain", "TEXT", 1),
+        ("checkpoint_id", "TEXT", 1),
+        ("mission_id", "TEXT", 1),
+        ("sequence", "INTEGER", 1),
+        ("mission_state", "TEXT", 1),
+        ("progress_data_json", "TEXT", 0),
+        ("reason", "TEXT", 0),
+        ("created_at", "TEXT", 1),
     ),
     "mission_transitions": (
-        "control_domain",
-        "transition_id",
-        "mission_id",
-        "from_state",
-        "to_state",
-        "revision",
-        "reason",
-        "checkpoint_id",
-        "transitioned_at",
+        ("control_domain", "TEXT", 1),
+        ("transition_id", "TEXT", 1),
+        ("mission_id", "TEXT", 1),
+        ("from_state", "TEXT", 1),
+        ("to_state", "TEXT", 1),
+        ("revision", "INTEGER", 1),
+        ("reason", "TEXT", 0),
+        ("checkpoint_id", "TEXT", 0),
+        ("transitioned_at", "TEXT", 1),
     ),
     "mission_effect_references": (
-        "control_domain",
-        "mission_id",
-        "effect_intent_id",
-        "effect_dispatch_id",
-        "gateway_claim_id",
-        "referenced_at",
+        ("control_domain", "TEXT", 1),
+        ("mission_id", "TEXT", 1),
+        ("effect_intent_id", "TEXT", 1),
+        ("effect_dispatch_id", "TEXT", 0),
+        ("gateway_claim_id", "TEXT", 0),
+        ("referenced_at", "TEXT", 1),
     ),
     "mission_controller_leases": (
-        "control_domain",
-        "mission_id",
-        "generation",
-        "controller_id",
-        "acquired_at",
-        "renewed_at",
-        "expires_at",
-        "released_at",
+        ("control_domain", "TEXT", 1),
+        ("mission_id", "TEXT", 1),
+        ("generation", "INTEGER", 1),
+        ("controller_id", "TEXT", 1),
+        ("acquired_at", "TEXT", 1),
+        ("renewed_at", "TEXT", 1),
+        ("expires_at", "TEXT", 1),
+        ("released_at", "TEXT", 0),
     ),
+}
+
+# Derived column name tuples for backward compatibility
+_EXPECTED_SCHEMA_TABLES_V2: dict[str, tuple[str, ...]] = {
+    table_name: tuple(col[0] for col in columns)
+    for table_name, columns in _EXPECTED_SCHEMA_COLUMNS_V2.items()
 }
 
 _EXPECTED_INDEXES_V2: dict[str, tuple[str, tuple[str, ...]]] = {
@@ -247,10 +259,15 @@ _EXPECTED_INDEXES_V2: dict[str, tuple[str, tuple[str, ...]]] = {
 }
 
 # Schema v1 is v2 without the controller leases table
-_EXPECTED_SCHEMA_TABLES_V1: dict[str, tuple[str, ...]] = {
+_EXPECTED_SCHEMA_COLUMNS_V1: dict[str, tuple[tuple[str, str, int], ...]] = {
     name: columns
-    for name, columns in _EXPECTED_SCHEMA_TABLES_V2.items()
+    for name, columns in _EXPECTED_SCHEMA_COLUMNS_V2.items()
     if name != "mission_controller_leases"
+}
+
+_EXPECTED_SCHEMA_TABLES_V1: dict[str, tuple[str, ...]] = {
+    table_name: tuple(col[0] for col in columns)
+    for table_name, columns in _EXPECTED_SCHEMA_COLUMNS_V1.items()
 }
 
 _EXPECTED_INDEXES_V1 = _EXPECTED_INDEXES_V2
@@ -377,26 +394,54 @@ class MissionRuntimeStore:
         Raises:
             MissionControllerClockError: If clock output is invalid
         """
-        now = self._clock()
+        try:
+            now = self._clock()
+        except Exception as exc:
+            raise MissionControllerClockError(
+                f"Clock callable raised exception: {exc}"
+            ) from exc
 
         if not isinstance(now, datetime):
             raise MissionControllerClockError(
                 f"Clock must return datetime, got {type(now).__name__}"
             )
 
-        if now.tzinfo is None or now.utcoffset() is None:
+        # Check timezone awareness - tzinfo.utcoffset() may raise
+        if now.tzinfo is None:
             raise MissionControllerClockError(
-                "Clock must return timezone-aware datetime with valid UTC offset"
+                "Clock must return timezone-aware datetime (tzinfo is None)"
+            )
+
+        try:
+            utc_offset = now.utcoffset()
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise MissionControllerClockError(
+                f"Clock datetime tzinfo.utcoffset() raised {type(exc).__name__}: {exc}"
+            ) from exc
+        except Exception as exc:
+            raise MissionControllerClockError(
+                f"Clock datetime tzinfo.utcoffset() raised unexpected exception: {exc}"
+            ) from exc
+
+        if utc_offset is None:
+            raise MissionControllerClockError(
+                "Clock datetime tzinfo.utcoffset() returned None"
             )
 
         # Normalize to UTC
-        return now.astimezone(timezone.utc)
+        try:
+            return now.astimezone(timezone.utc)
+        except Exception as exc:
+            raise MissionControllerClockError(
+                f"Failed to normalize clock datetime to UTC: {exc}"
+            ) from exc
 
     def _validate_schema_contract(
         self,
         conn: sqlite3.Connection,
         *,
         expected_tables: dict[str, tuple[str, ...]] = _EXPECTED_SCHEMA_TABLES_V2,
+        expected_columns: dict[str, tuple[tuple[str, str, int], ...]] = _EXPECTED_SCHEMA_COLUMNS_V2,
         expected_indexes: dict[str, tuple[str, tuple[str, ...]]] = _EXPECTED_INDEXES_V2,
         expected_version: int = MISSION_SCHEMA_VERSION,
     ) -> None:
@@ -433,14 +478,41 @@ class MissionRuntimeStore:
                 f"unexpected tables: {sorted(unexpected_tables)}"
             )
 
-        # Validate column order and properties for each table
-        for table_name, expected_columns in expected_tables.items():
+        # Validate column order, types, and NOT NULL for each table
+        for table_name, expected_cols in expected_columns.items():
+            # PRAGMA table_info returns: (cid, name, type, notnull, dflt_value, pk)
             table_info = list(conn.execute(f"PRAGMA table_info({table_name})"))
-            columns = tuple(row[1] for row in table_info)
-            if columns != expected_columns:
+
+            # Validate column count
+            if len(table_info) != len(expected_cols):
                 raise MissionSchemaVersionError(
-                    f"Database schema table {table_name} has incompatible columns: {columns!r}"
+                    f"Table {table_name} has {len(table_info)} columns, expected {len(expected_cols)}"
                 )
+
+            # Validate each column: name, type, NOT NULL
+            for i, (expected_name, expected_type, expected_notnull) in enumerate(expected_cols):
+                actual_row = table_info[i]
+                actual_name = actual_row[1]
+                actual_type = actual_row[2]
+                actual_notnull = actual_row[3]
+
+                if actual_name != expected_name:
+                    raise MissionSchemaVersionError(
+                        f"Table {table_name} column {i}: expected name '{expected_name}', found '{actual_name}'"
+                    )
+
+                # Normalize type for comparison (SQLite may return uppercase)
+                if actual_type.upper() != expected_type.upper():
+                    raise MissionSchemaVersionError(
+                        f"Table {table_name} column '{actual_name}': "
+                        f"expected type {expected_type}, found {actual_type}"
+                    )
+
+                if actual_notnull != expected_notnull:
+                    raise MissionSchemaVersionError(
+                        f"Table {table_name} column '{actual_name}': "
+                        f"NOT NULL mismatch (expected {expected_notnull}, found {actual_notnull})"
+                    )
 
         # Validate structural constraints
         self._validate_table_constraints(conn, expected_version)
@@ -463,18 +535,35 @@ class MissionRuntimeStore:
                     f"{indexed_columns!r}"
                 )
 
-        # Validate version metadata
-        try:
-            version_rows = [
-                int(row[0])
-                for row in conn.execute("SELECT version FROM mission_runtime_schema ORDER BY version")
-            ]
-        except (ValueError, TypeError) as exc:
-            raise MissionSchemaVersionError(
-                "Database schema version metadata contains non-integer value"
-            ) from exc
-        if not version_rows:
+        # Validate version metadata with strict integer semantics
+        cursor = conn.execute(
+            "SELECT version, typeof(version) FROM mission_runtime_schema ORDER BY version"
+        )
+        version_rows_with_types = cursor.fetchall()
+
+        if not version_rows_with_types:
             raise MissionSchemaVersionError("Database schema version metadata is empty")
+
+        # Validate each version row
+        version_rows = []
+        for row in version_rows_with_types:
+            raw_version = row[0]
+            version_type = row[1]
+
+            # Require INTEGER storage class
+            if version_type != 'integer':
+                raise MissionSchemaVersionError(
+                    f"Database schema version must be INTEGER storage class, found {version_type} with value {raw_version!r}"
+                )
+
+            # Validate it's actually an integer (not coerced)
+            if not isinstance(raw_version, int) or isinstance(raw_version, bool):
+                raise MissionSchemaVersionError(
+                    f"Database schema version metadata contains non-integer value: {raw_version!r}"
+                )
+
+            version_rows.append(raw_version)
+
         if version_rows != [expected_version]:
             raise MissionSchemaVersionError(
                 f"Database schema version metadata must contain exactly [{expected_version}], "
@@ -500,21 +589,26 @@ class MissionRuntimeStore:
             if "primary_key" in specs:
                 self._validate_primary_key(conn, table_name, specs["primary_key"])
 
-            # Validate FOREIGN KEYs
-            if "foreign_keys" in specs:
-                self._validate_foreign_keys(conn, table_name, specs["foreign_keys"])
+            # Validate FOREIGN KEY set exactly, including expected-empty.
+            self._validate_foreign_keys(
+                conn, table_name, specs.get("foreign_keys", [])
+            )
 
-            # Validate NOT NULL constraints
+            # Validate NOT NULL constraints.
+            # Exact per-column NOT NULL state is also checked by the column
+            # contract validator; this keeps named safety requirements explicit.
             if "not_null" in specs:
                 self._validate_not_null(conn, table_name, specs["not_null"])
 
-            # Validate CHECK constraints
-            if "checks" in specs:
-                self._validate_check_constraints(conn, table_name, specs["checks"])
+            # Validate CHECK set exactly, including expected-empty.
+            self._validate_check_constraints(
+                conn, table_name, specs.get("checks", [])
+            )
 
-            # Validate UNIQUE constraints
-            if "unique" in specs:
-                self._validate_unique_constraints(conn, table_name, specs["unique"])
+            # Validate non-PK UNIQUE set exactly, including expected-empty.
+            self._validate_unique_constraints(
+                conn, table_name, specs.get("unique", [])
+            )
 
     def _get_v1_constraint_specs(self) -> dict[str, dict]:
         """Get constraint specifications for v1 schema."""
@@ -534,7 +628,10 @@ class MissionRuntimeStore:
                         "ref_columns": ["control_domain", "mission_id"],
                     }
                 ],
-                "checks": ["current_state IN", "revision >= 1"],
+                "checks": [
+                    "current_state IN ('created', 'running', 'paused', 'completed', 'failed', 'cancelled')",
+                    "revision >= 1"
+                ],
             },
             "mission_checkpoints": {
                 "primary_key": ["control_domain", "checkpoint_id"],
@@ -588,11 +685,18 @@ class MissionRuntimeStore:
         }
         return specs
 
-    def _validate_primary_key(self, conn: sqlite3.Connection, table_name: str, expected_pk: list[str]) -> None:
-        """Validate PRIMARY KEY constraint."""
+    def _validate_primary_key(
+        self,
+        conn: sqlite3.Connection,
+        table_name: str,
+        expected_pk: list[str],
+    ) -> None:
+        """Validate exact PRIMARY KEY structure and indexed comparison semantics."""
         table_info = list(conn.execute(f"PRAGMA table_info({table_name})"))
-        pk_columns = [row[1] for row in table_info if row[5] > 0]  # pk column is index 5
-        pk_columns.sort(key=lambda col: next(row[5] for row in table_info if row[1] == col))
+
+        pk_rows = [row for row in table_info if row[5] > 0]
+        pk_rows.sort(key=lambda row: row[5])
+        pk_columns = [row[1] for row in pk_rows]
 
         if pk_columns != expected_pk:
             raise MissionSchemaVersionError(
@@ -600,19 +704,106 @@ class MissionRuntimeStore:
                 f"expected {expected_pk}, found {pk_columns}"
             )
 
+        # Locate SQLite's physical PK index when one exists.
+        pk_indexes = [
+            row
+            for row in conn.execute(f"PRAGMA index_list({table_name})")
+            if len(row) > 3 and row[3] == "pk"
+        ]
+
+        if not pk_indexes:
+            # INTEGER PRIMARY KEY aliases rowid and normally has no separate
+            # index. That is valid only for one exact INTEGER PK column.
+            if len(pk_rows) == 1 and str(pk_rows[0][2]).upper() == "INTEGER":
+                return
+
+            raise MissionSchemaVersionError(
+                f"Table {table_name} PRIMARY KEY has no authoritative PK index"
+            )
+
+        if len(pk_indexes) != 1:
+            raise MissionSchemaVersionError(
+                f"Table {table_name} has unexpected PRIMARY KEY index count: "
+                f"{len(pk_indexes)}"
+            )
+
+        idx_name = pk_indexes[0][1]
+        quoted_idx = idx_name.replace('"', '""')
+        xinfo = list(conn.execute(f'PRAGMA index_xinfo("{quoted_idx}")'))
+
+        key_rows = [row for row in xinfo if row[5] == 1]
+
+        indexed_columns = [row[2] for row in key_rows]
+        collations = [row[4] for row in key_rows]
+        descending = [row[3] for row in key_rows]
+
+        if indexed_columns != expected_pk:
+            raise MissionSchemaVersionError(
+                f"Table {table_name} PRIMARY KEY index columns are incompatible: "
+                f"expected {expected_pk}, found {indexed_columns}"
+            )
+
+        if any(collation != "BINARY" for collation in collations):
+            raise MissionSchemaVersionError(
+                f"Table {table_name} PRIMARY KEY uses incompatible collation: "
+                f"expected BINARY, found {collations}"
+            )
+
+        if any(desc != 0 for desc in descending):
+            raise MissionSchemaVersionError(
+                f"Table {table_name} PRIMARY KEY uses incompatible DESC ordering: "
+                f"{descending}"
+            )
+
     def _validate_foreign_keys(
-        self, conn: sqlite3.Connection, table_name: str, expected_fks: list[dict]
+        self,
+        conn: sqlite3.Connection,
+        table_name: str,
+        expected_fks: list[dict],
     ) -> None:
-        """Validate FOREIGN KEY constraints."""
+        """Validate the exact FOREIGN KEY set, including action semantics."""
+        # PRAGMA foreign_key_list() does not expose DEFERRABLE semantics.
+        # Inspect the canonical CREATE TABLE SQL as well so a schema cannot
+        # silently change enforcement timing while preserving the same FK
+        # columns/actions.
+        create_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        ).fetchone()
+        if not create_row or not create_row[0]:
+            raise MissionSchemaVersionError(
+                f"Table {table_name} has no authoritative CREATE SQL"
+            )
+
+        create_tokens = [
+            str(token).lower()
+            for token in self._tokenize_sql_expression(create_row[0])
+        ]
+
+        for i, token in enumerate(create_tokens):
+            if token == "deferrable":
+                previous = create_tokens[i - 1] if i > 0 else None
+                if previous != "not":
+                    raise MissionSchemaVersionError(
+                        f"Table {table_name} uses incompatible DEFERRABLE "
+                        "FOREIGN KEY semantics"
+                    )
+
+            if (
+                token == "initially"
+                and i + 1 < len(create_tokens)
+                and create_tokens[i + 1] == "deferred"
+            ):
+                raise MissionSchemaVersionError(
+                    f"Table {table_name} uses incompatible INITIALLY DEFERRED "
+                    "FOREIGN KEY semantics"
+                )
+
         fk_list = list(conn.execute(f"PRAGMA foreign_key_list({table_name})"))
 
-        # Group by fk id
         fks_by_id: dict[int, list] = {}
         for row in fk_list:
-            fk_id = row[0]
-            if fk_id not in fks_by_id:
-                fks_by_id[fk_id] = []
-            fks_by_id[fk_id].append(row)
+            fks_by_id.setdefault(row[0], []).append(row)
 
         if len(fks_by_id) != len(expected_fks):
             raise MissionSchemaVersionError(
@@ -620,24 +811,63 @@ class MissionRuntimeStore:
                 f"expected {len(expected_fks)}, found {len(fks_by_id)}"
             )
 
-        for expected_fk in expected_fks:
-            # Find matching FK
-            found = False
-            for fk_rows in fks_by_id.values():
-                ref_table = fk_rows[0][2]
-                from_cols = [row[3] for row in fk_rows]
-                to_cols = [row[4] for row in fk_rows]
+        actual_fks = []
+        for fk_rows in fks_by_id.values():
+            fk_rows = sorted(fk_rows, key=lambda row: row[1])
 
-                if (ref_table == expected_fk["ref_table"] and
-                    from_cols == expected_fk["columns"] and
-                    to_cols == expected_fk["ref_columns"]):
-                    found = True
-                    break
+            actual_fks.append({
+                "columns": [row[3] for row in fk_rows],
+                "ref_table": fk_rows[0][2],
+                "ref_columns": [row[4] for row in fk_rows],
+                "on_update": fk_rows[0][5],
+                "on_delete": fk_rows[0][6],
+                "match": fk_rows[0][7],
+            })
 
-            if not found:
+            # Every row belonging to one composite FK must agree on its
+            # non-column semantics.
+            if any(
+                row[2] != fk_rows[0][2]
+                or row[5] != fk_rows[0][5]
+                or row[6] != fk_rows[0][6]
+                or row[7] != fk_rows[0][7]
+                for row in fk_rows
+            ):
                 raise MissionSchemaVersionError(
-                    f"Table {table_name} missing expected FOREIGN KEY: {expected_fk}"
+                    f"Table {table_name} contains internally inconsistent "
+                    "composite FOREIGN KEY metadata"
                 )
+
+        normalized_expected = [
+            {
+                "columns": list(spec["columns"]),
+                "ref_table": spec["ref_table"],
+                "ref_columns": list(spec["ref_columns"]),
+                "on_update": spec.get("on_update", "NO ACTION"),
+                "on_delete": spec.get("on_delete", "NO ACTION"),
+                "match": spec.get("match", "NONE"),
+            }
+            for spec in expected_fks
+        ]
+
+        def fk_key(spec):
+            return (
+                tuple(spec["columns"]),
+                spec["ref_table"],
+                tuple(spec["ref_columns"]),
+                spec["on_update"],
+                spec["on_delete"],
+                spec["match"],
+            )
+
+        actual_keys = sorted(fk_key(spec) for spec in actual_fks)
+        expected_keys = sorted(fk_key(spec) for spec in normalized_expected)
+
+        if actual_keys != expected_keys:
+            raise MissionSchemaVersionError(
+                f"Table {table_name} has incompatible FOREIGN KEY constraints: "
+                f"expected {normalized_expected!r}, found {actual_fks!r}"
+            )
 
     def _validate_not_null(self, conn: sqlite3.Connection, table_name: str, expected_not_null: list[str]) -> None:
         """Validate NOT NULL constraints."""
@@ -650,59 +880,259 @@ class MissionRuntimeStore:
                     f"Table {table_name} column {col} missing required NOT NULL constraint"
                 )
 
-    def _validate_check_constraints(self, conn: sqlite3.Connection, table_name: str, expected_checks: list[str]) -> None:
-        """Validate CHECK constraints by examining CREATE TABLE SQL."""
+    def _tokenize_sql_expression(self, expr: str) -> list[str]:
+        """Tokenize SQL expression for canonical comparison.
+
+        Normalizes:
+        - Whitespace (ignored)
+        - Keyword case (uppercase)
+        - Identifier quoting (removed for simple identifiers)
+        - Preserves operators, numbers, string literals exactly
+
+        Returns list of normalized tokens.
+        """
+        tokens = []
+        i = 0
+        expr = expr.strip()
+
+        # SQL keywords to uppercase
+        keywords = {
+            'check', 'in', 'and', 'or', 'not', 'between', 'like', 'is', 'null',
+            'true', 'false', 'case', 'when', 'then', 'else', 'end'
+        }
+
+        while i < len(expr):
+            # Skip whitespace
+            if expr[i].isspace():
+                i += 1
+                continue
+
+            # Quoted identifiers: "name" or `name`
+            if expr[i] in ('"', '`'):
+                quote = expr[i]
+                i += 1
+                identifier = ''
+                while i < len(expr) and expr[i] != quote:
+                    identifier += expr[i]
+                    i += 1
+                i += 1  # skip closing quote
+                # Store unquoted identifier (normalized)
+                tokens.append(identifier.lower())
+                continue
+
+            # String literals: 'value'
+            if expr[i] == "'":
+                i += 1
+                literal = "'"
+                while i < len(expr):
+                    if expr[i] == "'":
+                        if i + 1 < len(expr) and expr[i + 1] == "'":
+                            literal += "''"
+                            i += 2
+                        else:
+                            literal += "'"
+                            i += 1
+                            break
+                    else:
+                        literal += expr[i]
+                        i += 1
+                tokens.append(literal)
+                continue
+
+            # Numbers
+            if expr[i].isdigit() or (expr[i] == '-' and i + 1 < len(expr) and expr[i + 1].isdigit()):
+                num = ''
+                if expr[i] == '-':
+                    num += '-'
+                    i += 1
+                while i < len(expr) and (expr[i].isdigit() or expr[i] == '.'):
+                    num += expr[i]
+                    i += 1
+                tokens.append(num)
+                continue
+
+            # Operators and punctuation
+            if expr[i] in '(),.':
+                tokens.append(expr[i])
+                i += 1
+                continue
+
+            # Multi-character operators
+            if i + 1 < len(expr):
+                two_char = expr[i:i+2]
+                if two_char in ('>=', '<=', '!=', '<>'):
+                    tokens.append(two_char)
+                    i += 2
+                    continue
+
+            # Single-character operators
+            if expr[i] in '=<>+-*/':
+                tokens.append(expr[i])
+                i += 1
+                continue
+
+            # Identifiers and keywords
+            if expr[i].isalpha() or expr[i] == '_':
+                word = ''
+                while i < len(expr) and (expr[i].isalnum() or expr[i] == '_'):
+                    word += expr[i]
+                    i += 1
+                # Normalize keywords to uppercase, identifiers to lowercase
+                if word.lower() in keywords:
+                    tokens.append(word.upper())
+                else:
+                    tokens.append(word.lower())
+                continue
+
+            # Unknown character - preserve it
+            tokens.append(expr[i])
+            i += 1
+
+        return tokens
+
+    def _extract_check_expressions(self, create_sql: str) -> list[str]:
+        """Extract CHECK constraint expressions from CREATE TABLE SQL.
+
+        Returns raw CHECK expressions (content between CHECK and closing paren).
+        """
+        import re
+
+        # Find all CHECK constraints
+        # Pattern: CHECK followed by parenthesized expression
+        checks = []
+
+        # Use a simple state machine to extract CHECK (...) expressions
+        i = 0
+        sql_upper = create_sql.upper()
+
+        while i < len(sql_upper):
+            # Look for CHECK keyword
+            check_pos = sql_upper.find('CHECK', i)
+            if check_pos == -1:
+                break
+
+            # Find opening paren after CHECK
+            paren_start = check_pos + 5
+            while paren_start < len(sql_upper) and sql_upper[paren_start].isspace():
+                paren_start += 1
+
+            if paren_start >= len(sql_upper) or sql_upper[paren_start] != '(':
+                i = check_pos + 5
+                continue
+
+            # Extract balanced parentheses
+            paren_count = 1
+            paren_end = paren_start + 1
+            while paren_end < len(create_sql) and paren_count > 0:
+                if create_sql[paren_end] == '(':
+                    paren_count += 1
+                elif create_sql[paren_end] == ')':
+                    paren_count -= 1
+                paren_end += 1
+
+            # Extract expression (without outer parens)
+            expr = create_sql[paren_start + 1:paren_end - 1]
+            checks.append(expr.strip())
+
+            i = paren_end
+
+        return checks
+
+    def _validate_check_constraints(
+        self,
+        conn: sqlite3.Connection,
+        table_name: str,
+        expected_checks: list[str],
+    ) -> None:
+        """Validate the exact CHECK-constraint set semantically.
+
+        Harmless SQL formatting differences are normalized by tokenization, but
+        altered, missing, duplicate, or additional CHECK constraints fail closed.
+        """
+        from collections import Counter
+
         cursor = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
-            (table_name,)
+            (table_name,),
         )
         row = cursor.fetchone()
         if not row:
-            raise MissionSchemaVersionError(f"Table {table_name} not found in sqlite_master")
+            raise MissionSchemaVersionError(
+                f"Table {table_name} not found in sqlite_master"
+            )
 
         create_sql = row[0]
         if not create_sql:
-            raise MissionSchemaVersionError(f"Table {table_name} has no CREATE SQL")
+            raise MissionSchemaVersionError(
+                f"Table {table_name} has no CREATE SQL"
+            )
 
-        # Normalize whitespace for comparison
-        normalized_sql = " ".join(create_sql.split()).upper()
+        actual_checks = self._extract_check_expressions(create_sql)
 
-        for check_clause in expected_checks:
-            normalized_check = " ".join(check_clause.split()).upper()
-            if normalized_check not in normalized_sql:
-                raise MissionSchemaVersionError(
-                    f"Table {table_name} missing required CHECK constraint: {check_clause}"
-                )
+        actual_tokens = Counter(
+            tuple(self._tokenize_sql_expression(check))
+            for check in actual_checks
+        )
+        expected_tokens = Counter(
+            tuple(self._tokenize_sql_expression(check))
+            for check in expected_checks
+        )
+
+        if actual_tokens != expected_tokens:
+            raise MissionSchemaVersionError(
+                f"Table {table_name} has incompatible CHECK constraints: "
+                f"expected {expected_checks!r}, found {actual_checks!r}"
+            )
 
     def _validate_unique_constraints(
-        self, conn: sqlite3.Connection, table_name: str, expected_unique: list[list[str]]
+        self,
+        conn: sqlite3.Connection,
+        table_name: str,
+        expected_unique: list[list[str]],
     ) -> None:
-        """Validate UNIQUE constraints."""
-        # Get all indexes for this table
-        index_list = list(conn.execute(f"PRAGMA index_list({table_name})"))
+        """Validate exact non-PK UNIQUE structure and comparison semantics."""
+        from collections import Counter
 
-        for expected_cols in expected_unique:
-            # Find a unique index matching these columns
-            found = False
-            for idx_row in index_list:
-                idx_name = idx_row[1]
-                is_unique = idx_row[2] == 1
+        actual_unique = []
 
-                if not is_unique:
-                    continue
+        for idx_row in conn.execute(f"PRAGMA index_list({table_name})"):
+            idx_name = idx_row[1]
+            is_unique = idx_row[2] == 1
+            origin = idx_row[3] if len(idx_row) > 3 else None
+            is_partial = bool(idx_row[4]) if len(idx_row) > 4 else False
 
-                # Get columns in this index
-                idx_info = list(conn.execute(f"PRAGMA index_info({idx_name})"))
-                idx_cols = [row[2] for row in idx_info]
+            if not is_unique or origin == "pk":
+                continue
 
-                if idx_cols == expected_cols:
-                    found = True
-                    break
+            quoted_idx = idx_name.replace('"', '""')
+            xinfo = list(
+                conn.execute(f'PRAGMA index_xinfo("{quoted_idx}")')
+            )
+            key_rows = [row for row in xinfo if row[5] == 1]
 
-            if not found:
-                raise MissionSchemaVersionError(
-                    f"Table {table_name} missing required UNIQUE constraint on {expected_cols}"
-                )
+            columns = tuple(row[2] for row in key_rows)
+            collations = tuple(row[4] for row in key_rows)
+            descending = tuple(row[3] for row in key_rows)
+
+            actual_unique.append(
+                (columns, collations, descending, is_partial)
+            )
+
+        expected_specs = [
+            (
+                tuple(columns),
+                tuple("BINARY" for _ in columns),
+                tuple(0 for _ in columns),
+                False,
+            )
+            for columns in expected_unique
+        ]
+
+        if Counter(actual_unique) != Counter(expected_specs):
+            raise MissionSchemaVersionError(
+                f"Table {table_name} has incompatible UNIQUE constraints: "
+                f"expected {expected_specs!r}, found {actual_unique!r}"
+            )
 
     def _initialize_schema(self, conn: sqlite3.Connection) -> None:
         """Initialize or migrate database schema.
@@ -756,16 +1186,31 @@ class MissionRuntimeStore:
                     raise
             else:
                 # Existing database - validate or migrate version
-                cursor = conn.execute("SELECT version FROM mission_runtime_schema ORDER BY version")
-                try:
-                    version_rows = [int(row[0]) for row in cursor.fetchall()]
-                except (ValueError, TypeError) as exc:
-                    raise MissionSchemaVersionError(
-                        "Database schema version metadata contains non-integer value"
-                    ) from exc
+                cursor = conn.execute("SELECT version, typeof(version) FROM mission_runtime_schema ORDER BY version")
+                version_rows_with_types = cursor.fetchall()
 
-                if not version_rows:
+                if not version_rows_with_types:
                     raise MissionSchemaVersionError("Database schema version metadata is empty")
+
+                # Validate each version with strict integer semantics
+                version_rows = []
+                for row in version_rows_with_types:
+                    raw_version = row[0]
+                    version_type = row[1]
+
+                    # Require INTEGER storage class
+                    if version_type != 'integer':
+                        raise MissionSchemaVersionError(
+                            f"Database schema version must be INTEGER storage class, found {version_type} with value {raw_version!r}"
+                        )
+
+                    # Validate it's actually an integer (not coerced)
+                    if not isinstance(raw_version, int) or isinstance(raw_version, bool):
+                        raise MissionSchemaVersionError(
+                            f"Database schema version metadata contains non-integer value: {raw_version!r}"
+                        )
+
+                    version_rows.append(raw_version)
 
                 distinct_versions = sorted(set(version_rows))
                 if len(distinct_versions) != 1:
@@ -791,9 +1236,20 @@ class MissionRuntimeStore:
                     try:
                         # Re-read version inside transaction (authoritative read)
                         refreshed_cursor = conn.execute(
-                            "SELECT version FROM mission_runtime_schema ORDER BY version"
+                            "SELECT version, typeof(version) FROM mission_runtime_schema ORDER BY version"
                         )
-                        refreshed_versions = [int(row[0]) for row in refreshed_cursor.fetchall()]
+                        refreshed_rows = refreshed_cursor.fetchall()
+
+                        # Validate versions strictly
+                        refreshed_versions = []
+                        for row in refreshed_rows:
+                            raw_ver = row[0]
+                            ver_type = row[1]
+                            if ver_type != 'integer' or not isinstance(raw_ver, int) or isinstance(raw_ver, bool):
+                                raise MissionSchemaVersionError(
+                                    f"Invalid schema version type during migration: {ver_type} = {raw_ver!r}"
+                                )
+                            refreshed_versions.append(raw_ver)
 
                         if refreshed_versions != [1]:
                             # Another process already migrated
@@ -809,6 +1265,7 @@ class MissionRuntimeStore:
                         self._validate_schema_contract(
                             conn,
                             expected_tables=_EXPECTED_SCHEMA_TABLES_V1,
+                            expected_columns=_EXPECTED_SCHEMA_COLUMNS_V1,
                             expected_indexes=_EXPECTED_INDEXES_V1,
                             expected_version=1,
                         )
@@ -1709,8 +2166,9 @@ class MissionRuntimeStore:
                         ),
                     )
 
-                    conn.commit()
-                    return MissionControllerLease(
+                    # Construct and validate lease object BEFORE commit
+                    # If construction fails, rollback occurs in except block
+                    lease = MissionControllerLease(
                         control_domain=control_domain,
                         mission_id=mission_id,
                         controller_id=controller_id,
@@ -1720,6 +2178,9 @@ class MissionRuntimeStore:
                         expires_at=expires_at,
                         released_at=None,
                     )
+
+                    conn.commit()
+                    return lease
 
                 # Parse latest lease
                 latest_generation = latest[0]
@@ -1788,8 +2249,9 @@ class MissionRuntimeStore:
                     ),
                 )
 
-                conn.commit()
-                return MissionControllerLease(
+                # Construct and validate lease object BEFORE commit
+                # If construction fails, rollback occurs in except block
+                lease = MissionControllerLease(
                     control_domain=control_domain,
                     mission_id=mission_id,
                     controller_id=controller_id,
@@ -1799,6 +2261,9 @@ class MissionRuntimeStore:
                     expires_at=expires_at,
                     released_at=None,
                 )
+
+                conn.commit()
+                return lease
             except Exception:
                 conn.rollback()
                 raise
@@ -1925,8 +2390,9 @@ class MissionRuntimeStore:
                     ),
                 )
 
-                conn.commit()
-                return MissionControllerLease(
+                # Construct and validate lease object BEFORE commit
+                # If construction fails, rollback occurs in except block
+                lease = MissionControllerLease(
                     control_domain=control_domain,
                     mission_id=mission_id,
                     controller_id=controller_id,
@@ -1936,6 +2402,9 @@ class MissionRuntimeStore:
                     expires_at=expires_at,
                     released_at=None,
                 )
+
+                conn.commit()
+                return lease
             except Exception:
                 conn.rollback()
                 raise
@@ -2054,8 +2523,9 @@ class MissionRuntimeStore:
                     ),
                 )
 
-                conn.commit()
-                return MissionControllerLease(
+                # Construct and validate lease object BEFORE commit
+                # If construction fails, rollback occurs in except block
+                lease = MissionControllerLease(
                     control_domain=control_domain,
                     mission_id=mission_id,
                     controller_id=controller_id,
@@ -2065,6 +2535,9 @@ class MissionRuntimeStore:
                     expires_at=latest_expires_at,
                     released_at=released_at,
                 )
+
+                conn.commit()
+                return lease
             except Exception:
                 conn.rollback()
                 raise
