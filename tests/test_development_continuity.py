@@ -264,8 +264,11 @@ def test_development_continuity_does_not_modify_core_implementation():
     # Mission Observability and Pavilion Native Interface are explicitly
     # non-authoritative read/presentation surfaces.
     # Mission Runtime and Runtime Store contain the checkpoint revision guard.
+    # Mission Controller Lease is the explicitly accepted Phase A authoritative
+    # surface for durable controller ownership generations.
     # Continue rejecting changes to every other existing core implementation file.
     assert set(result.stdout.splitlines()) <= {
+        "federation/mission_controller_lease.py",
         "federation/mission_observability.py",
         "federation/mission_runtime.py",
         "federation/mission_runtime_store.py",
