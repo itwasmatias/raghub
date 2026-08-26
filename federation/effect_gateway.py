@@ -940,6 +940,23 @@ class GovernedEffectGateway:
         except (ValueError, TypeError) as e:
             raise GatewayStateError(str(e)) from e
 
+    def reconcile_indeterminate(
+        self, request: GatewayEffectRequest, gateway_claim_id: str, obligation_id: str,
+        evidence_spine: Any, evidence_pointer: Any,
+    ) -> None:
+        """Resolve an indeterminate claim using exact verified provider evidence."""
+        try:
+            self._store.reconcile_indeterminate(
+                gateway_claim_id=gateway_claim_id,
+                control_domain=request.control_domain,
+                obligation_id=obligation_id,
+                evidence_spine=evidence_spine,
+                evidence_pointer=evidence_pointer,
+                now=self._clock(),
+            )
+        except (ValueError, TypeError) as e:
+            raise GatewayStateError(str(e)) from e
+
 
 __all__ = [
     "DenialReason",

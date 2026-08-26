@@ -54,6 +54,7 @@ from federation.effect_safety import (
     ReconciliationObligation,
     ReconciliationState,
     ProviderReconcilability,
+    EffectState,
 )
 
 
@@ -451,6 +452,7 @@ class DurableEffectStore:
                         'handoff_started',
                         'receipt_recorded',
                         'terminal',
+                        'reconciled',
                         'indeterminate'
                     )
                 ),
@@ -1002,6 +1004,7 @@ class DurableEffectStore:
                 "handoff_started",
                 "receipt_recorded",
                 "terminal",
+                "reconciled",
                 "indeterminate",
             }:
                 raise StorageIntegrityError(
@@ -2169,6 +2172,7 @@ class DurableEffectStore:
                         if existing[2] not in (
                             ReconciliationState.PENDING.value,
                             ReconciliationState.IN_PROGRESS.value,
+                            ReconciliationState.RESOLVED.value,
                         ):
                             raise ValueError(
                                 f"obligation {obligation.obligation_id} in domain {domain} "
@@ -3163,6 +3167,112 @@ class DurableEffectStore:
             if "locked" in str(e).lower():
                 raise ConcurrencyConflictError(f"Database lock timeout while recording indeterminate claim {gateway_claim_id}") from e
             raise StorageIntegrityError(f"Failed to record indeterminate result: {e}") from e
+
+    def reconcile_indeterminate(
+        self,
+        gateway_claim_id: str,
+        control_domain: str,
+        obligation_id: str,
+        evidence_spine: EvidenceSpine,
+        evidence_pointer: EvidencePointer,
+        now: datetime,
+    ) -> None:
+        """Atomically resolve an indeterminate claim from verified provider evidence.
+
+        The operation is deliberately read-only with respect to the provider.  It
+        only settles durable MissionaryX state after the canonical evidence spine
+        verifies an exact operation-committed reconciliation record.
+        """
+        from federation.effect_safety import resolve_indeterminate_from_evidence
+        from research_mission.evidence_spine import EvidencePointer, EvidenceSpine
+
+        if type(evidence_spine) is not EvidenceSpine or type(evidence_pointer) is not EvidencePointer:
+            raise TypeError("reconciliation requires EvidenceSpine and EvidencePointer")
+        domain = validate_domain_id(control_domain, "control_domain")
+        self._ensure_open()
+        record = evidence_spine.verify_evidence(evidence_pointer)
+        if record.key.source != "provider_boundary_reconciliation" or record.key.domain_id != domain:
+            raise ValueError("reconciliation evidence source or domain is invalid")
+        claim = self.get_gateway_claim(gateway_claim_id, domain)
+        obligation = self.get_obligation(obligation_id, domain)
+        if claim is None or obligation is None:
+            raise ValueError("reconciliation claim or obligation not found")
+        if claim["state"] != "indeterminate" or obligation.state is not ReconciliationState.PENDING:
+            raise ValueError("reconciliation requires an indeterminate claim and pending obligation")
+        if obligation.effect_intent_id != claim["effect_intent_id"] or obligation.dispatch_id != claim["effect_dispatch_id"]:
+            raise ValueError("reconciliation obligation is not bound to the claim")
+        resolved = resolve_indeterminate_from_evidence(
+            EffectState.INDETERMINATE,
+            evidence_spine,
+            evidence_pointer,
+            claim["effect_intent_id"],
+            domain,
+            claim["effect_dispatch_id"],
+            claim["idempotency_key"],
+        )
+        if resolved is not EffectState.SOMETHING_LANDED:
+            raise ValueError("reconciliation evidence does not prove something_landed")
+        history = list(obligation.probe_history)
+        history.append({"kind": "reconciliation", "evidence": evidence_pointer.to_dict(), "result": resolved.value})
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    updated = connection.execute(
+                        """UPDATE effect_gateway_claims SET state = 'reconciled', terminal_at = ?
+                           WHERE control_domain = ? AND gateway_claim_id = ? AND state = 'indeterminate'""",
+                        (_serialize_timestamp(now), domain, gateway_claim_id),
+                    )
+                    if updated.rowcount != 1:
+                        raise ConcurrencyConflictError("gateway claim changed during reconciliation")
+                    connection.execute(
+                        """UPDATE authority_reservations SET disposition = ?, disposition_at = ?,
+                           disposition_evidence_json = ?
+                           WHERE control_domain = ? AND reservation_id = ? AND disposition = ?""",
+                        (AuthorityDisposition.CONSUMED.value, _serialize_timestamp(now),
+                         _serialize_evidence_pointer(evidence_pointer), domain,
+                         claim["authority_reservation_id"], AuthorityDisposition.RESERVED.value),
+                    )
+                    connection.execute(
+                        """UPDATE reconciliation_obligations SET state = ?, probe_history_json = ?,
+                           next_probe_at = NULL WHERE control_domain = ? AND obligation_id = ?
+                           AND state = ?""",
+                        (ReconciliationState.RESOLVED.value, _serialize_probe_history(tuple(history)),
+                         domain, obligation_id, ReconciliationState.PENDING.value),
+                    )
+                    if connection.total_changes < 3:
+                        raise ConcurrencyConflictError("reconciliation state changed concurrently")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+        except sqlite3.OperationalError as e:
+            raise StorageIntegrityError(f"Failed to reconcile indeterminate effect: {e}") from e
+
+    def append_reconciliation_observation(
+        self, obligation_id: str, control_domain: str, observation: dict[str, Any]
+    ) -> None:
+        """Persist an independent read/verification observation on an obligation."""
+        domain = validate_domain_id(control_domain, "control_domain")
+        self._ensure_open()
+        obligation = self.get_obligation(obligation_id, domain)
+        if obligation is None or obligation.state is not ReconciliationState.RESOLVED:
+            raise ValueError("verification requires a resolved reconciliation obligation")
+        history = tuple((*obligation.probe_history, dict(observation)))
+        self.store_obligation(
+            ReconciliationObligation(
+                obligation_id=obligation.obligation_id,
+                effect_intent_id=obligation.effect_intent_id,
+                dispatch_id=obligation.dispatch_id,
+                state=obligation.state,
+                provider_reconcilability=obligation.provider_reconcilability,
+                next_probe_at=None,
+                probe_history=history,
+                terminal_disposition=None,
+                created_at=obligation.created_at,
+                control_domain=domain,
+            )
+        )
 
     def revoke_permit(
         self,

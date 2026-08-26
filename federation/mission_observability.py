@@ -64,6 +64,7 @@ class ProjectedEffectStatus(str, Enum):
 
     UNKNOWN = "unknown"
     INDETERMINATE = "indeterminate"
+    SOMETHING_LANDED = "something_landed"
 
 
 def _canonical_json(value: Any) -> str:
@@ -942,14 +943,16 @@ class MissionObservability:
             None if dispatch is None else self._project_dispatch(dispatch)
         )
         reservation_observation = self._project_reservation(reservation, control_domain)
-        status = (
-            ProjectedEffectStatus.INDETERMINATE
-            if claim is not None and claim.state == "indeterminate"
-            else ProjectedEffectStatus.UNKNOWN
-        )
+        status = ProjectedEffectStatus.UNKNOWN
+        if claim is not None and claim.state == "indeterminate":
+            status = ProjectedEffectStatus.INDETERMINATE
+        elif claim is not None and claim.state == "reconciled" and reservation.disposition is AuthorityDisposition.CONSUMED:
+            status = ProjectedEffectStatus.SOMETHING_LANDED
         status_basis = (
             "authoritative_gateway_claim_state"
             if status is ProjectedEffectStatus.INDETERMINATE
+            else "reconciled_gateway_claim_and_consumed_authority"
+            if status is ProjectedEffectStatus.SOMETHING_LANDED
             else "effect_outcome_unavailable_from_public_reads"
         )
         return EffectObservation(
@@ -1061,6 +1064,7 @@ class MissionObservability:
             "handoff_started",
             "receipt_recorded",
             "terminal",
+            "reconciled",
             "indeterminate",
         }
         if state not in allowed_states:
@@ -1146,6 +1150,20 @@ class MissionObservability:
                     f"Gateway claim {claim_id!r} state {state!r} requires terminal_at"
                 )
 
+        if state == "reconciled":
+            if handoff_started_at is None:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} state {state!r} requires handoff_started_at"
+                )
+            if receipt_recorded_at is not None:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} reconciled state must not have receipt_recorded_at"
+                )
+            if terminal_at is None:
+                raise MissionObservabilityIntegrityError(
+                    f"Gateway claim {claim_id!r} state {state!r} requires terminal_at"
+                )
+
         if state == "indeterminate":
             if handoff_started_at is None:
                 raise MissionObservabilityIntegrityError(
@@ -1188,7 +1206,7 @@ class MissionObservability:
                     raise MissionObservabilityIntegrityError(
                         f"Gateway claim {claim_id!r} terminal_at must follow receipt_recorded_at"
                     )
-            elif state == "indeterminate":
+            elif state in {"indeterminate", "reconciled"}:
                 # Indeterminate path: handoff -> indeterminate (no receipt)
                 if handoff_started_at is None:
                     raise MissionObservabilityIntegrityError(

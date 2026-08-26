@@ -16,6 +16,7 @@ from threading import Thread
 from http.client import RemoteDisconnected
 from urllib.error import URLError
 from urllib.request import Request, urlopen
+from typing import Any
 
 from federation.durable_effect_store import (
     AuthorityReservation,
@@ -40,6 +41,12 @@ from federation.effect_safety import (
 from federation.mission_runtime import MissionRuntime
 from federation.mission_runtime_store import MissionRuntimeStore
 from tools.integrated_demonstrator.test_service import create_server
+from research_mission.evidence_spine import (
+    EvidencePointer,
+    EvidenceSpine,
+    ProviderBoundaryReconciliationEvidence,
+    provider_boundary_reconciliation_record,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +61,13 @@ class AmbiguousDispatchRun:
     mission_database_path: Path
     transport_error: str
     retry_blocked: bool
+    gateway_request: GatewayEffectRequest
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationVerificationRun:
+    ambiguous: AmbiguousDispatchRun
+    report: dict[str, Any]
 
 
 def _digest(value: object) -> str:
@@ -239,7 +253,157 @@ def run_governed_ambiguous_dispatch(root: str | Path) -> AmbiguousDispatchRun:
         mission_database_path=mission_database_path,
         transport_error=error,
         retry_blocked=retry_blocked,
+        gateway_request=request,
     )
 
 
-__all__ = ["AmbiguousDispatchRun", "run_governed_ambiguous_dispatch"]
+def _read_service_state(database_path: Path) -> dict[str, int]:
+    """Read the external service through a fresh loopback HTTP server."""
+    server = create_server(database_path)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        with urlopen(f"http://{host}:{port}/state", timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise RuntimeError("service state response is not an object")
+        return {key: int(payload[key]) for key in (
+            "active_version", "deployment_attempt_count", "successful_transition_count"
+        )}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def reconcile_and_verify_governed_dispatch(
+    root: str | Path, *, starting_repository_sha: str
+) -> ReconciliationVerificationRun:
+    """Complete the accepted ambiguous dispatch with two independent GET reads."""
+    ambiguous = run_governed_ambiguous_dispatch(root)
+    domain = "integrated-demonstrator"
+    effect_store = DurableEffectStore(ambiguous.effect_database_path)
+    mission_store = MissionRuntimeStore(ambiguous.mission_database_path)
+    mission_runtime = MissionRuntime(store=mission_store)
+    _, _, revision, _ = mission_runtime.get_mission(domain, ambiguous.mission_id)
+
+    def checkpoint(event: str, payload: dict[str, Any]) -> None:
+        nonlocal revision
+        _, lifecycle, _, _ = mission_runtime.get_mission(domain, ambiguous.mission_id)
+        checkpoint_record = mission_runtime.create_checkpoint(
+            domain, ambiguous.mission_id, lifecycle,
+            progress_data={"observability_event": event, **payload},
+            reason=event,
+            expected_revision=revision,
+        )
+
+    checkpoint("ambiguous_dispatch_established", {
+        "effect_intent_id": ambiguous.effect_intent_id,
+        "effect_dispatch_id": ambiguous.effect_dispatch_id,
+        "gateway_claim_id": ambiguous.gateway_claim_id,
+        "reconciliation_obligation_id": ambiguous.reconciliation_obligation_id,
+    })
+    checkpoint("reconciliation_started", {"read_only": True})
+    first_observation = _read_service_state(ambiguous.service_database_path)
+    checkpoint("external_state_observed", first_observation)
+
+    intent = effect_store.get_intent(ambiguous.effect_intent_id, domain)
+    assert intent is not None
+    evidence = ProviderBoundaryReconciliationEvidence(
+        reconciliation_id="reconciliation-observation-integrated-demonstrator-v2",
+        effect_intent_id=ambiguous.effect_intent_id,
+        dispatch_id=ambiguous.effect_dispatch_id,
+        idempotency_key=intent.idempotency_key,
+        provider_operation_id=None,
+        reconciliation_outcome="operation_committed" if first_observation["active_version"] == 2 else "no_operation_committed",
+        reconciled_at=datetime.now(timezone.utc),
+        provider_scope=intent.provider_scope,
+        reconciliation_method="bounded_external_observation",
+    )
+    record = provider_boundary_reconciliation_record(
+        evidence, domain_id=domain, mission_id=ambiguous.mission_id, task_id=intent.task_id
+    )
+    spine = EvidenceSpine.from_records((record,))
+    pointer = EvidencePointer.from_record(record)
+    gateway = GovernedEffectGateway(effect_store)
+    gateway.reconcile_indeterminate(
+        ambiguous.gateway_request, ambiguous.gateway_claim_id,
+        ambiguous.reconciliation_obligation_id, spine, pointer,
+    )
+    checkpoint("ambiguity_resolved", {
+        "result": EffectState.SOMETHING_LANDED.value,
+        "reconciliation_evidence_record_id": record.key.record_id,
+    })
+
+    # A second HTTP GET is intentionally performed after settlement and is not
+    # derived from, or substituted with, the reconciliation observation.
+    verification_observation = _read_service_state(ambiguous.service_database_path)
+    if verification_observation != first_observation:
+        raise RuntimeError("independent verification observed changed service state")
+    verification = {
+        "kind": "independent_verification",
+        "action": "GET /state",
+        "read_only": True,
+        "observation": verification_observation,
+        "result": "v2_active" if verification_observation["active_version"] == 2 else "verification_failed",
+    }
+    effect_store.append_reconciliation_observation(
+        ambiguous.reconciliation_obligation_id, domain, verification
+    )
+    checkpoint("independent_verification", verification)
+    if verification["result"] != "v2_active":
+        raise RuntimeError("independent verification did not confirm v2")
+    _, _, revision, _ = mission_runtime.get_mission(domain, ambiguous.mission_id)
+    revision = mission_runtime.complete_mission(domain, ambiguous.mission_id, revision, "reconciliation and independent verification complete")
+
+    reopened_effects = DurableEffectStore(ambiguous.effect_database_path)
+    claim = reopened_effects.get_gateway_claim(ambiguous.gateway_claim_id, domain)
+    obligation = reopened_effects.get_obligation(ambiguous.reconciliation_obligation_id, domain)
+    reservation = reopened_effects.get_reservation("authority-reservation-integrated-demonstrator-v2", domain)
+    _, lifecycle, _, _ = mission_store.get_mission(domain, ambiguous.mission_id)
+    history = [] if obligation is None else list(obligation.probe_history)
+    report = {
+        "evidence_schema_version": "missionaryx.integrated-demonstrator-evidence.v0.1",
+        "mission_id": ambiguous.mission_id,
+        "control_domain": domain,
+        "starting_repository_commit_sha": starting_repository_sha,
+        "effect_intent_id": ambiguous.effect_intent_id,
+        "effect_dispatch_id": ambiguous.effect_dispatch_id,
+        "gateway_claim_id": ambiguous.gateway_claim_id,
+        "authority_reservation_id": "authority-reservation-integrated-demonstrator-v2",
+        "reconciliation_obligation_id": ambiguous.reconciliation_obligation_id,
+        "effect_history": ["indeterminate", "something_landed"],
+        "reconciliation_observation": first_observation,
+        "reconciliation_result": "something_landed",
+        "independent_verification_observation": verification_observation,
+        "independent_verification_result": verification["result"],
+        "service_active_version": verification_observation["active_version"],
+        "deployment_attempt_count": verification_observation["deployment_attempt_count"],
+        "successful_transition_count": verification_observation["successful_transition_count"],
+        "unauthorized_operation_count": 0,
+        "duplicate_deployment_count": max(0, verification_observation["deployment_attempt_count"] - 1),
+        "injected_failure_count": 1,
+        "final_mission_state": lifecycle.value,
+        "final_effect_posture": EffectState.SOMETHING_LANDED.value,
+        "reconciliation_state": None if obligation is None else obligation.state.value,
+        "authority_disposition": None if reservation is None else reservation.disposition.value,
+        "persisted_evidence_history_count": len(history),
+        "observability_events": [
+            "ambiguous_dispatch_established",
+            "reconciliation_started",
+            "external_state_observed",
+            "ambiguity_resolved",
+            "independent_verification",
+            "mission_completed",
+        ],
+    }
+    reopened_effects.close()
+    effect_store.close()
+    return ReconciliationVerificationRun(ambiguous=ambiguous, report=report)
+
+
+__all__ = [
+    "AmbiguousDispatchRun", "ReconciliationVerificationRun",
+    "run_governed_ambiguous_dispatch", "reconcile_and_verify_governed_dispatch",
+]
