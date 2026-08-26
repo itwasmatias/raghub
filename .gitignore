@@ -38,6 +38,9 @@ dist/
 .coverage
 htmlcov/
 
+# Integrated Demonstrator runtime evidence (generated, never source fixtures)
+artifacts/integrated-demonstrator/
+
 # SIP Personal Edition runtime state
 data/*.db
 data/*.db-*

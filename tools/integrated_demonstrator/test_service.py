@@ -19,6 +19,7 @@ after the external effect has already landed.
 
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -53,31 +54,32 @@ class DemoServiceStore:
         return connection
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS service_state (
-                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                    active_version INTEGER NOT NULL
-                        CHECK (active_version IN (1, 2)),
-                    deployment_attempt_count INTEGER NOT NULL
-                        CHECK (deployment_attempt_count >= 0),
-                    successful_transition_count INTEGER NOT NULL
-                        CHECK (successful_transition_count >= 0)
+        with closing(self._connect()) as connection:
+            with connection:
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS service_state (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        active_version INTEGER NOT NULL
+                            CHECK (active_version IN (1, 2)),
+                        deployment_attempt_count INTEGER NOT NULL
+                            CHECK (deployment_attempt_count >= 0),
+                        successful_transition_count INTEGER NOT NULL
+                            CHECK (successful_transition_count >= 0)
+                    )
+                    """
                 )
-                """
-            )
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO service_state (
-                    singleton,
-                    active_version,
-                    deployment_attempt_count,
-                    successful_transition_count
-                ) VALUES (1, 1, 0, 0)
-                """
-            )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO service_state (
+                        singleton,
+                        active_version,
+                        deployment_attempt_count,
+                        successful_transition_count
+                    ) VALUES (1, 1, 0, 0)
+                    """
+                )
 
     @staticmethod
     def _row_to_state(row: sqlite3.Row) -> TestServiceState:
@@ -88,17 +90,18 @@ class DemoServiceStore:
         )
 
     def read_state(self) -> TestServiceState:
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT
-                    active_version,
-                    deployment_attempt_count,
-                    successful_transition_count
-                FROM service_state
-                WHERE singleton = 1
-                """
-            ).fetchone()
+        with closing(self._connect()) as connection:
+            with connection:
+                row = connection.execute(
+                    """
+                    SELECT
+                        active_version,
+                        deployment_attempt_count,
+                        successful_transition_count
+                    FROM service_state
+                    WHERE singleton = 1
+                    """
+                ).fetchone()
 
         if row is None:
             raise RuntimeError("test-service state row is missing")
