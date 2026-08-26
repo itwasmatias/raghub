@@ -565,6 +565,8 @@ class DurableEffectStore:
         self._test_crash_before_consumption_commit: Any = None
         self._test_crash_before_consumption_start: Any = None
         self._test_crash_after_consumption_commit: Any = None
+        self._test_fail_indeterminate_obligation_write: Any = None
+        self._test_fail_indeterminate_claim_transition: Any = None
 
     def _create_connection(self, database_path: str, *, require_wal: bool = True) -> sqlite3.Connection:
         """Create a new database connection with proper configuration.
@@ -2969,8 +2971,12 @@ class DurableEffectStore:
         domain = validate_domain_id(control_domain, "control_domain")
         self._ensure_open()
 
-        valid_statuses = {"nothing_landed", "something_landed", "indeterminate"}
+        valid_statuses = {"nothing_landed", "something_landed"}
         if effect_status not in valid_statuses:
+            if effect_status == "indeterminate":
+                raise ValueError(
+                    "indeterminate requires record_indeterminate_with_obligation"
+                )
             raise ValueError(f"effect_status must be one of {valid_statuses}")
 
         try:
@@ -3041,6 +3047,122 @@ class DurableEffectStore:
 
         except sqlite3.OperationalError as e:
             raise StorageIntegrityError(f"Failed to record result: {e}") from e
+
+    def record_indeterminate_with_obligation(
+        self,
+        gateway_claim_id: str,
+        control_domain: str,
+        obligation: ReconciliationObligation,
+        now: datetime,
+    ) -> None:
+        """Atomically persist a pending obligation and indeterminate claim."""
+        domain = validate_domain_id(control_domain, "control_domain")
+        self._ensure_open()
+        if type(obligation) is not ReconciliationObligation:
+            raise TypeError("obligation must be a ReconciliationObligation")
+        if obligation.control_domain != domain:
+            raise ValueError("obligation control_domain does not match claim domain")
+        if obligation.state is not ReconciliationState.PENDING:
+            raise ValueError("indeterminate obligation must be PENDING")
+        if obligation.terminal_disposition is not None:
+            raise ValueError("indeterminate obligation cannot have terminal_disposition")
+
+        next_probe_at = _serialize_timestamp(obligation.next_probe_at) if obligation.next_probe_at else None
+        probe_history = _serialize_probe_history(obligation.probe_history)
+        created_at = _serialize_timestamp(obligation.created_at)
+
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    claim = connection.execute(
+                        """
+                        SELECT effect_intent_id, effect_dispatch_id, authority_reservation_id, state
+                        FROM effect_gateway_claims
+                        WHERE control_domain = ? AND gateway_claim_id = ?
+                        """,
+                        (domain, gateway_claim_id),
+                    ).fetchone()
+                    if claim is None:
+                        raise ValueError(f"gateway_claim_id {gateway_claim_id!r} not found in domain {domain}")
+                    if claim[3] != "handoff_started":
+                        raise ValueError(
+                            f"INDETERMINATE requires handoff_started, claim {gateway_claim_id!r} is {claim[3]!r}"
+                        )
+                    if obligation.effect_intent_id != claim[0]:
+                        raise ValueError("obligation effect_intent_id does not match claim")
+                    if obligation.dispatch_id != claim[1]:
+                        raise ValueError("obligation dispatch_id does not match claim")
+
+                    reservation = connection.execute(
+                        """
+                        SELECT reservation_id, effect_intent_id, disposition
+                        FROM authority_reservations
+                        WHERE control_domain = ? AND reservation_id = ?
+                        """,
+                        (domain, claim[2]),
+                    ).fetchone()
+                    if reservation is None:
+                        raise ValueError("claim authority reservation does not exist")
+                    if reservation[0] != claim[2]:
+                        raise ValueError("reservation does not match claim authority reservation")
+                    if reservation[1] != claim[0]:
+                        raise ValueError("reservation effect_intent_id does not match claim")
+                    if reservation[2] != AuthorityDisposition.RESERVED.value:
+                        raise ValueError("claim authority reservation must remain RESERVED")
+
+                    existing = connection.execute(
+                        """
+                        SELECT effect_intent_id, dispatch_id, state, provider_reconcilability,
+                               next_probe_at, probe_history_json, terminal_disposition_json, created_at
+                        FROM reconciliation_obligations
+                        WHERE control_domain = ? AND obligation_id = ?
+                        """,
+                        (domain, obligation.obligation_id),
+                    ).fetchone()
+                    incoming = (
+                        obligation.effect_intent_id, obligation.dispatch_id, obligation.state.value,
+                        obligation.provider_reconcilability.value, next_probe_at, probe_history,
+                        None, created_at,
+                    )
+                    if existing is not None:
+                        if existing[2] not in (ReconciliationState.PENDING.value, ReconciliationState.IN_PROGRESS.value):
+                            raise ValueError("obligation has a terminal state")
+                        if tuple(existing) != incoming:
+                            raise ValueError("obligation already exists with different payload")
+                    else:
+                        if self._test_fail_indeterminate_obligation_write is not None:
+                            self._test_fail_indeterminate_obligation_write()
+                        connection.execute(
+                            """
+                            INSERT INTO reconciliation_obligations (
+                                control_domain, obligation_id, effect_intent_id, dispatch_id,
+                                state, provider_reconcilability, next_probe_at,
+                                probe_history_json, terminal_disposition_json, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (domain, obligation.obligation_id, *incoming),
+                        )
+
+                    if self._test_fail_indeterminate_claim_transition is not None:
+                        self._test_fail_indeterminate_claim_transition()
+                    changed = connection.execute(
+                        """
+                        UPDATE effect_gateway_claims SET state = 'indeterminate', terminal_at = ?
+                        WHERE control_domain = ? AND gateway_claim_id = ? AND state = 'handoff_started'
+                        """,
+                        (_serialize_timestamp(now), domain, gateway_claim_id),
+                    )
+                    if changed.rowcount != 1:
+                        raise ConcurrencyConflictError(f"Claim {gateway_claim_id!r} state changed concurrently")
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower():
+                raise ConcurrencyConflictError(f"Database lock timeout while recording indeterminate claim {gateway_claim_id}") from e
+            raise StorageIntegrityError(f"Failed to record indeterminate result: {e}") from e
 
     def revoke_permit(
         self,

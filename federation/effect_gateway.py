@@ -874,15 +874,15 @@ class GovernedEffectGateway:
         if not isinstance(result, GatewayEffectResult):
             raise TypeError("result must be GatewayEffectResult")
 
-        # Map EffectState to effect_status string
-        from federation.effect_safety import EffectState
+        if result.effect_status == EffectState.INDETERMINATE:
+            raise GatewayStateError(
+                "INDETERMINATE requires record_indeterminate_with_obligation"
+            )
 
         if result.effect_status == EffectState.NOTHING_LANDED:
             effect_status = "nothing_landed"
         elif result.effect_status == EffectState.SOMETHING_LANDED:
             effect_status = "something_landed"
-        elif result.effect_status == EffectState.INDETERMINATE:
-            effect_status = "indeterminate"
         else:
             raise GatewayStateError(f"Unknown effect_status: {result.effect_status}")
 
@@ -895,6 +895,49 @@ class GovernedEffectGateway:
                 now=now,
             )
         except ValueError as e:
+            raise GatewayStateError(str(e)) from e
+
+    def record_indeterminate_with_obligation(
+        self,
+        request: GatewayEffectRequest,
+        result: GatewayEffectResult,
+        obligation: Any,
+    ) -> None:
+        """Validate and atomically record an indeterminate effect."""
+        from federation.effect_safety import ReconciliationObligation, ReconciliationState
+
+        if not isinstance(request, GatewayEffectRequest):
+            raise TypeError("request must be GatewayEffectRequest")
+        if not isinstance(result, GatewayEffectResult):
+            raise TypeError("result must be GatewayEffectResult")
+        if not isinstance(obligation, ReconciliationObligation):
+            raise TypeError("obligation must be ReconciliationObligation")
+        if result.effect_status is not EffectState.INDETERMINATE:
+            raise GatewayStateError("atomic obligation operation requires INDETERMINATE")
+        claim = self._store.get_gateway_claim(result.gateway_claim_id, request.control_domain)
+        if claim is None:
+            raise GatewayStateError("gateway claim not found")
+        checks = {
+            "control_domain": claim and request.control_domain == obligation.control_domain,
+            "intent": result.effect_intent_id == request.effect_intent_id == claim["effect_intent_id"] == obligation.effect_intent_id,
+            "dispatch": result.effect_dispatch_id == request.effect_dispatch_id == claim["effect_dispatch_id"] == obligation.dispatch_id,
+            "authority_reservation": request.authority_reservation_id == claim["authority_reservation_id"],
+            "fingerprint": claim["request_fingerprint"] == request.request_fingerprint(),
+            "obligation_id": result.reconciliation_obligation_id == obligation.obligation_id,
+            "reconcilability": obligation.provider_reconcilability is request.provider_reconcilability,
+            "reserved": result.authority_disposition is AuthorityDisposition.RESERVED,
+            "required": result.dispatch_attempted and result.reconciliation_required and result.handoff_started and not result.receipt_recorded,
+        }
+        if not all(checks.values()) or obligation.state is not ReconciliationState.PENDING or obligation.terminal_disposition is not None:
+            raise GatewayStateError("invalid indeterminate reconciliation binding")
+        try:
+            self._store.record_indeterminate_with_obligation(
+                gateway_claim_id=result.gateway_claim_id,
+                control_domain=request.control_domain,
+                obligation=obligation,
+                now=self._clock(),
+            )
+        except (ValueError, TypeError) as e:
             raise GatewayStateError(str(e)) from e
 
 

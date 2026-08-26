@@ -21,6 +21,7 @@ import multiprocessing
 import os
 import secrets
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -52,7 +53,12 @@ from federation.effect_gateway import (
     GatewayEffectRequest,
     GovernedEffectGateway,
 )
-from federation.effect_safety import AuthorityDisposition, EffectState
+from federation.effect_safety import (
+    AuthorityDisposition,
+    EffectState,
+    ProviderReconcilability,
+    ReconciliationState,
+)
 from pavilionos.authorization_envelope import PavilionAuthorizationEnvelope
 from pavilionos.canonical_adapter import (
     AdapterDenied,
@@ -62,6 +68,7 @@ from pavilionos.canonical_adapter import (
 from pavilionos.canonical_coordinator import (
     CanonicalPavilionCoordinator,
     CoordinatorDenied,
+    CoordinatorError,
     PavilionActionRequest,
     PAVILION_ADAPTER_ID,
     PAVILION_CONTROL_DOMAIN,
@@ -893,6 +900,7 @@ def test_indeterminate_result_holds_authority(
     coordinator: CanonicalPavilionCoordinator,
     active_delegation_grant: AuthoritativeDelegationGrant,
     gateway: GovernedEffectGateway,
+    durable_store: DurableEffectStore,
 ):
     """Test 31: INDETERMINATE effect holds authority conservatively.
 
@@ -922,6 +930,160 @@ def test_indeterminate_result_holds_authority(
 
     # Authority held conservatively
     assert result.authority_disposition == AuthorityDisposition.RESERVED
+
+    durable_store.close()
+    reopened = DurableEffectStore(durable_store.database_path)
+    try:
+        claim = reopened.get_gateway_claim(result.gateway_claim_id, PAVILION_CONTROL_DOMAIN)
+        assert claim["state"] == "indeterminate"
+        obligation = reopened.get_obligation(
+            f"pavilion-obligation-{result.effect_intent_id}", PAVILION_CONTROL_DOMAIN
+        )
+        assert obligation is not None
+        assert obligation.control_domain == PAVILION_CONTROL_DOMAIN
+        assert obligation.effect_intent_id == result.effect_intent_id
+        assert obligation.dispatch_id == result.effect_dispatch_id
+        assert obligation.state is ReconciliationState.PENDING
+        assert obligation.provider_reconcilability is ProviderReconcilability.NONE
+        assert reopened.get_reservation(
+            result.authority_reservation_id, PAVILION_CONTROL_DOMAIN
+        ).disposition is AuthorityDisposition.RESERVED
+    finally:
+        reopened.close()
+
+
+def test_adapter_exception_after_authorization_is_durable_indeterminate_after_reopen(
+    coordinator: CanonicalPavilionCoordinator,
+    active_delegation_grant: AuthoritativeDelegationGrant,
+    durable_store: DurableEffectStore,
+):
+    def failing_provider(action: str) -> ProviderResult:
+        raise TimeoutError("adapter subprocess timeout")
+
+    request = make_test_request(active_delegation_grant)
+    result = coordinator.coordinate(
+        request, provider_registry={"restart-firefox": failing_provider}
+    )
+
+    assert result.effect_status is EffectState.INDETERMINATE
+    durable_store.close()
+    reopened = DurableEffectStore(durable_store.database_path)
+    try:
+        claim = reopened.get_gateway_claim(result.gateway_claim_id, PAVILION_CONTROL_DOMAIN)
+        assert claim["state"] == "indeterminate"
+        obligation = reopened.get_obligation(
+            f"pavilion-obligation-{result.effect_intent_id}", PAVILION_CONTROL_DOMAIN
+        )
+        assert obligation is not None
+        assert obligation.control_domain == PAVILION_CONTROL_DOMAIN
+        assert obligation.effect_intent_id == result.effect_intent_id
+        assert obligation.dispatch_id == result.effect_dispatch_id
+        assert obligation.state is ReconciliationState.PENDING
+        assert obligation.provider_reconcilability is ProviderReconcilability.NONE
+        assert reopened.get_reservation(
+            result.authority_reservation_id, PAVILION_CONTROL_DOMAIN
+        ).disposition is AuthorityDisposition.RESERVED
+    finally:
+        reopened.close()
+
+
+def test_subprocess_timeout_is_durable_indeterminate_after_reopen(
+    tmp_path: Path,
+    delegation_registry: DelegationGrantRegistry,
+    active_delegation_grant: AuthoritativeDelegationGrant,
+    durable_store: DurableEffectStore,
+    gateway: GovernedEffectGateway,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    coordinator = CanonicalPavilionCoordinator(
+        durable_store=durable_store,
+        delegation_registry=delegation_registry,
+        gateway=gateway,
+        adapter_path=tmp_path / "canonical-adapter",
+    )
+
+    def timeout_run(*args: Any, **kwargs: Any) -> Any:
+        envelope = json.loads(kwargs["input"])
+        gateway.verify_and_consume_permit(
+            envelope["permit_token"], envelope["control_domain"]
+        )
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", timeout_run)
+    request = make_test_request(active_delegation_grant)
+    result = coordinator.coordinate(request)
+
+    assert result.effect_status is EffectState.INDETERMINATE
+    durable_store.close()
+    reopened = DurableEffectStore(durable_store.database_path)
+    try:
+        claim = reopened.get_gateway_claim(result.gateway_claim_id, PAVILION_CONTROL_DOMAIN)
+        assert claim["state"] == "indeterminate"
+        assert claim["receipt_recorded_at"] is None
+        obligation = reopened.get_obligation(
+            f"pavilion-obligation-{result.effect_intent_id}", PAVILION_CONTROL_DOMAIN
+        )
+        assert obligation is not None
+        assert obligation.state is ReconciliationState.PENDING
+        assert obligation.control_domain == PAVILION_CONTROL_DOMAIN
+        assert obligation.effect_intent_id == result.effect_intent_id
+        assert obligation.dispatch_id == result.effect_dispatch_id
+        assert obligation.provider_reconcilability is ProviderReconcilability.NONE
+        assert reopened.get_reservation(
+            result.authority_reservation_id, PAVILION_CONTROL_DOMAIN
+        ).disposition is AuthorityDisposition.RESERVED
+    finally:
+        reopened.close()
+
+
+def test_subprocess_timeout_persistence_failure_raises_coordinator_error(
+    tmp_path: Path,
+    delegation_registry: DelegationGrantRegistry,
+    active_delegation_grant: AuthoritativeDelegationGrant,
+    durable_store: DurableEffectStore,
+    gateway: GovernedEffectGateway,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    coordinator = CanonicalPavilionCoordinator(
+        durable_store=durable_store,
+        delegation_registry=delegation_registry,
+        gateway=gateway,
+        adapter_path=tmp_path / "canonical-adapter",
+    )
+
+    def timeout_run(*args: Any, **kwargs: Any) -> Any:
+        envelope = json.loads(kwargs["input"])
+        gateway.verify_and_consume_permit(
+            envelope["permit_token"], envelope["control_domain"]
+        )
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+
+    def fail_obligation_write() -> None:
+        raise RuntimeError("injected timeout persistence failure")
+
+    monkeypatch.setattr(subprocess, "run", timeout_run)
+    durable_store._test_fail_indeterminate_obligation_write = fail_obligation_write
+    request = make_test_request(active_delegation_grant)
+    with pytest.raises(CoordinatorError, match="Failed to durably record indeterminate effect"):
+        coordinator.coordinate(request)
+
+    durable_store.close()
+    reopened = DurableEffectStore(durable_store.database_path)
+    try:
+        claims_connection = reopened._connect()
+        try:
+            claims = claims_connection.execute(
+                "SELECT gateway_claim_id, effect_intent_id, state FROM effect_gateway_claims"
+            ).fetchall()
+        finally:
+            claims_connection.close()
+        assert len(claims) == 1
+        assert claims[0][2] == "handoff_started"
+        assert reopened.get_obligation(
+            f"pavilion-obligation-{claims[0][1]}", PAVILION_CONTROL_DOMAIN
+        ) is None
+    finally:
+        reopened.close()
 
 
 def test_nothing_landed_releases_authority(

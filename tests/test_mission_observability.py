@@ -16,6 +16,9 @@ from federation.effect_safety import (
     AuthorityReservation,
     EffectDispatch,
     EffectIntent,
+    ProviderReconcilability,
+    ReconciliationObligation,
+    ReconciliationState,
 )
 from federation.mission_observability import (
     MissionObservability,
@@ -209,10 +212,21 @@ def _make_claim_indeterminate(
         control_domain=intent.control_domain,
         now=NOW + timedelta(minutes=3),
     )
-    store.record_gateway_result(
+    store.record_indeterminate_with_obligation(
         gateway_claim_id=claim_id,
         control_domain=intent.control_domain,
-        effect_status="indeterminate",
+        obligation=ReconciliationObligation(
+            obligation_id=f"obligation-{intent.effect_intent_id}",
+            effect_intent_id=intent.effect_intent_id,
+            dispatch_id=dispatch.dispatch_id,
+            state=ReconciliationState.PENDING,
+            provider_reconcilability=ProviderReconcilability.PROVIDER_OPERATION_LOOKUP,
+            next_probe_at=None,
+            probe_history=(),
+            terminal_disposition=None,
+            created_at=NOW + timedelta(minutes=4),
+            control_domain=intent.control_domain,
+        ),
         now=NOW + timedelta(minutes=4),
     )
     return verifier

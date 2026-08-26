@@ -50,6 +50,8 @@ from federation.effect_safety import (
     EffectIntent,
     EffectState,
     ProviderReconcilability,
+    ReconciliationObligation,
+    ReconciliationState,
 )
 from pavilionos.authorization_envelope import PavilionAuthorizationEnvelope
 
@@ -335,6 +337,7 @@ class CanonicalPavilionCoordinator:
                 if result.returncode != 0:
                     # Adapter error after authorization - effect indeterminate
                     return self._handle_indeterminate(
+                        gateway_request=gateway_request,
                         effect_intent_id=effect_intent_id,
                         effect_dispatch_id=effect_dispatch_id,
                         authority_reservation_id=authority_reservation_id,
@@ -347,6 +350,7 @@ class CanonicalPavilionCoordinator:
                     receipt_data = json.loads(result.stdout)
                 except json.JSONDecodeError as exc:
                     return self._handle_indeterminate(
+                        gateway_request=gateway_request,
                         effect_intent_id=effect_intent_id,
                         effect_dispatch_id=effect_dispatch_id,
                         authority_reservation_id=authority_reservation_id,
@@ -356,14 +360,18 @@ class CanonicalPavilionCoordinator:
 
             except subprocess.TimeoutExpired:
                 return self._handle_indeterminate(
+                    gateway_request=gateway_request,
                     effect_intent_id=effect_intent_id,
                     effect_dispatch_id=effect_dispatch_id,
                     authority_reservation_id=authority_reservation_id,
                     gateway_claim_id=gateway_claim_id,
                     detail="Adapter subprocess timed out after authorization",
                 )
+            except CoordinatorError:
+                raise
             except Exception as exc:
                 return self._handle_indeterminate(
+                    gateway_request=gateway_request,
                     effect_intent_id=effect_intent_id,
                     effect_dispatch_id=effect_dispatch_id,
                     authority_reservation_id=authority_reservation_id,
@@ -400,7 +408,10 @@ class CanonicalPavilionCoordinator:
                     "observations": adapter_receipt.observations,
                 }
             except Exception as exc:
+                if isinstance(exc, CoordinatorError):
+                    raise
                 return self._handle_indeterminate(
+                    gateway_request=gateway_request,
                     effect_intent_id=effect_intent_id,
                     effect_dispatch_id=effect_dispatch_id,
                     authority_reservation_id=authority_reservation_id,
@@ -424,8 +435,9 @@ class CanonicalPavilionCoordinator:
                 )
                 receipt_recorded = True
             except Exception as exc:
-                # Receipt recording failure doesn't change effect truth
-                pass
+                raise CoordinatorError(
+                    f"Failed to durably record gateway receipt: {exc}"
+                ) from exc
 
         # Step 13: Determine authority disposition
         if effect_status == EffectState.NOTHING_LANDED:
@@ -452,15 +464,38 @@ class CanonicalPavilionCoordinator:
             effect_dispatch_id=effect_dispatch_id,
         )
 
-        try:
-            self.gateway.record_effect_result(
-                gateway_claim_id=gateway_claim_id,
+        if effect_status is EffectState.INDETERMINATE:
+            obligation = ReconciliationObligation(
+                obligation_id=gateway_result.reconciliation_obligation_id,
+                effect_intent_id=effect_intent_id,
+                dispatch_id=effect_dispatch_id,
+                state=ReconciliationState.PENDING,
+                provider_reconcilability=gateway_request.provider_reconcilability,
+                next_probe_at=None,
+                probe_history=(),
+                terminal_disposition=None,
+                created_at=self._now(),
                 control_domain=PAVILION_CONTROL_DOMAIN,
-                result=gateway_result,
             )
-        except Exception as exc:
-            # Result recording failure doesn't change effect truth
-            pass
+            try:
+                self.gateway.record_indeterminate_with_obligation(
+                    gateway_request, gateway_result, obligation
+                )
+            except Exception as exc:
+                raise CoordinatorError(
+                    f"Failed to durably record indeterminate effect: {exc}"
+                ) from exc
+        else:
+            try:
+                self.gateway.record_effect_result(
+                    gateway_claim_id=gateway_claim_id,
+                    control_domain=PAVILION_CONTROL_DOMAIN,
+                    result=gateway_result,
+                )
+            except Exception as exc:
+                raise CoordinatorError(
+                    f"Failed to durably record effect result: {exc}"
+                ) from exc
 
         return CoordinatorResult(
             task_succeeded=task_succeeded,
@@ -477,6 +512,7 @@ class CanonicalPavilionCoordinator:
 
     def _handle_indeterminate(
         self,
+        gateway_request: GatewayEffectRequest,
         effect_intent_id: str,
         effect_dispatch_id: str,
         authority_reservation_id: str,
@@ -484,7 +520,37 @@ class CanonicalPavilionCoordinator:
         detail: str,
     ) -> CoordinatorResult:
         """Handle indeterminate effect after HANDOFF_STARTED."""
-        # Effect may have landed - cannot classify as NOTHING_LANDED
+        obligation_id = f"pavilion-obligation-{effect_intent_id}"
+        result = GatewayEffectResult(
+            task_succeeded=False,
+            task_error=detail,
+            effect_status=EffectState.INDETERMINATE,
+            dispatch_attempted=True,
+            handoff_started=True,
+            receipt_recorded=False,
+            authority_disposition=AuthorityDisposition.RESERVED,
+            reconciliation_required=True,
+            reconciliation_obligation_id=obligation_id,
+            gateway_claim_id=gateway_claim_id,
+            effect_intent_id=effect_intent_id,
+            effect_dispatch_id=effect_dispatch_id,
+        )
+        obligation = ReconciliationObligation(
+            obligation_id=obligation_id,
+            effect_intent_id=effect_intent_id,
+            dispatch_id=effect_dispatch_id,
+            state=ReconciliationState.PENDING,
+            provider_reconcilability=gateway_request.provider_reconcilability,
+            next_probe_at=None,
+            probe_history=(),
+            terminal_disposition=None,
+            created_at=self._now(),
+            control_domain=PAVILION_CONTROL_DOMAIN,
+        )
+        try:
+            self.gateway.record_indeterminate_with_obligation(gateway_request, result, obligation)
+        except Exception as exc:
+            raise CoordinatorError(f"Failed to durably record indeterminate effect: {exc}") from exc
         return CoordinatorResult(
             task_succeeded=False,
             task_error=detail,

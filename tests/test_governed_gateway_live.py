@@ -1042,7 +1042,7 @@ def test_multiprocess_claim_race_50_iterations(tmp_path: Path) -> None:
 def test_full_happy_path_to_terminal(tmp_path: Path) -> None:
     """Test full happy path: claim -> permit -> consume -> receipt -> terminal."""
     from federation.effect_safety import AuthorityDisposition, EffectState
-    from federation.effect_gateway import GatewayEffectResult
+    from federation.effect_gateway import GatewayEffectResult, GatewayStateError
 
     db_path = tmp_path / "store.sqlite3"
     store = DurableEffectStore(db_path)
@@ -1232,7 +1232,7 @@ def test_terminal_state_rewrite_rejected(tmp_path: Path) -> None:
 def test_indeterminate_result_from_handoff(tmp_path: Path) -> None:
     """Test INDETERMINATE result transitions from HANDOFF_STARTED."""
     from federation.effect_safety import AuthorityDisposition, EffectState
-    from federation.effect_gateway import GatewayEffectResult
+    from federation.effect_gateway import GatewayEffectResult, GatewayStateError
 
     db_path = tmp_path / "store.sqlite3"
     store = DurableEffectStore(db_path)
@@ -1262,11 +1262,12 @@ def test_indeterminate_result_from_handoff(tmp_path: Path) -> None:
         effect_dispatch_id="dispatch-1",
     )
 
-    gateway.record_effect_result(claim_id, control_domain="domain-a", result=result)
+    with pytest.raises(GatewayStateError):
+        gateway.record_effect_result(claim_id, control_domain="domain-a", result=result)
 
     claim = store.get_gateway_claim(claim_id, "domain-a")
-    assert claim["state"] == "indeterminate"
-    assert claim["terminal_at"] is not None
+    assert claim["state"] == "handoff_started"
+    assert claim["terminal_at"] is None
 
 
 def test_indeterminate_preserves_reserved_authority(tmp_path: Path) -> None:
@@ -1301,7 +1302,14 @@ def test_indeterminate_preserves_reserved_authority(tmp_path: Path) -> None:
         effect_dispatch_id="dispatch-1",
     )
 
-    gateway.record_effect_result(claim_id, control_domain="domain-a", result=result)
+    from federation.effect_safety import ReconciliationObligation, ReconciliationState, ProviderReconcilability
+    obligation = ReconciliationObligation(
+        obligation_id="reconcile-1", effect_intent_id="intent-1", dispatch_id="dispatch-1",
+        state=ReconciliationState.PENDING, provider_reconcilability=request.provider_reconcilability,
+        next_probe_at=None, probe_history=(), terminal_disposition=None,
+        created_at=_utc(1, 10, 0), control_domain="domain-a",
+    )
+    gateway.record_indeterminate_with_obligation(request, result, obligation)
 
     # Verify reservation still RESERVED
     conn = sqlite3.connect(str(db_path))
