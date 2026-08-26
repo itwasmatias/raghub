@@ -9,7 +9,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 from tools.integrated_demonstrator.test_service import (
-    TestServiceStore,
+    DemoServiceStore,
     create_server,
 )
 
@@ -52,7 +52,7 @@ def live_service(tmp_path):
 
 
 def test_initial_state_is_version_one_and_zero_operations(tmp_path):
-    store = TestServiceStore(tmp_path / "service.sqlite3")
+    store = DemoServiceStore(tmp_path / "service.sqlite3")
 
     state = store.read_state()
 
@@ -62,7 +62,7 @@ def test_initial_state_is_version_one_and_zero_operations(tmp_path):
 
 
 def test_deploy_v2_changes_external_state_exactly_once(tmp_path):
-    store = TestServiceStore(tmp_path / "service.sqlite3")
+    store = DemoServiceStore(tmp_path / "service.sqlite3")
 
     first, first_transitioned = store.deploy_v2()
     second, second_transitioned = store.deploy_v2()
@@ -81,10 +81,10 @@ def test_deploy_v2_changes_external_state_exactly_once(tmp_path):
 def test_state_survives_store_reopen(tmp_path):
     database_path = tmp_path / "service.sqlite3"
 
-    first_store = TestServiceStore(database_path)
+    first_store = DemoServiceStore(database_path)
     first_store.deploy_v2()
 
-    reopened = TestServiceStore(database_path)
+    reopened = DemoServiceStore(database_path)
     state = reopened.read_state()
 
     assert state.active_version == 2
@@ -143,7 +143,7 @@ def test_drop_response_commits_effect_before_confirmation_is_lost(live_service):
 
     # Read using a fresh store instance to prove the committed external state
     # does not depend on the HTTP handler's in-memory objects.
-    reopened = TestServiceStore(database_path)
+    reopened = DemoServiceStore(database_path)
     state = reopened.read_state()
 
     assert state.active_version == 2

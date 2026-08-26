@@ -36,7 +36,7 @@ class TestServiceState:
     successful_transition_count: int
 
 
-class TestServiceStore:
+class DemoServiceStore:
     """Durable singleton state for the isolated external test service."""
 
     def __init__(self, database_path: str | Path) -> None:
@@ -181,14 +181,14 @@ class TestServiceHTTPServer(ThreadingHTTPServer):
     def __init__(
         self,
         server_address: tuple[str, int],
-        store: TestServiceStore,
+        store: DemoServiceStore,
     ) -> None:
         self.store = store
         super().__init__(server_address, TestServiceHandler)
 
 
 class TestServiceHandler(BaseHTTPRequestHandler):
-    """Bounded HTTP interface over TestServiceStore."""
+    """Bounded HTTP interface over DemoServiceStore."""
 
     server: TestServiceHTTPServer
 
@@ -264,5 +264,5 @@ def create_server(
 
     return TestServiceHTTPServer(
         (host, port),
-        TestServiceStore(database_path),
+        DemoServiceStore(database_path),
     )
