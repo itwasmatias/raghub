@@ -846,6 +846,141 @@ def _create_v1_database_with_data(db_path: Path):
         conn.close()
 
 
+def test_check_semantics_reject_threshold_change_and_accept_sqlite_identifier_quotes():
+    """Required CHECK meaning is structural, while harmless quoting is accepted."""
+    store = MissionRuntimeStore()
+    for expression, expected_to_raise in (
+        ("generation >= 10", True),
+        ('"generation" >= 1', False),
+        ("`generation` >= 1", False),
+        ("[generation] >= 1", False),
+    ):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute(
+                f"CREATE TABLE probe (generation INTEGER NOT NULL CHECK ({expression}))"
+            )
+            if expected_to_raise:
+                with pytest.raises(MissionSchemaVersionError):
+                    store._validate_check_constraints(conn, "probe", ["generation >= 1"])
+            else:
+                store._validate_check_constraints(conn, "probe", ["generation >= 1"])
+        finally:
+            conn.close()
+
+
+def test_idempotent_acquire_constructor_failure_does_not_change_durable_state(monkeypatch, tmp_path):
+    """A failure building an idempotent result cannot report after commit."""
+    import federation.mission_runtime_store as runtime_store_module
+
+    store = MissionRuntimeStore(tmp_path / "acquire-atomicity.db")
+    spec = MissionSpecification(
+        mission_id="mission-idempotent-acquire-atomicity",
+        control_domain="test-domain",
+        objective="Test",
+        owner_identity="owner",
+        metadata={},
+    )
+    store.create_mission(spec)
+    store.acquire_controller_lease(spec.control_domain, spec.mission_id, "controller-a")
+
+    class FailingLease:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("result construction failure")
+
+    monkeypatch.setattr(runtime_store_module, "MissionControllerLease", FailingLease)
+    with pytest.raises(RuntimeError, match="result construction failure"):
+        store.acquire_controller_lease(spec.control_domain, spec.mission_id, "controller-a")
+
+    conn = sqlite3.connect(store._db_path)
+    try:
+        assert conn.execute(
+            "SELECT generation, controller_id FROM mission_controller_leases "
+            "WHERE control_domain=? AND mission_id=?",
+            (spec.control_domain, spec.mission_id),
+        ).fetchall() == [(1, "controller-a")]
+    finally:
+        conn.close()
+
+
+def test_idempotent_release_constructor_failure_does_not_change_durable_state(monkeypatch, tmp_path):
+    """A failure building an already-released result remains failure-atomic."""
+    import federation.mission_runtime_store as runtime_store_module
+
+    store = MissionRuntimeStore(tmp_path / "release-atomicity.db")
+    spec = MissionSpecification(
+        mission_id="mission-idempotent-release-atomicity",
+        control_domain="test-domain",
+        objective="Test",
+        owner_identity="owner",
+        metadata={},
+    )
+    store.create_mission(spec)
+    store.acquire_controller_lease(spec.control_domain, spec.mission_id, "controller-a")
+    store.release_controller_lease(spec.control_domain, spec.mission_id, "controller-a", 1)
+
+    class FailingLease:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("result construction failure")
+
+    monkeypatch.setattr(runtime_store_module, "MissionControllerLease", FailingLease)
+    with pytest.raises(RuntimeError, match="result construction failure"):
+        store.release_controller_lease(spec.control_domain, spec.mission_id, "controller-a", 1)
+
+    conn = sqlite3.connect(store._db_path)
+    try:
+        released_at = conn.execute(
+            "SELECT released_at FROM mission_controller_leases "
+            "WHERE control_domain=? AND mission_id=? AND generation=1",
+            (spec.control_domain, spec.mission_id),
+        ).fetchone()[0]
+        assert released_at is not None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("operation", ["renew", "release"])
+def test_mutating_lease_result_construction_failure_rolls_back(monkeypatch, tmp_path, operation):
+    """Renew/release never expose a failed result after committing its UPDATE."""
+    import federation.mission_runtime_store as runtime_store_module
+
+    store = MissionRuntimeStore(tmp_path / f"{operation}-mutation-atomicity.db")
+    spec = MissionSpecification(
+        mission_id=f"mission-{operation}-mutation-atomicity",
+        control_domain="test-domain",
+        objective="Test",
+        owner_identity="owner",
+        metadata={},
+    )
+    store.create_mission(spec)
+    original = store.acquire_controller_lease(spec.control_domain, spec.mission_id, "controller-a")
+    original_expires_at = original.expires_at.isoformat()
+
+    class FailingLease:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("result construction failure")
+
+    monkeypatch.setattr(runtime_store_module, "MissionControllerLease", FailingLease)
+    with pytest.raises(RuntimeError, match="result construction failure"):
+        if operation == "renew":
+            store.renew_controller_lease(spec.control_domain, spec.mission_id, "controller-a", 1)
+        else:
+            store.release_controller_lease(spec.control_domain, spec.mission_id, "controller-a", 1)
+
+    conn = sqlite3.connect(store._db_path)
+    try:
+        renewed_at, expires_at, released_at = conn.execute(
+            "SELECT renewed_at, expires_at, released_at FROM mission_controller_leases "
+            "WHERE control_domain=? AND mission_id=? AND generation=1",
+            (spec.control_domain, spec.mission_id),
+        ).fetchone()
+        assert expires_at == original_expires_at
+        assert renewed_at == original.renewed_at.isoformat()
+        assert released_at is None
+    finally:
+        conn.close()
+
+
 def test_migration_v1_to_v2_preserves_data():
     """Test that v1 → v2 migration preserves all existing data."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:

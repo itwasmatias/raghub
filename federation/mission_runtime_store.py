@@ -502,7 +502,7 @@ class MissionRuntimeStore:
                     )
 
                 # Normalize type for comparison (SQLite may return uppercase)
-                if actual_type.upper() != expected_type.upper():
+                if not isinstance(actual_type, str) or actual_type.upper() != expected_type.upper():
                     raise MissionSchemaVersionError(
                         f"Table {table_name} column '{actual_name}': "
                         f"expected type {expected_type}, found {actual_type}"
@@ -907,12 +907,15 @@ class MissionRuntimeStore:
                 i += 1
                 continue
 
-            # Quoted identifiers: "name" or `name`
-            if expr[i] in ('"', '`'):
+            # Quoted identifiers: "name", `name`, or [name].  SQLite treats
+            # these forms equivalently; normalize them to the same identifier
+            # token without treating quoted text as SQL syntax.
+            if expr[i] in ('"', '`', '['):
                 quote = expr[i]
+                closing_quote = ']' if quote == '[' else quote
                 i += 1
                 identifier = ''
-                while i < len(expr) and expr[i] != quote:
+                while i < len(expr) and expr[i] != closing_quote:
                     identifier += expr[i]
                     i += 1
                 i += 1  # skip closing quote
@@ -2202,8 +2205,11 @@ class MissionRuntimeStore:
                 if is_active:
                     if latest_controller_id == controller_id:
                         # Same controller - return existing lease (idempotent)
-                        conn.commit()
-                        return MissionControllerLease(
+                        # Construct the public result while the transaction is
+                        # still open.  A constructor/validation failure must
+                        # roll back the transaction, even for this idempotent
+                        # no-write path.
+                        lease = MissionControllerLease(
                             control_domain=control_domain,
                             mission_id=mission_id,
                             controller_id=latest_controller_id,
@@ -2213,6 +2219,8 @@ class MissionRuntimeStore:
                             expires_at=latest_expires_at,
                             released_at=latest_released_at,
                         )
+                        conn.commit()
+                        return lease
                     else:
                         # Different controller - conflict
                         raise MissionControllerLeaseConflictError(
@@ -2494,8 +2502,10 @@ class MissionRuntimeStore:
                 # Idempotent release check
                 if latest_released_at is not None:
                     # Already released - idempotent return
-                    conn.commit()
-                    return MissionControllerLease(
+                    # Build the caller-visible value before commit so a
+                    # validation failure cannot be reported after durable
+                    # state has become observable.
+                    lease = MissionControllerLease(
                         control_domain=control_domain,
                         mission_id=mission_id,
                         controller_id=controller_id,
@@ -2505,6 +2515,8 @@ class MissionRuntimeStore:
                         expires_at=latest_expires_at,
                         released_at=latest_released_at,
                     )
+                    conn.commit()
+                    return lease
 
                 # Release lease
                 released_at = now
