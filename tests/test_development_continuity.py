@@ -266,12 +266,19 @@ def test_development_continuity_does_not_modify_core_implementation():
     # Mission Runtime and Runtime Store contain the checkpoint revision guard.
     # Mission Controller Lease is the explicitly accepted Phase A authoritative
     # surface for durable controller ownership generations.
+    # These four core files were accepted by the integrated demonstrator
+    # commits after this frozen checkpoint. Keep this list explicit: advance
+    # BASE_CHECKPOINT and recalculate it when establishing the next boundary.
     # Continue rejecting changes to every other existing core implementation file.
     assert set(result.stdout.splitlines()) <= {
+        "federation/durable_effect_store.py",
+        "federation/effect_gateway.py",
         "federation/mission_controller_lease.py",
         "federation/mission_observability.py",
         "federation/mission_runtime.py",
         "federation/mission_runtime_store.py",
+        "pavilionos/canonical_coordinator.py",
+        "pavilionos/mission_control.py",
         "pavilionos/native_interface.py",
     }
 

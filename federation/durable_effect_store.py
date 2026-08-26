@@ -2123,7 +2123,10 @@ class DurableEffectStore:
 
         try:
             with self._connection() as connection:
-                with connection:
+                # Serialize the read/check/write as one writer transaction so
+                # concurrent callers cannot both pass the terminal-state check.
+                connection.execute("BEGIN IMMEDIATE")
+                try:
                     existing = connection.execute(
                         """
                         SELECT effect_intent_id, dispatch_id, state, provider_reconcilability,
@@ -2169,14 +2172,15 @@ class DurableEffectStore:
                         )
                         if existing_payload == incoming_payload:
                             return
-                        if existing[2] not in (
-                            ReconciliationState.PENDING.value,
-                            ReconciliationState.IN_PROGRESS.value,
+                        if existing[2] in {
+                            ReconciliationState.NOT_REQUIRED.value,
                             ReconciliationState.RESOLVED.value,
-                        ):
+                            ReconciliationState.ESCALATED.value,
+                        }:
                             raise ValueError(
                                 f"obligation {obligation.obligation_id} in domain {domain} "
-                                f"cannot regress from {existing[2]!r} to {obligation.state.value!r}"
+                                f"cannot regress or rewrite terminal state {existing[2]!r} "
+                                f"to {obligation.state.value!r}"
                             )
                         connection.execute(
                             """
@@ -2226,6 +2230,10 @@ class DurableEffectStore:
                                 serialized_created_at,
                             ),
                         )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
 
         except sqlite3.OperationalError as e:
             if "locked" in str(e).lower():
@@ -3255,24 +3263,52 @@ class DurableEffectStore:
         """Persist an independent read/verification observation on an obligation."""
         domain = validate_domain_id(control_domain, "control_domain")
         self._ensure_open()
-        obligation = self.get_obligation(obligation_id, domain)
-        if obligation is None or obligation.state is not ReconciliationState.RESOLVED:
-            raise ValueError("verification requires a resolved reconciliation obligation")
-        history = tuple((*obligation.probe_history, dict(observation)))
-        self.store_obligation(
-            ReconciliationObligation(
-                obligation_id=obligation.obligation_id,
-                effect_intent_id=obligation.effect_intent_id,
-                dispatch_id=obligation.dispatch_id,
-                state=obligation.state,
-                provider_reconcilability=obligation.provider_reconcilability,
-                next_probe_at=None,
-                probe_history=history,
-                terminal_disposition=None,
-                created_at=obligation.created_at,
-                control_domain=domain,
-            )
-        )
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    row = connection.execute(
+                        """
+                        SELECT state, probe_history_json
+                        FROM reconciliation_obligations
+                        WHERE control_domain = ? AND obligation_id = ?
+                        """,
+                        (domain, obligation_id),
+                    ).fetchone()
+                    if row is None or row[0] != ReconciliationState.RESOLVED.value:
+                        raise ValueError("verification requires a resolved reconciliation obligation")
+                    history = list(_deserialize_probe_history(row[1]))
+                    history.append(dict(observation))
+                    updated = connection.execute(
+                        """
+                        UPDATE reconciliation_obligations
+                           SET probe_history_json = ?
+                         WHERE control_domain = ? AND obligation_id = ?
+                           AND state = ?
+                        """,
+                        (
+                            _serialize_probe_history(tuple(history)),
+                            domain,
+                            obligation_id,
+                            ReconciliationState.RESOLVED.value,
+                        ),
+                    )
+                    if updated.rowcount != 1:
+                        raise ConcurrencyConflictError(
+                            f"obligation {obligation_id!r} changed during observation append"
+                        )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower():
+                raise ConcurrencyConflictError(
+                    f"Database lock timeout while appending observation to obligation {obligation_id}"
+                ) from e
+            raise StorageIntegrityError(
+                f"Failed to append reconciliation observation: {e}"
+            ) from e
 
     def revoke_permit(
         self,
