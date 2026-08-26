@@ -281,6 +281,7 @@ def reconcile_and_verify_governed_dispatch(
     root: str | Path, *, starting_repository_sha: str
 ) -> ReconciliationVerificationRun:
     """Complete the accepted ambiguous dispatch with two independent GET reads."""
+    root = Path(root)
     ambiguous = run_governed_ambiguous_dispatch(root)
     domain = "integrated-demonstrator"
     effect_store = DurableEffectStore(ambiguous.effect_database_path)
@@ -303,6 +304,10 @@ def reconcile_and_verify_governed_dispatch(
         "effect_dispatch_id": ambiguous.effect_dispatch_id,
         "gateway_claim_id": ambiguous.gateway_claim_id,
         "reconciliation_obligation_id": ambiguous.reconciliation_obligation_id,
+    })
+    checkpoint("retry_blocked", {
+        "reason": "effect outcome is INDETERMINATE; automatic retry is forbidden",
+        "dispatch_attempt_count": 1,
     })
     checkpoint("reconciliation_started", {"read_only": True})
     first_observation = _read_service_state(ambiguous.service_database_path)
@@ -366,6 +371,14 @@ def reconcile_and_verify_governed_dispatch(
     report = {
         "evidence_schema_version": "missionaryx.integrated-demonstrator-evidence.v0.1",
         "mission_id": ambiguous.mission_id,
+        "mission_objective": "Deploy version 2 of this test service, verify that it became active, and produce evidence of the completed change.",
+        "participants": ["mission controller", "reasoning participant", "governed executor", "independent verifier"],
+        "authority": {
+            "test service deployment": "allowed",
+            "test service state read": "allowed",
+            "production": "denied",
+            "spending": "denied",
+        },
         "control_domain": domain,
         "starting_repository_commit_sha": starting_repository_sha,
         "effect_intent_id": ambiguous.effect_intent_id,
@@ -385,6 +398,7 @@ def reconcile_and_verify_governed_dispatch(
         "duplicate_deployment_count": max(0, verification_observation["deployment_attempt_count"] - 1),
         "injected_failure_count": 1,
         "final_mission_state": lifecycle.value,
+        "mission_revision": mission_store.get_mission(domain, ambiguous.mission_id)[2],
         "final_effect_posture": EffectState.SOMETHING_LANDED.value,
         "reconciliation_state": None if obligation is None else obligation.state.value,
         "authority_disposition": None if reservation is None else reservation.disposition.value,
@@ -398,6 +412,11 @@ def reconcile_and_verify_governed_dispatch(
             "mission_completed",
         ],
     }
+    report_path = root / "evidence-report.json"
+    report_path.write_text(
+        json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
     reopened_effects.close()
     effect_store.close()
     return ReconciliationVerificationRun(ambiguous=ambiguous, report=report)
