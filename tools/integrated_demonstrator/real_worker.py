@@ -752,7 +752,6 @@ class OpenAICompatibleProposalWorker:
                     provider_identity=self.provider_identity,
                     model_identity=self.model_identity,
                 ),
-                "temperature": 0,
                 "max_tokens": self._config.max_output_tokens,
                 "stream": False,
             },

@@ -30,6 +30,18 @@ export MISSIONARYX_WORKER_API_KEY=local-secret
 python -m tools.integrated_demonstrator.run_demo --worker-mode live
 ```
 
+The bounded request body omits sampling controls such as `temperature`, `top_p`,
+`frequency_penalty`, and `presence_penalty`. For Crucible's bounded API profile,
+configure its accepted output ceiling explicitly:
+
+```bash
+export MISSIONARYX_WORKER_MAX_OUTPUT_TOKENS=128
+```
+
+The generic adapter default remains `512`; provider-specific output limits are
+configured through the existing environment setting rather than imposed on every
+OpenAI-compatible worker.
+
 Authentication is required by default. A provider that intentionally does not
 require bearer authentication must be configured explicitly with
 `MISSIONARYX_WORKER_REQUIRE_AUTH=0`. The key is loaded only from the environment,

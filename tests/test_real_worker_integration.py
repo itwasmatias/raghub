@@ -186,10 +186,16 @@ def test_openai_request_is_bounded_non_streaming_and_bearer_authenticated() -> N
     method, path, headers, body = server.requests[-1]
     assert (method, path) == ("POST", "/v1/chat/completions")
     assert headers["Authorization"] == "Bearer top-secret-token"
+    assert set(body) == {"model", "messages", "max_tokens", "stream"}
     assert body["model"] == "model-1"
     assert body["stream"] is False
-    assert body["temperature"] == 0
     assert body["max_tokens"] == 256
+    assert {
+        "temperature",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+    }.isdisjoint(body)
     assert "tools" not in body
     prompt = "\n".join(message["content"] for message in body["messages"])
     assert "Deploy test service v2" in prompt
