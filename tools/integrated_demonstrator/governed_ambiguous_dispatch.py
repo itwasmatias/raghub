@@ -371,6 +371,7 @@ def reconcile_and_verify_governed_dispatch(
     report = {
         "evidence_schema_version": "missionaryx.integrated-demonstrator-evidence.v0.1",
         "mission_id": ambiguous.mission_id,
+        "human_mission_title": "Deploy test service v2 and verify the result",
         "mission_objective": "Deploy version 2 of this test service, verify that it became active, and produce evidence of the completed change.",
         "participants": ["mission controller", "reasoning participant", "governed executor", "independent verifier"],
         "authority": {

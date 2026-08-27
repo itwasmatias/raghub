@@ -28,6 +28,9 @@ artifacts/integrated-demonstrator/<run-id>/
 The directory contains the evidence report, Mission Control HTML and JSON
 projection, three durable SQLite stores, an operator summary, and a manifest.
 Open `mission-control.html` in a browser to view the evidence-backed story.
+The rendered page uses the Mission Control v0.2 presentation layer — see
+`docs/mission-control-demonstrator-v0.2.md` for a walkthrough of what a viewer
+should notice and how every displayed value is bound to persisted evidence.
 
 ## Verify a preserved run
 

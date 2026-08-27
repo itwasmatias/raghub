@@ -3,7 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pavilionos.mission_control import load_mission_control_view, render_mission_control
+from pavilionos.mission_control import (
+    PRESENTATION_SCHEMA_VERSION,
+    load_mission_control_view,
+    render_mission_control,
+)
 from tools.integrated_demonstrator.governed_ambiguous_dispatch import (
     reconcile_and_verify_governed_dispatch,
 )
@@ -27,15 +31,19 @@ def test_mission_control_projects_persisted_story_and_counters(tmp_path: Path):
     assert view.ready is True
     assert view.summary == {
         "mission_status": "COMPLETED",
-        "active_version": 2,
-        "deployment_attempts": 1,
+        "human_mission_title": "Deploy test service v2 and verify the result",
+        "external_result": "v2 active",
+        "evidence_verified": True,
+        "authorized_operations": 1,
         "successful_transitions": 1,
-        "duplicate_deployments": 0,
-        "unauthorized_operations": 0,
         "injected_failures": 1,
+        "duplicate_operations": 0,
+        "unauthorized_operations": 0,
+        "active_version": 2,
         "final_effect_posture": "something_landed",
-        "effect_history": "INDETERMINATE → SOMETHING_LANDED",
+        "effect_history": "INDETERMINATE \u2192 SOMETHING_LANDED",
         "independent_verification": "PASS",
+        "retry_blocked": True,
     }
     labels = [item["label"] for item in view.timeline]
     assert "Response lost; effect is INDETERMINATE" in labels
@@ -43,9 +51,24 @@ def test_mission_control_projects_persisted_story_and_counters(tmp_path: Path):
     assert "Effect resolved as SOMETHING_LANDED" in labels
     assert "Independent verifier: PASS" in labels
     assert result.ambiguous.retry_blocked is True
+    # The observation timeline no longer emits duplicate "Mission checkpoint recorded"
+    # rows; each labeled checkpoint appears exactly once.
+    assert labels.count("Mission checkpoint recorded") == 0
+
     html = render_mission_control(view)
-    assert "Machine-readable evidence report" in html
+    assert "Deploy test service v2 and verify the result" in html
     assert "INDETERMINATE" in html
+    assert "Automatic retry BLOCKED" in html
+    assert "Machine-readable evidence report" in html
+    assert "Technical details" in html
+    assert "@media" in html
+    projected = view.to_dict()
+    assert projected["schema_version"] == PRESENTATION_SCHEMA_VERSION
+    assert projected["authority"]["allowed"] == [
+        "test service deployment",
+        "test service state read",
+    ]
+    assert projected["authority"]["denied"] == ["production", "spending"]
 
 
 def test_missing_or_inconsistent_report_never_renders_success(tmp_path: Path):
@@ -81,4 +104,5 @@ def test_machine_readable_report_is_deterministic_and_accessible(tmp_path: Path)
     report = json.loads((tmp_path / "evidence-report.json").read_text())
     assert report["mission_id"] == result.ambiguous.mission_id
     assert report["effect_history"] == ["indeterminate", "something_landed"]
+    assert report["human_mission_title"] == "Deploy test service v2 and verify the result"
     assert json.loads(json.dumps(view.evidence_report, sort_keys=True)) == report

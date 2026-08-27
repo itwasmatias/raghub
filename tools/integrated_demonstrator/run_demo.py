@@ -303,6 +303,9 @@ def _validate_sources(run_directory: Path) -> _ValidatedSources:
     report = _load_json_object(run_directory / "evidence-report.json", canonical=True)
     _require_report_value(report, "evidence_schema_version", EVIDENCE_SCHEMA_VERSION)
     _require_report_value(report, "control_domain", CONTROL_DOMAIN)
+    _require_report_value(
+        report, "human_mission_title", "Deploy test service v2 and verify the result"
+    )
     mission_id = report.get("mission_id")
     if type(mission_id) is not str or not mission_id:
         raise DemonstratorVerificationError("evidence report mission_id is invalid")
