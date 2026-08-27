@@ -211,6 +211,28 @@ def test_openai_request_is_bounded_non_streaming_and_bearer_authenticated() -> N
     assert result.external_endpoint_contacted is True
 
 
+def test_worker_prompt_requires_only_required_fields_and_omits_optional_output() -> None:
+    with _server() as (server, base_url):
+        OpenAICompatibleProposalWorker(_config(base_url)).propose(_request())
+
+    body = server.requests[-1][3]
+    user_payload = json.loads(body["messages"][1]["content"])
+    contract = user_payload["required_proposal_contract"]
+    assert contract["required_fields"] == [
+        "schema_version",
+        "request_id",
+        "worker_identity",
+        "provider_identity",
+        "model_identity",
+        "proposed_action",
+    ]
+    assert "optional_fields" not in contract
+    instruction = user_payload["instruction"].lower()
+    assert "emit only the required_fields" in instruction
+    assert "omit rationale and proposal_timestamp" in instruction
+    assert "emit no prose" in instruction
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -251,6 +273,21 @@ def test_valid_proposal_is_typed_and_identity_bound() -> None:
             expected_provider_identity="openai-compatible",
             expected_model_identity="model-1",
         )
+
+
+def test_parser_and_authority_still_accept_existing_optional_proposal_fields() -> None:
+    proposal = parse_worker_proposal(
+        json.dumps(_proposal(proposal_timestamp="2026-08-27T22:25:03Z")),
+        expected_request_id="request-1",
+        expected_worker_identity="worker-1",
+        expected_provider_identity="openai-compatible",
+        expected_model_identity="model-1",
+    )
+    assert proposal.rationale == "The bounded objective requires test service v2."
+    assert proposal.proposal_timestamp == "2026-08-27T22:25:03Z"
+    decision = authorize_proposal(proposal, ALLOWED_DEMO_ACTIONS)
+    assert decision.authorized is True
+    assert decision.authorized_arguments == {"target": "test-service", "version": "v2"}
 
 
 @pytest.mark.parametrize(

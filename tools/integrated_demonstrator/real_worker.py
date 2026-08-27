@@ -592,7 +592,6 @@ def _prompt_messages(
             "type": "deploy_service_version",
             "arguments": {"target": "string", "version": "string"},
         },
-        "optional_fields": ["rationale", "proposal_timestamp"],
     }
     system = (
         "You are a bounded MissionaryX proposal worker. You are not an authority and cannot "
@@ -612,7 +611,11 @@ def _prompt_messages(
             "model_identity": model_identity,
         },
         "required_proposal_contract": contract,
-        "instruction": "Select exactly one catalog entry without changing any arguments.",
+        "instruction": (
+            "Select exactly one catalog entry without changing any arguments. "
+            "Emit only the required_fields. Omit rationale and proposal_timestamp. "
+            "Emit no prose."
+        ),
     }
     return [
         {"role": "system", "content": system},
