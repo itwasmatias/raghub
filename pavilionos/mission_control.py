@@ -1,4 +1,4 @@
-"""Mission Control presentation v0.2 for the Integrated Demonstrator.
+"""Mission Control presentation v0.3 for the Integrated Demonstrator.
 
 This module is a read-only projection over authoritative sources: the mission
 runtime store, the durable effect store, and the persisted evidence report.
@@ -24,12 +24,25 @@ from federation.durable_effect_store import DurableEffectStore
 from pavilionos.native_interface import PavilionNativeInterface
 
 
-PRESENTATION_SCHEMA_VERSION = "missionaryx.mission-control-projection.v0.2"
+PRESENTATION_SCHEMA_VERSION = "missionaryx.mission-control-projection.v0.3"
 HUMAN_MISSION_TITLE = "Deploy test service v2 and verify the result"
 
 
 class MissionControlSourceError(Exception):
     """Persisted source data is absent or contradictory."""
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise MissionControlSourceError(f"evidence report has duplicate key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_non_finite_json(token: str) -> None:
+    raise MissionControlSourceError(f"evidence report has non-finite value: {token}")
 
 
 class _ReadOnlyObservability(Protocol):
@@ -49,6 +62,7 @@ class MissionControlView:
     evidence_report: dict[str, Any] | None
     ready: bool
     source_error: str | None = None
+    worker: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -62,6 +76,7 @@ class MissionControlView:
             "evidence_report_available": self.evidence_report is not None,
             "ready": self.ready,
             "source_error": self.source_error,
+            "worker": self.worker,
         }
 
 
@@ -83,6 +98,11 @@ _EVENT_LABELS = {
 }
 
 _CHECKPOINT_LABELS = {
+    "worker_request_started": "Bounded proposal requested",
+    "worker_readiness_confirmed": "Worker readiness confirmed",
+    "worker_proposal_validated": "Typed worker proposal validated",
+    "worker_authority_authorized": "Proposal authorized by MissionaryX",
+    "worker_execution_bound": "Proposal bound to controlled executor",
     "ambiguous_dispatch_established": "Response lost; effect is INDETERMINATE",
     "retry_blocked": "Automatic retry BLOCKED",
     "reconciliation_started": "Reconciliation started",
@@ -92,6 +112,21 @@ _CHECKPOINT_LABELS = {
 }
 
 _CHECKPOINT_DETAILS = {
+    "worker_request_started": (
+        "The worker received one bounded objective and one allowed-action catalog."
+    ),
+    "worker_readiness_confirmed": (
+        "The configured model endpoint reported ready before proposal generation."
+    ),
+    "worker_proposal_validated": (
+        "MissionaryX parsed one correlated typed proposal as data."
+    ),
+    "worker_authority_authorized": (
+        "MissionaryX independently matched the exact proposal to bounded mission authority."
+    ),
+    "worker_execution_bound": (
+        "Trusted code mapped the authorized arguments to the fixed deployment executor."
+    ),
     "ambiguous_dispatch_established": (
         "MissionaryX could no longer prove whether the deployment had succeeded."
     ),
@@ -128,6 +163,11 @@ _EVENT_SEVERITY = {
 }
 
 _CHECKPOINT_SEVERITY = {
+    "worker_request_started": "step-normal",
+    "worker_readiness_confirmed": "step-normal",
+    "worker_proposal_validated": "step-normal",
+    "worker_authority_authorized": "step-ok",
+    "worker_execution_bound": "step-ok",
     "ambiguous_dispatch_established": "step-warn",
     "retry_blocked": "step-blocked",
     "reconciliation_started": "step-reconcile",
@@ -220,6 +260,235 @@ def _timeline(observation: MissionObservation) -> tuple[dict[str, Any], ...]:
 # ---------------------------------------------------------------------------
 # Evidence-report validation
 
+
+def _checkpoint_payloads(observation: MissionObservation) -> dict[str, dict[str, Any]]:
+    payloads: dict[str, dict[str, Any]] = {}
+    for checkpoint in observation.checkpoints:
+        if not checkpoint.reason:
+            continue
+        try:
+            value = json.loads(checkpoint.progress_data_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise MissionControlSourceError(
+                f"checkpoint {checkpoint.reason!r} is malformed"
+            ) from exc
+        if type(value) is not dict:
+            raise MissionControlSourceError(
+                f"checkpoint {checkpoint.reason!r} is not an object"
+            )
+        if checkpoint.reason in payloads:
+            raise MissionControlSourceError(
+                f"checkpoint {checkpoint.reason!r} is duplicated"
+            )
+        payloads[checkpoint.reason] = value
+    return payloads
+
+
+def _validate_worker_report(
+    observation: MissionObservation,
+    report: dict[str, Any],
+) -> None:
+    worker = report.get("worker")
+    if type(worker) is not dict:
+        raise MissionControlSourceError("worker evidence is missing or invalid")
+    required = {
+        "evidence_schema_version",
+        "request_schema_version",
+        "request_id",
+        "worker_identity",
+        "provider_identity",
+        "model_identity",
+        "role",
+        "mode",
+        "live_external",
+        "external_endpoint_contacted",
+        "readiness",
+        "attempt_count",
+        "retry_count",
+        "retry_attempted",
+        "attempt_failures",
+        "proposal",
+        "proposal_schema_valid",
+        "authority_decision",
+        "execution_permitted",
+        "execution_binding",
+    }
+    if set(worker) != required:
+        raise MissionControlSourceError("worker evidence fields are incomplete or unexpected")
+    if worker["evidence_schema_version"] != "missionaryx.worker-participation-evidence.v0.1":
+        raise MissionControlSourceError("worker evidence schema is unsupported")
+    if worker["request_schema_version"] != "missionaryx.worker-request.v0.1":
+        raise MissionControlSourceError("worker request schema is unsupported")
+    for name in ("request_id", "worker_identity", "provider_identity", "model_identity"):
+        if type(worker[name]) is not str or not worker[name]:
+            raise MissionControlSourceError(f"worker {name} is invalid")
+    if worker["role"] != "proposal_planner":
+        raise MissionControlSourceError("worker role is invalid")
+    if worker["mode"] not in {"deterministic_test", "live_external"}:
+        raise MissionControlSourceError("worker mode is invalid")
+    if type(worker["live_external"]) is not bool or (
+        worker["live_external"] != (worker["mode"] == "live_external")
+    ):
+        raise MissionControlSourceError("worker live-mode evidence is contradictory")
+    if (
+        type(worker["external_endpoint_contacted"]) is not bool
+        or worker["external_endpoint_contacted"] is not worker["live_external"]
+    ):
+        raise MissionControlSourceError(
+            "worker external-contact evidence is contradictory"
+        )
+    if worker["readiness"] != {"category": "worker_ready", "http_status": 200}:
+        raise MissionControlSourceError("worker readiness evidence does not prove ready")
+    attempts = worker["attempt_count"]
+    if type(attempts) is not int or attempts not in {1, 2}:
+        raise MissionControlSourceError("worker attempt count is invalid")
+    failures = worker["attempt_failures"]
+    if (
+        type(failures) is not list
+        or len(failures) != attempts - 1
+        or any(
+            item not in {"worker_timeout", "worker_transport_failure"}
+            for item in failures
+        )
+        or worker["retry_count"] != attempts - 1
+        or worker["retry_attempted"] is not (attempts > 1)
+    ):
+        raise MissionControlSourceError("worker retry evidence is inconsistent")
+
+    proposal = worker["proposal"]
+    required_proposal_fields = {
+        "schema_version",
+        "request_id",
+        "worker_identity",
+        "provider_identity",
+        "model_identity",
+        "proposed_action",
+    }
+    expected_action = {
+        "type": "deploy_service_version",
+        "arguments": {"target": "test-service", "version": "v2"},
+    }
+    if (
+        type(proposal) is not dict
+        or not required_proposal_fields.issubset(proposal)
+        or set(proposal) - required_proposal_fields
+        - {"rationale", "proposal_timestamp"}
+        or proposal.get("schema_version") != "missionaryx.worker-proposal.v0.1"
+        or proposal.get("request_id") != worker["request_id"]
+        or proposal.get("worker_identity") != worker["worker_identity"]
+        or proposal.get("provider_identity") != worker["provider_identity"]
+        or proposal.get("model_identity") != worker["model_identity"]
+        or proposal.get("proposed_action") != expected_action
+        or worker["proposal_schema_valid"] is not True
+    ):
+        raise MissionControlSourceError("worker proposal evidence is inconsistent")
+    authority = worker["authority_decision"]
+    if authority != {
+        "authorized": True,
+        "reason_category": "exact_catalog_match",
+        "action_type": "deploy_service_version",
+        "authorized_arguments": {"target": "test-service", "version": "v2"},
+    }:
+        raise MissionControlSourceError("worker authority evidence is inconsistent")
+    binding = worker["execution_binding"]
+    if (
+        type(binding) is not dict
+        or set(binding)
+        != {"action_type", "arguments", "operation_digest", "executor"}
+        or binding.get("action_type") != "deploy_service_version"
+        or binding.get("arguments") != expected_action["arguments"]
+        or binding.get("executor") != "integrated-demonstrator-controlled-http"
+        or type(binding.get("operation_digest")) is not str
+        or len(binding["operation_digest"]) != 64
+        or worker["execution_permitted"] is not True
+    ):
+        raise MissionControlSourceError("worker execution binding is inconsistent")
+    executed = report.get("executed_operation")
+    if (
+        type(executed) is not dict
+        or set(executed)
+        != {
+            "action_type",
+            "arguments",
+            "http_method",
+            "path",
+            "target_version",
+            "operation_digest",
+        }
+        or executed.get("action_type") != binding["action_type"]
+        or executed.get("arguments") != binding["arguments"]
+        or executed.get("operation_digest") != binding["operation_digest"]
+        or executed.get("http_method") != "POST"
+        or executed.get("path") != "/deploy-v2"
+        or executed.get("target_version") != 2
+    ):
+        raise MissionControlSourceError(
+            "worker proposal does not match the executed operation"
+        )
+
+    checkpoints = _checkpoint_payloads(observation)
+    required_checkpoints = {
+        "worker_request_started",
+        "worker_readiness_confirmed",
+        "worker_proposal_validated",
+        "worker_authority_authorized",
+        "worker_execution_bound",
+    }
+    if not required_checkpoints.issubset(checkpoints):
+        raise MissionControlSourceError("persisted worker checkpoint history is incomplete")
+    if any(
+        checkpoints[name].get("request_id") != worker["request_id"]
+        for name in required_checkpoints
+    ):
+        raise MissionControlSourceError("worker checkpoint correlation is inconsistent")
+    request_started = checkpoints["worker_request_started"]
+    if (
+        request_started.get("request_schema_version")
+        != worker["request_schema_version"]
+        or request_started.get("worker_identity") != worker["worker_identity"]
+        or request_started.get("provider_identity") != worker["provider_identity"]
+        or request_started.get("model_identity") != worker["model_identity"]
+        or request_started.get("live_external") is not worker["live_external"]
+        or request_started.get("allowed_action_catalog")
+        != [
+            {
+                "type": "deploy_service_version",
+                "arguments": {"target": "test-service", "version": "v2"},
+                "description": "Deploy only version v2 of the isolated test service.",
+            }
+        ]
+    ):
+        raise MissionControlSourceError("worker request checkpoint is inconsistent")
+    if (
+        checkpoints["worker_readiness_confirmed"].get("category")
+        != worker["readiness"]["category"]
+        or checkpoints["worker_readiness_confirmed"].get("http_status")
+        != worker["readiness"]["http_status"]
+    ):
+        raise MissionControlSourceError("worker readiness checkpoint is inconsistent")
+    if checkpoints["worker_proposal_validated"].get("proposal") != proposal:
+        raise MissionControlSourceError("worker proposal checkpoint does not match evidence")
+    if (
+        checkpoints["worker_proposal_validated"].get("attempt_count")
+        != worker["attempt_count"]
+        or checkpoints["worker_proposal_validated"].get("attempt_failures")
+        != worker["attempt_failures"]
+        or checkpoints["worker_authority_authorized"].get("authorized_arguments")
+        != authority["authorized_arguments"]
+        or checkpoints["worker_authority_authorized"].get("reason_category")
+        != authority["reason_category"]
+        or checkpoints["worker_execution_bound"].get("action_type")
+        != binding["action_type"]
+        or checkpoints["worker_execution_bound"].get("arguments")
+        != binding["arguments"]
+        or checkpoints["worker_execution_bound"].get("operation_digest")
+        != binding["operation_digest"]
+        or checkpoints["worker_execution_bound"].get("executor")
+        != binding["executor"]
+    ):
+        raise MissionControlSourceError("worker authority or execution checkpoint drifted")
+
+
 def _validate_report(observation: MissionObservation, report: dict[str, Any]) -> None:
     required = {
         "mission_id",
@@ -236,6 +505,8 @@ def _validate_report(observation: MissionObservation, report: dict[str, Any]) ->
         "independent_verification_result",
         "reconciliation_result",
         "authority",
+        "worker",
+        "executed_operation",
     }
     missing = sorted(required - report.keys())
     if missing:
@@ -306,6 +577,7 @@ def _validate_report(observation: MissionObservation, report: dict[str, Any]) ->
         raise MissionControlSourceError(
             "persisted retry-blocked checkpoint is missing"
         )
+    _validate_worker_report(observation, report)
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +599,21 @@ def _evidence_rows(report: dict[str, Any]) -> tuple[dict[str, Any], ...]:
     reservation_disposition = report.get("authority_disposition")
     reconciliation_state = report.get("reconciliation_state")
     return (
+        {
+            "label": "Worker proposal",
+            "status": "Verified",
+            "detail": (
+                f"{report['worker']['provider_identity']} / "
+                f"{report['worker']['model_identity']} returned one typed proposal"
+            ),
+            "ok": report["worker"]["proposal_schema_valid"] is True,
+        },
+        {
+            "label": "Proposal authority",
+            "status": "Verified",
+            "detail": "Exact proposal arguments matched bounded MissionaryX authority",
+            "ok": report["worker"]["authority_decision"]["authorized"] is True,
+        },
         {
             "label": "Mission state",
             "status": "Verified",
@@ -429,6 +716,34 @@ def _technical(report: dict[str, Any]) -> dict[str, Any]:
         "persisted_evidence_history_count": report.get(
             "persisted_evidence_history_count"
         ),
+        "worker_request_id": report.get("worker", {}).get("request_id"),
+        "worker_identity": report.get("worker", {}).get("worker_identity"),
+        "worker_provider": report.get("worker", {}).get("provider_identity"),
+        "worker_model": report.get("worker", {}).get("model_identity"),
+        "worker_proposal_schema": report.get("worker", {})
+        .get("proposal", {})
+        .get("schema_version"),
+        "worker_attempt_count": report.get("worker", {}).get("attempt_count"),
+    }
+
+
+def _worker_projection(report: dict[str, Any]) -> dict[str, Any]:
+    worker = report["worker"]
+    return {
+        "worker_identity": worker["worker_identity"],
+        "provider": worker["provider_identity"],
+        "model": worker["model_identity"],
+        "role": "Proposal / Planner",
+        "mode": (
+            "External/live configured worker"
+            if worker["live_external"]
+            else "Deterministic test infrastructure"
+        ),
+        "live_external": worker["live_external"],
+        "external_endpoint_contacted": worker["external_endpoint_contacted"],
+        "proposal": "Deploy test service v2",
+        "proposal_schema_status": "Proposal validated",
+        "authority_status": "Operation authorized",
     }
 
 
@@ -474,6 +789,7 @@ def build_mission_control_view(
         authority = _authority_breakdown(evidence_report)
         evidence = _evidence_rows(evidence_report)
         technical = _technical(evidence_report)
+        worker = _worker_projection(evidence_report)
         return MissionControlView(
             mission={
                 "mission_id": native.mission_id,
@@ -488,6 +804,7 @@ def build_mission_control_view(
             technical=technical,
             evidence_report=evidence_report,
             ready=True,
+            worker=worker,
         )
     except Exception as exc:
         return MissionControlView(
@@ -522,8 +839,16 @@ def load_mission_control_view(
         )
         path = Path(report_path)
         try:
-            report = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
-        except (OSError, json.JSONDecodeError) as exc:
+            report = (
+                json.loads(
+                    path.read_text(encoding="utf-8"),
+                    object_pairs_hook=_reject_duplicate_json_keys,
+                    parse_constant=_reject_non_finite_json,
+                )
+                if path.exists()
+                else None
+            )
+        except (OSError, json.JSONDecodeError, MissionControlSourceError) as exc:
             return MissionControlView(
                 mission={},
                 summary={},
@@ -772,6 +1097,27 @@ main {
     grid-template-columns: 1fr 1fr;
     gap: 24px;
 }
+.worker-summary {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 16px;
+    margin-top: 18px;
+}
+.worker-summary div {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+    background: rgba(255,255,255,0.02);
+}
+.worker-summary span {
+    display: block;
+    color: var(--muted);
+    font-size: 0.74rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-bottom: 5px;
+}
+.worker-summary strong { font-size: 0.95rem; }
 .authority-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -891,7 +1237,7 @@ details.subdetail ul { margin: 0; padding-left: 18px; }
     .topbar { padding: 14px 18px; flex-direction: column; gap: 4px; align-items: flex-start; }
     .hero { padding: 22px 20px; }
     .hero h1 { font-size: 1.5rem; }
-    .grid-two { grid-template-columns: 1fr; }
+    .grid-two, .worker-summary { grid-template-columns: 1fr; }
     .authority-grid { grid-template-columns: 1fr; }
     .timeline li { grid-template-columns: 1fr; gap: 6px; }
     .timeline li .when { font-size: 0.72rem; }
@@ -952,6 +1298,40 @@ def _render_hero(view: MissionControlView) -> str:
         f"<li><span class=\"num\">{escape(str(s['unauthorized_operations']))}</span>"
         "<span class=\"label\">unauthorized operation(s)</span></li>"
         "</ul>"
+        "</section>"
+    )
+
+
+def _render_worker(view: MissionControlView) -> str:
+    worker = view.worker
+    if worker is None:
+        return ""
+    facts = (
+        ("Proposal", worker["proposal"]),
+        ("Schema", worker["proposal_schema_status"]),
+        ("Authority", worker["authority_status"]),
+    )
+    fact_html = "".join(
+        f"<div><span>{escape(str(label))}</span><strong>{escape(str(value))}</strong></div>"
+        for label, value in facts
+    )
+    rows = (
+        ("Provider", worker["provider"]),
+        ("Model", worker["model"]),
+        ("Role", worker["role"]),
+        ("Participation mode", worker["mode"]),
+    )
+    details = "".join(
+        f"<div><dt>{escape(str(label))}</dt><dd>{escape(str(value))}</dd></div>"
+        for label, value in rows
+    )
+    return (
+        "<section class=\"panel\" aria-labelledby=\"worker-title\">"
+        "<h2 id=\"worker-title\">Worker</h2>"
+        "<p class=\"panel-lede\">The model participated as a bounded proposal worker; "
+        "MissionaryX retained authorization and execution control.</p>"
+        f"<dl class=\"metrics-list\">{details}</dl>"
+        f"<div class=\"worker-summary\">{fact_html}</div>"
         "</section>"
     )
 
@@ -1068,6 +1448,12 @@ def _render_technical(view: MissionControlView) -> str:
         ("Starting repository commit", "starting_repository_commit_sha"),
         ("Evidence schema", "evidence_schema_version"),
         ("Reconciliation probe count", "persisted_evidence_history_count"),
+        ("Worker request", "worker_request_id"),
+        ("Worker identity", "worker_identity"),
+        ("Worker provider", "worker_provider"),
+        ("Worker model", "worker_model"),
+        ("Worker proposal schema", "worker_proposal_schema"),
+        ("Worker attempt count", "worker_attempt_count"),
     )
     rows = "".join(
         f"<div><dt>{escape(label)}</dt><dd>{escape(str(tech.get(key, 'unknown')))}</dd></div>"
@@ -1102,7 +1488,7 @@ def _render_technical(view: MissionControlView) -> str:
 
 
 def render_mission_control(view: MissionControlView) -> str:
-    """Render the v0.2 Mission Control HTML from a projected view."""
+    """Render the v0.3 Mission Control HTML from a projected view."""
     if not view.ready:
         return _render_incomplete(view)
     parts = [
@@ -1124,6 +1510,7 @@ def render_mission_control(view: MissionControlView) -> str:
         "</header>",
         "<main>",
         _render_hero(view),
+        _render_worker(view),
         _render_timeline(view),
         "<div class=\"grid-two\">",
         _render_authority(view),

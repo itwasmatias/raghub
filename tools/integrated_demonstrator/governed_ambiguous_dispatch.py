@@ -41,6 +41,28 @@ from federation.effect_safety import (
 from federation.mission_runtime import MissionRuntime
 from federation.mission_runtime_store import MissionRuntimeStore
 from tools.integrated_demonstrator.test_service import create_server
+from tools.integrated_demonstrator.real_worker import (
+    ALLOWED_DEMO_ACTIONS,
+    WORKER_REQUEST_SCHEMA_VERSION,
+    DeterministicProposalWorker,
+    ProposalAuthorityDecision,
+    ProposalAuthorityDenied,
+    ProposalCorrelationError,
+    ProposalRequest,
+    ProposalSchemaError,
+    ProposalWorker,
+    WorkerAuthenticationError,
+    WorkerIntegrationError,
+    WorkerNotReadyError,
+    WorkerProposalResult,
+    WorkerProtocolError,
+    WorkerReadiness,
+    WorkerReadinessCategory,
+    WorkerReadinessError,
+    WorkerTimeoutError,
+    WorkerTransportError,
+    authorize_proposal,
+)
 from research_mission.evidence_spine import (
     EvidencePointer,
     EvidenceSpine,
@@ -62,6 +84,8 @@ class AmbiguousDispatchRun:
     transport_error: str
     retry_blocked: bool
     gateway_request: GatewayEffectRequest
+    worker_evidence: dict[str, Any]
+    executed_operation: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +100,293 @@ def _digest(value: object) -> str:
     ).hexdigest()
 
 
-def run_governed_ambiguous_dispatch(root: str | Path) -> AmbiguousDispatchRun:
+WORKER_PARTICIPATION_EVIDENCE_SCHEMA_VERSION = (
+    "missionaryx.worker-participation-evidence.v0.1"
+)
+_WORKER_REQUEST_ID = "worker-request-integrated-demonstrator-v2"
+
+
+def _worker_failure_category(error: WorkerIntegrationError) -> str:
+    if isinstance(error, WorkerAuthenticationError):
+        return "worker_authentication_failure"
+    if isinstance(error, WorkerTimeoutError):
+        return "worker_request_timeout"
+    if isinstance(error, WorkerTransportError):
+        return "worker_transport_failure"
+    if isinstance(error, ProposalCorrelationError):
+        return "proposal_correlation_invalid"
+    if isinstance(error, ProposalSchemaError):
+        return "proposal_schema_invalid"
+    if isinstance(error, WorkerReadinessError):
+        return "worker_readiness_invalid"
+    if isinstance(error, WorkerProtocolError):
+        return "worker_protocol_invalid"
+    return "worker_attempt_failed"
+
+
+def _trusted_executor_binding(
+    decision: ProposalAuthorityDecision,
+) -> dict[str, Any]:
+    """Map one exact authorized catalog entry to fixed trusted executor data."""
+    expected_arguments = {"target": "test-service", "version": "v2"}
+    if (
+        type(decision) is not ProposalAuthorityDecision
+        or not decision.authorized
+        or decision.action_type != "deploy_service_version"
+        or decision.authorized_arguments != expected_arguments
+    ):
+        raise ProposalAuthorityDenied(
+            "authorized proposal has no trusted controlled-executor mapping"
+        )
+    operation = {
+        "action_type": "deploy_service_version",
+        "arguments": expected_arguments,
+        "http_method": "POST",
+        "path": "/deploy-v2",
+        "target_version": 2,
+    }
+    operation["operation_digest"] = _digest(
+        {
+            "method": operation["http_method"],
+            "path": operation["path"],
+            "target_version": operation["target_version"],
+        }
+    )
+    return operation
+
+
+def _obtain_authorized_worker_proposal(
+    *,
+    worker: ProposalWorker,
+    mission_id: str,
+    checkpoint,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Obtain one typed proposal and bind it to the fixed executor catalog."""
+    for name in ("worker_identity", "provider_identity", "model_identity"):
+        value = getattr(worker, name, None)
+        if type(value) is not str or not value:
+            raise WorkerProtocolError(f"worker {name} is invalid")
+    if type(getattr(worker, "live_external", None)) is not bool:
+        raise WorkerProtocolError("worker live_external marker is invalid")
+
+    proposal_request = ProposalRequest(
+        request_id=_WORKER_REQUEST_ID,
+        mission_id=mission_id,
+        objective="Deploy test service v2 and verify the result.",
+        current_state={
+            "active_version": "v1",
+            "effect_posture": "nothing_landed",
+        },
+        allowed_actions=ALLOWED_DEMO_ACTIONS,
+    )
+    checkpoint(
+        "worker_request_started",
+        {
+            "request_id": proposal_request.request_id,
+            "request_schema_version": WORKER_REQUEST_SCHEMA_VERSION,
+            "worker_identity": worker.worker_identity,
+            "provider_identity": worker.provider_identity,
+            "model_identity": worker.model_identity,
+            "role": "proposal_planner",
+            "live_external": worker.live_external,
+            "allowed_action_catalog": [
+                action.to_prompt_dict() for action in proposal_request.allowed_actions
+            ],
+        },
+    )
+    try:
+        readiness = worker.check_readiness()
+    except WorkerIntegrationError as exc:
+        checkpoint(
+            "worker_readiness_failed",
+            {
+                "request_id": proposal_request.request_id,
+                "reason_category": _worker_failure_category(exc),
+                "attempt_count": exc.attempt_count,
+                "attempt_failures": list(exc.attempt_failures),
+            },
+        )
+        raise
+    if type(readiness) is not WorkerReadiness:
+        error = WorkerReadinessError("worker readiness result is invalid")
+        checkpoint(
+            "worker_readiness_failed",
+            {
+                "request_id": proposal_request.request_id,
+                "reason_category": _worker_failure_category(error),
+                "attempt_count": 0,
+                "attempt_failures": [],
+            },
+        )
+        raise error
+    if readiness.category is not WorkerReadinessCategory.WORKER_READY:
+        checkpoint(
+            "worker_not_ready",
+            {
+                "request_id": proposal_request.request_id,
+                "worker_status": "worker_not_ready",
+                "reason_category": readiness.category.value,
+                "http_status": readiness.http_status,
+            },
+        )
+        raise WorkerNotReadyError(
+            f"worker is not ready: {readiness.category.value}"
+        )
+    checkpoint(
+        "worker_readiness_confirmed",
+        {
+            "request_id": proposal_request.request_id,
+            "category": readiness.category.value,
+            "http_status": readiness.http_status,
+        },
+    )
+
+    try:
+        result = worker.propose(proposal_request)
+    except WorkerIntegrationError as exc:
+        checkpoint(
+            "worker_proposal_rejected",
+            {
+                "request_id": proposal_request.request_id,
+                "reason_category": _worker_failure_category(exc),
+                "attempt_count": exc.attempt_count,
+                "attempt_failures": list(exc.attempt_failures),
+                "proposal_schema_valid": False,
+                "execution_permitted": False,
+            },
+        )
+        raise
+    if type(result) is not WorkerProposalResult:
+        error = WorkerProtocolError("worker proposal result is invalid")
+        checkpoint(
+            "worker_proposal_rejected",
+            {
+                "request_id": proposal_request.request_id,
+                "reason_category": _worker_failure_category(error),
+                "attempt_count": 0,
+                "attempt_failures": [],
+                "proposal_schema_valid": False,
+                "execution_permitted": False,
+            },
+        )
+        raise error
+    proposal = result.proposal
+    if (
+        proposal.request_id != proposal_request.request_id
+        or proposal.worker_identity != worker.worker_identity
+        or proposal.provider_identity != worker.provider_identity
+        or proposal.model_identity != worker.model_identity
+        or result.live_external is not worker.live_external
+    ):
+        error = ProposalCorrelationError(
+            "accepted proposal identity does not match the configured worker"
+        )
+        checkpoint(
+            "worker_proposal_rejected",
+            {
+                "request_id": proposal_request.request_id,
+                "reason_category": _worker_failure_category(error),
+                "attempt_count": result.attempt_count,
+                "attempt_failures": list(result.attempt_failures),
+                "proposal_schema_valid": False,
+                "execution_permitted": False,
+            },
+        )
+        raise error
+    checkpoint(
+        "worker_proposal_validated",
+        {
+            "request_id": proposal_request.request_id,
+            "proposal_schema_valid": True,
+            "proposal": proposal.evidence_dict(),
+            "attempt_count": result.attempt_count,
+            "attempt_failures": list(result.attempt_failures),
+            "live_external": result.live_external,
+        },
+    )
+
+    try:
+        authority = authorize_proposal(proposal, proposal_request.allowed_actions)
+    except ProposalAuthorityDenied:
+        checkpoint(
+            "worker_authority_denied",
+            {
+                "request_id": proposal_request.request_id,
+                "proposed_action": {
+                    "type": proposal.action_type,
+                    "arguments": proposal.action_arguments,
+                },
+                "authorized": False,
+                "reason_category": "outside_bounded_action_catalog",
+                "execution_permitted": False,
+            },
+        )
+        raise
+    checkpoint(
+        "worker_authority_authorized",
+        {
+            "request_id": proposal_request.request_id,
+            "authorized": True,
+            "reason_category": authority.reason_category,
+            "action_type": authority.action_type,
+            "authorized_arguments": authority.authorized_arguments,
+            "execution_permitted": True,
+        },
+    )
+    executor_operation = _trusted_executor_binding(authority)
+    checkpoint(
+        "worker_execution_bound",
+        {
+            "request_id": proposal_request.request_id,
+            "action_type": executor_operation["action_type"],
+            "arguments": executor_operation["arguments"],
+            "operation_digest": executor_operation["operation_digest"],
+            "executor": "integrated-demonstrator-controlled-http",
+        },
+    )
+    evidence = {
+        "evidence_schema_version": WORKER_PARTICIPATION_EVIDENCE_SCHEMA_VERSION,
+        "request_schema_version": WORKER_REQUEST_SCHEMA_VERSION,
+        "request_id": proposal_request.request_id,
+        "worker_identity": worker.worker_identity,
+        "provider_identity": worker.provider_identity,
+        "model_identity": worker.model_identity,
+        "role": "proposal_planner",
+        "mode": "live_external" if result.live_external else "deterministic_test",
+        "live_external": result.live_external,
+        "external_endpoint_contacted": result.external_endpoint_contacted,
+        "readiness": {
+            "category": readiness.category.value,
+            "http_status": readiness.http_status,
+        },
+        "attempt_count": result.attempt_count,
+        "retry_count": result.attempt_count - 1,
+        "retry_attempted": result.attempt_count > 1,
+        "attempt_failures": list(result.attempt_failures),
+        "proposal": proposal.evidence_dict(),
+        "proposal_schema_valid": True,
+        "authority_decision": {
+            "authorized": True,
+            "reason_category": authority.reason_category,
+            "action_type": authority.action_type,
+            "authorized_arguments": authority.authorized_arguments,
+        },
+        "execution_permitted": True,
+        "execution_binding": {
+            "action_type": executor_operation["action_type"],
+            "arguments": executor_operation["arguments"],
+            "operation_digest": executor_operation["operation_digest"],
+            "executor": "integrated-demonstrator-controlled-http",
+        },
+    }
+    return evidence, executor_operation
+
+
+def run_governed_ambiguous_dispatch(
+    root: str | Path,
+    *,
+    proposal_worker: ProposalWorker | None = None,
+) -> AmbiguousDispatchRun:
     """Run exactly one v1 -> v2 deployment with confirmation deliberately lost."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -86,7 +396,6 @@ def run_governed_ambiguous_dispatch(root: str | Path) -> AmbiguousDispatchRun:
     dispatch_id = "effect-dispatch-integrated-demonstrator-v2"
     reservation_id = "authority-reservation-integrated-demonstrator-v2"
     obligation_id = "reconciliation-integrated-demonstrator-v2"
-    operation_digest = _digest({"method": "POST", "path": "/deploy-v2", "target_version": 2})
     now = datetime.now(timezone.utc)
 
     mission_database_path = root / "mission.sqlite3"
@@ -98,13 +407,34 @@ def run_governed_ambiguous_dispatch(root: str | Path) -> AmbiguousDispatchRun:
     mission_runtime.create_mission(
         mission_id,
         domain,
-        "Govern one bounded deployment and preserve ambiguous outcome truth",
+        "Deploy test service v2 and verify the result.",
         "mission-owner",
         agent_identity="deployment-agent",
-        constraints="Exactly one POST /deploy-v2; no retry while unresolved",
+        constraints=(
+            "One bounded worker proposal; exactly one authorized POST /deploy-v2; "
+            "no retry while unresolved"
+        ),
     )
     _, _, revision, _ = mission_runtime.get_mission(domain, mission_id)
     mission_runtime.start_mission(domain, mission_id, revision, "demonstrator started")
+
+    def checkpoint(event: str, payload: dict[str, Any]) -> None:
+        _, lifecycle, current_revision, _ = mission_runtime.get_mission(domain, mission_id)
+        mission_runtime.create_checkpoint(
+            domain,
+            mission_id,
+            lifecycle,
+            progress_data={"observability_event": event, **payload},
+            reason=event,
+            expected_revision=current_revision,
+        )
+
+    worker_evidence, executor_operation = _obtain_authorized_worker_proposal(
+        worker=proposal_worker or DeterministicProposalWorker(),
+        mission_id=mission_id,
+        checkpoint=checkpoint,
+    )
+    operation_digest = executor_operation["operation_digest"]
 
     effect_store = DurableEffectStore(effect_database_path)
     gateway = GovernedEffectGateway(effect_store)
@@ -190,7 +520,7 @@ def run_governed_ambiguous_dispatch(root: str | Path) -> AmbiguousDispatchRun:
     error: str | None = None
     try:
         request_http = Request(
-            f"http://{host}:{port}/deploy-v2",
+            f"http://{host}:{port}{executor_operation['path']}",
             data=b"",
             method="POST",
             headers={"X-MissionaryX-Drop-Response": "1"},
@@ -254,6 +584,8 @@ def run_governed_ambiguous_dispatch(root: str | Path) -> AmbiguousDispatchRun:
         transport_error=error,
         retry_blocked=retry_blocked,
         gateway_request=request,
+        worker_evidence=worker_evidence,
+        executed_operation=executor_operation,
     )
 
 
@@ -278,11 +610,17 @@ def _read_service_state(database_path: Path) -> dict[str, int]:
 
 
 def reconcile_and_verify_governed_dispatch(
-    root: str | Path, *, starting_repository_sha: str
+    root: str | Path,
+    *,
+    starting_repository_sha: str,
+    proposal_worker: ProposalWorker | None = None,
 ) -> ReconciliationVerificationRun:
     """Complete the accepted ambiguous dispatch with two independent GET reads."""
     root = Path(root)
-    ambiguous = run_governed_ambiguous_dispatch(root)
+    ambiguous = run_governed_ambiguous_dispatch(
+        root,
+        proposal_worker=proposal_worker,
+    )
     domain = "integrated-demonstrator"
     effect_store = DurableEffectStore(ambiguous.effect_database_path)
     mission_store = MissionRuntimeStore(ambiguous.mission_database_path)
@@ -369,11 +707,16 @@ def reconcile_and_verify_governed_dispatch(
     _, lifecycle, _, _ = mission_store.get_mission(domain, ambiguous.mission_id)
     history = [] if obligation is None else list(obligation.probe_history)
     report = {
-        "evidence_schema_version": "missionaryx.integrated-demonstrator-evidence.v0.1",
+        "evidence_schema_version": "missionaryx.integrated-demonstrator-evidence.v0.2",
         "mission_id": ambiguous.mission_id,
         "human_mission_title": "Deploy test service v2 and verify the result",
         "mission_objective": "Deploy version 2 of this test service, verify that it became active, and produce evidence of the completed change.",
-        "participants": ["mission controller", "reasoning participant", "governed executor", "independent verifier"],
+        "participants": [
+            "mission controller",
+            f"proposal worker:{ambiguous.worker_evidence['worker_identity']}",
+            "governed executor",
+            "independent verifier",
+        ],
         "authority": {
             "test service deployment": "allowed",
             "test service state read": "allowed",
@@ -382,6 +725,8 @@ def reconcile_and_verify_governed_dispatch(
         },
         "control_domain": domain,
         "starting_repository_commit_sha": starting_repository_sha,
+        "worker": ambiguous.worker_evidence,
+        "executed_operation": ambiguous.executed_operation,
         "effect_intent_id": ambiguous.effect_intent_id,
         "effect_dispatch_id": ambiguous.effect_dispatch_id,
         "gateway_claim_id": ambiguous.gateway_claim_id,
@@ -405,6 +750,11 @@ def reconcile_and_verify_governed_dispatch(
         "authority_disposition": None if reservation is None else reservation.disposition.value,
         "persisted_evidence_history_count": len(history),
         "observability_events": [
+            "worker_request_started",
+            "worker_readiness_confirmed",
+            "worker_proposal_validated",
+            "worker_authority_authorized",
+            "worker_execution_bound",
             "ambiguous_dispatch_established",
             "reconciliation_started",
             "external_state_observed",
@@ -425,5 +775,6 @@ def reconcile_and_verify_governed_dispatch(
 
 __all__ = [
     "AmbiguousDispatchRun", "ReconciliationVerificationRun",
+    "WORKER_PARTICIPATION_EVIDENCE_SCHEMA_VERSION",
     "run_governed_ambiguous_dispatch", "reconcile_and_verify_governed_dispatch",
 ]

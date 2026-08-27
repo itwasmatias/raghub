@@ -79,7 +79,7 @@ def test_one_command_success_and_artifact_bundle(tmp_path: Path, capsys) -> None
         "service.sqlite3",
     } == {path.name for path in run_directory.iterdir() if path.is_file()}
     manifest = json.loads((run_directory / "manifest.json").read_text())
-    assert manifest["schema_version"] == "missionaryx.integrated-demonstrator-manifest.v0.1"
+    assert manifest["schema_version"] == "missionaryx.integrated-demonstrator-manifest.v0.2"
     assert manifest["run_id"] == "cli-run"
     assert manifest["verification_result"] == "pass"
     assert {item["path"] for item in manifest["artifacts"]} == {

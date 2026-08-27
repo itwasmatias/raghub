@@ -36,10 +36,17 @@ from pavilionos.mission_control import (
 from tools.integrated_demonstrator.governed_ambiguous_dispatch import (
     reconcile_and_verify_governed_dispatch,
 )
+from tools.integrated_demonstrator.real_worker import (
+    DeterministicProposalWorker,
+    OpenAICompatibleProposalWorker,
+    OpenAICompatibleWorkerConfig,
+    ProposalWorker,
+    WorkerIntegrationError,
+)
 
 
-DEMONSTRATOR_SCHEMA_VERSION = "missionaryx.integrated-demonstrator-manifest.v0.1"
-EVIDENCE_SCHEMA_VERSION = "missionaryx.integrated-demonstrator-evidence.v0.1"
+DEMONSTRATOR_SCHEMA_VERSION = "missionaryx.integrated-demonstrator-manifest.v0.2"
+EVIDENCE_SCHEMA_VERSION = "missionaryx.integrated-demonstrator-evidence.v0.2"
 CONTROL_DOMAIN = "integrated-demonstrator"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ARTIFACTS_ROOT = REPOSITORY_ROOT / "artifacts" / "integrated-demonstrator"
@@ -299,6 +306,108 @@ def _require_report_value(report: dict[str, Any], name: str, expected: object) -
         )
 
 
+def _validate_worker_evidence(report: dict[str, Any]) -> dict[str, Any]:
+    worker = report.get("worker")
+    if type(worker) is not dict:
+        raise DemonstratorVerificationError("worker participation evidence is missing")
+    for name in ("request_id", "worker_identity", "provider_identity", "model_identity"):
+        if type(worker.get(name)) is not str or not worker[name]:
+            raise DemonstratorVerificationError(f"worker evidence {name} is invalid")
+    _require_report_value(
+        worker,
+        "evidence_schema_version",
+        "missionaryx.worker-participation-evidence.v0.1",
+    )
+    _require_report_value(
+        worker,
+        "request_schema_version",
+        "missionaryx.worker-request.v0.1",
+    )
+    _require_report_value(worker, "role", "proposal_planner")
+    if worker.get("mode") not in {"deterministic_test", "live_external"}:
+        raise DemonstratorVerificationError("worker mode evidence is invalid")
+    if type(worker.get("live_external")) is not bool or worker["live_external"] != (
+        worker["mode"] == "live_external"
+    ):
+        raise DemonstratorVerificationError("worker live-mode evidence is contradictory")
+    if (
+        type(worker.get("external_endpoint_contacted")) is not bool
+        or worker["external_endpoint_contacted"] is not worker["live_external"]
+    ):
+        raise DemonstratorVerificationError(
+            "worker external-contact evidence is contradictory"
+        )
+    _require_report_value(
+        worker,
+        "readiness",
+        {"category": "worker_ready", "http_status": 200},
+    )
+    attempts = worker.get("attempt_count")
+    failures = worker.get("attempt_failures")
+    if (
+        type(attempts) is not int
+        or attempts not in {1, 2}
+        or type(failures) is not list
+        or len(failures) != attempts - 1
+        or any(
+            failure not in {"worker_timeout", "worker_transport_failure"}
+            for failure in failures
+        )
+        or worker.get("retry_count") != attempts - 1
+        or worker.get("retry_attempted") is not (attempts > 1)
+    ):
+        raise DemonstratorVerificationError("worker retry evidence is inconsistent")
+    expected_action = {
+        "type": "deploy_service_version",
+        "arguments": {"target": "test-service", "version": "v2"},
+    }
+    proposal = worker.get("proposal")
+    if (
+        type(proposal) is not dict
+        or proposal.get("schema_version") != "missionaryx.worker-proposal.v0.1"
+        or proposal.get("request_id") != worker["request_id"]
+        or proposal.get("worker_identity") != worker["worker_identity"]
+        or proposal.get("provider_identity") != worker["provider_identity"]
+        or proposal.get("model_identity") != worker["model_identity"]
+        or proposal.get("proposed_action") != expected_action
+        or worker.get("proposal_schema_valid") is not True
+    ):
+        raise DemonstratorVerificationError("typed worker proposal evidence is invalid")
+    authority = worker.get("authority_decision")
+    if authority != {
+        "authorized": True,
+        "reason_category": "exact_catalog_match",
+        "action_type": "deploy_service_version",
+        "authorized_arguments": expected_action["arguments"],
+    }:
+        raise DemonstratorVerificationError("worker authority decision is invalid")
+    binding = worker.get("execution_binding")
+    if (
+        type(binding) is not dict
+        or binding.get("action_type") != expected_action["type"]
+        or binding.get("arguments") != expected_action["arguments"]
+        or binding.get("executor") != "integrated-demonstrator-controlled-http"
+        or type(binding.get("operation_digest")) is not str
+        or not _SHA256_RE.fullmatch(binding["operation_digest"])
+        or worker.get("execution_permitted") is not True
+    ):
+        raise DemonstratorVerificationError("worker execution binding is invalid")
+    executed = report.get("executed_operation")
+    if (
+        type(executed) is not dict
+        or executed.get("action_type") != binding["action_type"]
+        or executed.get("arguments") != binding["arguments"]
+        or executed.get("operation_digest") != binding["operation_digest"]
+        or executed.get("http_method") != "POST"
+        or executed.get("path") != "/deploy-v2"
+        or executed.get("target_version") != 2
+    ):
+        raise DemonstratorVerificationError(
+            "executed operation does not exactly match the authorized worker proposal"
+        )
+    return worker
+
+
 def _validate_sources(run_directory: Path) -> _ValidatedSources:
     report = _load_json_object(run_directory / "evidence-report.json", canonical=True)
     _require_report_value(report, "evidence_schema_version", EVIDENCE_SCHEMA_VERSION)
@@ -309,6 +418,7 @@ def _validate_sources(run_directory: Path) -> _ValidatedSources:
     mission_id = report.get("mission_id")
     if type(mission_id) is not str or not mission_id:
         raise DemonstratorVerificationError("evidence report mission_id is invalid")
+    worker = _validate_worker_evidence(report)
 
     service_state = _read_service_state(run_directory / "service.sqlite3")
     expected_service_state = {
@@ -363,6 +473,10 @@ def _validate_sources(run_directory: Path) -> _ValidatedSources:
             raise DemonstratorVerificationError("authority was not consumed by reconciliation")
         if intent is None or dispatch is None:
             raise DemonstratorVerificationError("intent or dispatch evidence is missing")
+        if intent.operation_digest != worker["execution_binding"]["operation_digest"]:
+            raise DemonstratorVerificationError(
+                "effect intent digest does not match the authorized worker proposal"
+            )
         if (
             claim["effect_intent_id"] != intent.effect_intent_id
             or claim["effect_dispatch_id"] != dispatch.dispatch_id
@@ -413,6 +527,11 @@ def _validate_sources(run_directory: Path) -> _ValidatedSources:
     ):
         raise DemonstratorVerificationError("mission effect reference is inconsistent")
     required_checkpoints = {
+        "worker_request_started",
+        "worker_readiness_confirmed",
+        "worker_proposal_validated",
+        "worker_authority_authorized",
+        "worker_execution_bound",
         "ambiguous_dispatch_established",
         "retry_blocked",
         "reconciliation_started",
@@ -445,6 +564,17 @@ def _validate_sources(run_directory: Path) -> _ValidatedSources:
         raise DemonstratorVerificationError(
             f"Mission Control projection is not ready: {view.source_error or 'unknown source error'}"
         )
+    if (
+        view.worker is None
+        or view.worker.get("provider") != worker["provider_identity"]
+        or view.worker.get("model") != worker["model_identity"]
+        or view.worker.get("live_external") is not worker["live_external"]
+        or view.worker.get("external_endpoint_contacted")
+        is not worker["external_endpoint_contacted"]
+    ):
+        raise DemonstratorVerificationError(
+            "Mission Control worker projection is not evidence-bound"
+        )
     projection = view.to_dict()
     if not any(
         item.get("reason") == "retry_blocked" for item in projection.get("timeline", [])
@@ -463,6 +593,19 @@ def _summary_text(
             "The run stopped before all acceptance invariants passed.\n"
             "Partial durable evidence was preserved when available.\n"
         )
+    worker = report["worker"]
+    worker_mode = (
+        "EXTERNAL/LIVE CONFIGURED WORKER"
+        if worker["live_external"]
+        else "DETERMINISTIC TEST INFRASTRUCTURE"
+    )
+    live_verified = (
+        "YES"
+        if worker["live_external"]
+        and worker["external_endpoint_contacted"]
+        and worker["proposal_schema_valid"]
+        else "NO"
+    )
     return (
         "MISSIONARYX INTEGRATED DEMONSTRATOR — PASS\n\n"
         f"Run ID:               {run_id}\n"
@@ -474,6 +617,10 @@ def _summary_text(
         f"Unauthorized ops:     {report['unauthorized_operation_count']}\n"
         f"Injected failures:    {report['injected_failure_count']}\n"
         "Effect history:       INDETERMINATE → SOMETHING_LANDED\n"
+        f"Worker mode:          {worker_mode}\n"
+        f"Worker provider:      {worker['provider_identity']}\n"
+        f"Worker model:         {worker['model_identity']}\n"
+        f"Live worker verified: {live_verified}\n"
         "Verification:         PASS\n"
         f"Evidence:             {run_directory / 'evidence-report.json'}\n"
         f"Mission Control:      {run_directory / 'mission-control.html'}\n"
@@ -508,6 +655,21 @@ def _build_manifest(
         "duplicate_deployment_count": report["duplicate_deployment_count"],
         "unauthorized_operation_count": report["unauthorized_operation_count"],
         "injected_failure_count": report["injected_failure_count"],
+        "worker_request_id": report["worker"]["request_id"],
+        "worker_identity": report["worker"]["worker_identity"],
+        "worker_provider_identity": report["worker"]["provider_identity"],
+        "worker_model_identity": report["worker"]["model_identity"],
+        "worker_mode": report["worker"]["mode"],
+        "worker_live_external": report["worker"]["live_external"],
+        "worker_external_endpoint_contacted": report["worker"][
+            "external_endpoint_contacted"
+        ],
+        "worker_proposal_schema_version": report["worker"]["proposal"][
+            "schema_version"
+        ],
+        "worker_proposal_authorized": report["worker"]["authority_decision"][
+            "authorized"
+        ],
         "verification_result": "pass",
     }
 
@@ -526,6 +688,8 @@ def _validate_manifest(run_directory: Path) -> dict[str, Any]:
         "duplicate_deployment_count": 0,
         "unauthorized_operation_count": 0,
         "injected_failure_count": 1,
+        "worker_proposal_schema_version": "missionaryx.worker-proposal.v0.1",
+        "worker_proposal_authorized": True,
         "verification_result": "pass",
     }
     for name, expected in required_values.items():
@@ -543,6 +707,29 @@ def _validate_manifest(run_directory: Path) -> dict[str, Any]:
     for name in ("starting_repository_commit_sha", "mission_id"):
         if type(manifest.get(name)) is not str or not manifest[name]:
             raise DemonstratorVerificationError(f"manifest {name} is invalid")
+    for name in (
+        "worker_request_id",
+        "worker_identity",
+        "worker_provider_identity",
+        "worker_model_identity",
+    ):
+        if type(manifest.get(name)) is not str or not manifest[name]:
+            raise DemonstratorVerificationError(f"manifest {name} is invalid")
+    if manifest.get("worker_mode") not in {"deterministic_test", "live_external"}:
+        raise DemonstratorVerificationError("manifest worker_mode is invalid")
+    if type(manifest.get("worker_live_external")) is not bool or (
+        manifest["worker_live_external"]
+        != (manifest["worker_mode"] == "live_external")
+    ):
+        raise DemonstratorVerificationError("manifest worker live mode is contradictory")
+    if (
+        type(manifest.get("worker_external_endpoint_contacted")) is not bool
+        or manifest["worker_external_endpoint_contacted"]
+        is not manifest["worker_live_external"]
+    ):
+        raise DemonstratorVerificationError(
+            "manifest worker external contact is contradictory"
+        )
 
     artifact_rows = manifest.get("artifacts")
     if type(artifact_rows) is not list:
@@ -621,6 +808,23 @@ def verify_run(run_directory: str | Path) -> DemonstratorRun:
         "duplicate_deployment_count": report.get("duplicate_deployment_count"),
         "unauthorized_operation_count": report.get("unauthorized_operation_count"),
         "injected_failure_count": report.get("injected_failure_count"),
+        "worker_request_id": report.get("worker", {}).get("request_id"),
+        "worker_identity": report.get("worker", {}).get("worker_identity"),
+        "worker_provider_identity": report.get("worker", {}).get(
+            "provider_identity"
+        ),
+        "worker_model_identity": report.get("worker", {}).get("model_identity"),
+        "worker_mode": report.get("worker", {}).get("mode"),
+        "worker_live_external": report.get("worker", {}).get("live_external"),
+        "worker_external_endpoint_contacted": report.get("worker", {}).get(
+            "external_endpoint_contacted"
+        ),
+        "worker_proposal_schema_version": report.get("worker", {})
+        .get("proposal", {})
+        .get("schema_version"),
+        "worker_proposal_authorized": report.get("worker", {})
+        .get("authority_decision", {})
+        .get("authorized"),
     }
     for name, expected in cross_checks.items():
         if first_manifest.get(name) != expected:
@@ -644,6 +848,7 @@ def run_demo(
     artifacts_root: str | Path = DEFAULT_ARTIFACTS_ROOT,
     run_id: str | None = None,
     starting_repository_sha: str | None = None,
+    proposal_worker: ProposalWorker | None = None,
 ) -> DemonstratorRun:
     """Execute, package, and self-verify one isolated demonstrator run."""
     selected_run_id = _validate_run_id(run_id or _new_run_id())
@@ -657,6 +862,7 @@ def run_demo(
         reconcile_and_verify_governed_dispatch(
             run_directory,
             starting_repository_sha=starting_sha,
+            proposal_worker=proposal_worker or DeterministicProposalWorker(),
         )
         validated = _validate_sources(run_directory)
         projection_path = run_directory / "mission-control.json"
@@ -717,6 +923,7 @@ def _print_result(result: DemonstratorRun, *, verified_only: bool = False) -> No
         print("MISSIONARYX INTEGRATED DEMONSTRATOR — PASS")
         print()
     report = result.report
+    worker = report["worker"]
     print("Mission:              COMPLETED")
     print("Service:              v2")
     print(f"Deployment attempts:  {report['deployment_attempt_count']}")
@@ -726,6 +933,26 @@ def _print_result(result: DemonstratorRun, *, verified_only: bool = False) -> No
     print(f"Injected failures:    {report['injected_failure_count']}")
     print("Effect history:       INDETERMINATE → SOMETHING_LANDED")
     print("Verification:         PASS")
+    print(
+        "Worker mode:          "
+        + (
+            "EXTERNAL/LIVE CONFIGURED WORKER"
+            if worker["live_external"]
+            else "DETERMINISTIC TEST INFRASTRUCTURE"
+        )
+    )
+    print(f"Worker provider:      {worker['provider_identity']}")
+    print(f"Worker model:         {worker['model_identity']}")
+    print(
+        "LIVE EXTERNAL WORKER VERIFIED: "
+        + (
+            "YES"
+            if worker["live_external"]
+            and worker["external_endpoint_contacted"]
+            and worker["proposal_schema_valid"]
+            else "NO"
+        )
+    )
     print(f"Evidence:             {result.run_directory / 'evidence-report.json'}")
     print(f"Mission Control:      {result.mission_control_path}")
     print(f"Manifest:             {result.manifest_path}")
@@ -745,6 +972,15 @@ def _run_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--run-id",
         help="optional safe run ID; fails if that run directory already exists",
+    )
+    parser.add_argument(
+        "--worker-mode",
+        choices=("deterministic", "live"),
+        default="deterministic",
+        help=(
+            "deterministic uses offline test infrastructure; live requires explicit "
+            "MISSIONARYX_WORKER_* configuration"
+        ),
     )
     return parser
 
@@ -767,13 +1003,27 @@ def main(argv: Iterable[str] | None = None) -> int:
             _print_result(result, verified_only=True)
         else:
             args = _run_parser().parse_args(arguments)
+            if args.worker_mode == "live":
+                print("MISSIONARYX REAL WORKER INTEGRATION — LIVE WORKER MODE REQUESTED")
+                proposal_worker: ProposalWorker = OpenAICompatibleProposalWorker(
+                    OpenAICompatibleWorkerConfig.from_environment()
+                )
+            else:
+                proposal_worker = DeterministicProposalWorker()
             result = run_demo(
                 artifacts_root=args.artifacts_root,
                 run_id=args.run_id,
+                proposal_worker=proposal_worker,
             )
             _print_result(result)
         return 0
-    except (DemonstratorError, OSError, ValueError, sqlite3.Error) as exc:
+    except (
+        DemonstratorError,
+        WorkerIntegrationError,
+        OSError,
+        ValueError,
+        sqlite3.Error,
+    ) as exc:
         print(f"MISSIONARYX INTEGRATED DEMONSTRATOR — FAIL: {exc}", file=sys.stderr)
         return 1
 
