@@ -27,6 +27,14 @@ from revenue_bridge.effects import (
     EffectReconciliationResult,
     EffectState,
 )
+from revenue_bridge.capital import (
+    CapitalEvaluation,
+    CapitalGovernor,
+    CapitalSnapshot,
+    SpendProposal,
+    SpendTier,
+)
+from revenue_bridge.economics import OpportunityEconomics
 from revenue_bridge.events import AppEvent
 from revenue_bridge.proposals import (
     ActionProposal,
@@ -51,6 +59,7 @@ class RevenueOpportunity:
     effect_result: EffectExecutionResult | None = None
     reconciliation_result: EffectReconciliationResult | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    economics: OpportunityEconomics | None = None
 
     @property
     def opportunity_id(self) -> str:
@@ -129,6 +138,63 @@ class RevenueInbox:
 
     def get(self, opportunity_id: str) -> RevenueOpportunity | None:
         return self._opportunities.get(opportunity_id)
+
+    def record_economics(
+        self,
+        opportunity_id: str,
+        economics: OpportunityEconomics,
+    ) -> OpportunityEconomics:
+        """Attach explicit estimated economics without granting spending authority."""
+        opp = self._opportunities.get(opportunity_id)
+        if opp is None:
+            raise KeyError(f"Opportunity {opportunity_id} not found in inbox")
+        if not opp.is_qualified:
+            raise ValueError("Cannot record acquisition economics for an unqualified opportunity")
+        if not isinstance(economics, OpportunityEconomics):
+            raise TypeError("economics must be an OpportunityEconomics")
+        if economics.opportunity_id != opportunity_id:
+            raise ValueError("Economics opportunity_id does not match inbox opportunity")
+
+        opp.economics = economics
+        return economics
+
+    def evaluate_capital(
+        self,
+        opportunity_id: str,
+        snapshot: CapitalSnapshot,
+        *,
+        spend_tier: SpendTier = SpendTier.NORMAL,
+        governor: CapitalGovernor | None = None,
+    ) -> tuple[SpendProposal, CapitalEvaluation]:
+        """Evaluate one recorded opportunity without granting spending authority."""
+        opp = self._opportunities.get(opportunity_id)
+        if opp is None:
+            raise KeyError(f"Opportunity {opportunity_id} not found in inbox")
+        if opp.economics is None:
+            raise ValueError("Opportunity economics must be recorded before capital evaluation")
+        if not isinstance(snapshot, CapitalSnapshot):
+            raise TypeError("snapshot must be a CapitalSnapshot")
+        if not isinstance(spend_tier, SpendTier):
+            raise TypeError("spend_tier must be a SpendTier")
+
+        economics = opp.economics
+        proposal = SpendProposal(
+            proposal_id=f"spend_{opportunity_id}_{economics.fingerprint[:12]}",
+            opportunity_id=opportunity_id,
+            requested_spend_usd=economics.proposed_acquisition_cost_usd,
+            spend_tier=spend_tier,
+            expected_contribution_usd=economics.expected_contribution_usd,
+            acquisition_channel=opp.source,
+            purpose=(
+                f"Acquire customer for "
+                f"{opp.qualification.proposed_offer.name if opp.qualification.proposed_offer else 'bounded MissionaryX service'}"
+            ),
+            requires_creator_approval=True,
+        )
+
+        active_governor = governor or CapitalGovernor()
+        evaluation = active_governor.evaluate(snapshot, proposal)
+        return proposal, evaluation
 
     def list_opportunities(self) -> list[RevenueOpportunity]:
         return list(self._opportunities.values())
