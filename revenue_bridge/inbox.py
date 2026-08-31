@@ -34,6 +34,10 @@ from revenue_bridge.capital import (
     SpendProposal,
     SpendTier,
 )
+from revenue_bridge.contribution import (
+    ContributionLedger,
+    PaymentObservation,
+)
 from revenue_bridge.economics import OpportunityEconomics
 from revenue_bridge.events import AppEvent
 from revenue_bridge.proposals import (
@@ -115,9 +119,11 @@ class RevenueInbox:
         self,
         qualifier: RevenueQualifier | None = None,
         approval_boundary: CreatorApprovalBoundary | None = None,
+        contribution_ledger: ContributionLedger | None = None,
     ) -> None:
         self.qualifier = qualifier or RevenueQualifier()
         self.approval_boundary = approval_boundary or CreatorApprovalBoundary()
+        self.contribution_ledger = contribution_ledger or ContributionLedger()
         self._opportunities: dict[str, RevenueOpportunity] = {}
 
     def ingest(self, event: AppEvent) -> RevenueOpportunity:
@@ -138,6 +144,23 @@ class RevenueInbox:
 
     def get(self, opportunity_id: str) -> RevenueOpportunity | None:
         return self._opportunities.get(opportunity_id)
+
+    def record_verified_payment(
+        self,
+        payment: PaymentObservation,
+    ):
+        """Record customer revenue only after payment evidence is VERIFIED."""
+        if not isinstance(payment, PaymentObservation):
+            raise TypeError("payment must be a PaymentObservation")
+        if payment.opportunity_id not in self._opportunities:
+            raise KeyError(
+                f"Opportunity {payment.opportunity_id} not found in inbox"
+            )
+        return self.contribution_ledger.record_verified_payment(payment)
+
+    def capital_snapshot(self) -> CapitalSnapshot:
+        """Return capital state derived only from recorded contribution outcomes."""
+        return self.contribution_ledger.capital_snapshot()
 
     def record_economics(
         self,
@@ -161,7 +184,7 @@ class RevenueInbox:
     def evaluate_capital(
         self,
         opportunity_id: str,
-        snapshot: CapitalSnapshot,
+        snapshot: CapitalSnapshot | None = None,
         *,
         spend_tier: SpendTier = SpendTier.NORMAL,
         governor: CapitalGovernor | None = None,
@@ -172,7 +195,9 @@ class RevenueInbox:
             raise KeyError(f"Opportunity {opportunity_id} not found in inbox")
         if opp.economics is None:
             raise ValueError("Opportunity economics must be recorded before capital evaluation")
-        if not isinstance(snapshot, CapitalSnapshot):
+        if snapshot is None:
+            snapshot = self.contribution_ledger.capital_snapshot()
+        elif not isinstance(snapshot, CapitalSnapshot):
             raise TypeError("snapshot must be a CapitalSnapshot")
         if not isinstance(spend_tier, SpendTier):
             raise TypeError("spend_tier must be a SpendTier")
