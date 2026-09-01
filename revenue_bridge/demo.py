@@ -1,6 +1,6 @@
 """Creator Test Drive for MissionaryX Revenue Bridge v0.1.
 
-Demonstrates the complete end-to-end governed revenue workflow (Steps A through J):
+Demonstrates the complete end-to-end governed revenue workflow (Steps A through N):
   A. GitHub-like opportunity arrives
   B. Normalized to AppEvent
   C. Revenue qualifier identifies exact evidence
@@ -11,6 +11,10 @@ Demonstrates the complete end-to-end governed revenue workflow (Steps A through 
   H. Evidence records what actually happened
   I. Indeterminate scenario does not blindly retry
   J. Email-shaped event follows the same common contract
+  K. Explicit opportunity economics are recorded
+  L. Capital governor evaluates acquisition eligibility
+  M. Simulated realized costs and payment evidence remain separate
+  N. Verified payment updates contribution and unrecovered loss
 
 Can be executed with a single command:
   python -m revenue_bridge.demo
@@ -27,6 +31,9 @@ from revenue_bridge.approval import (
     ApprovalRequiredError,
     CreatorApprovalBoundary,
 )
+from revenue_bridge.capital import CapitalDecision
+from revenue_bridge.contribution import ContributionKind
+from revenue_bridge.economics import OpportunityEconomics
 from revenue_bridge.effects import (
     ApprovedAppAction,
     BlindRetryRefusedError,
@@ -38,6 +45,10 @@ from revenue_bridge.email import EmailInboundNormalizer
 from revenue_bridge.events import AppEvent
 from revenue_bridge.github import GitHubInboundNormalizer
 from revenue_bridge.inbox import RevenueInbox
+from revenue_bridge.payment import (
+    PaymentObservationMode,
+    SimulatedPaymentEvidenceAdapter,
+)
 from revenue_bridge.proposals import (
     ActionProposal,
     ActionProposalState,
@@ -286,6 +297,123 @@ def run_creator_test_drive(verbose: bool = True) -> bool:
         print(f"  ✓ Email Approved & Sent:  {effect_email.state.value.upper()} (Evidence: {effect_email.evidence_ref})")
 
     # ───────────────────────────────────────────────────────────────────────────
+    # STEP K: Record explicit opportunity economics
+    # ───────────────────────────────────────────────────────────────────────────
+    if verbose:
+        print("\n[STEP K] Recording explicit Profit Loop opportunity economics...")
+
+    economics = OpportunityEconomics(
+        opportunity_id=opp_gh.opportunity_id,
+        sale_probability=0.25,
+        offer_price_usd=50.0,
+        proposed_acquisition_cost_usd=5.0,
+        estimated_fulfillment_cost_usd=4.0,
+        estimated_model_api_cost_usd=2.0,
+        estimated_payment_platform_fees_usd=1.0,
+        evidence_refs=(f"event:{event_gh.event_id}",),
+        assumptions=(
+            "25% sale probability is a deterministic demo estimate, not observed customer intent",
+        ),
+    )
+    inbox.record_economics(opp_gh.opportunity_id, economics)
+
+    assert economics.estimated_margin_if_sold_usd == 43.0
+    assert economics.expected_contribution_usd == 5.75
+
+    if verbose:
+        print(f"  ✓ Offer Price:             ${economics.offer_price_usd:.2f}")
+        print(f"  ✓ Expected Contribution:  ${economics.expected_contribution_usd:.2f}")
+        print("  ✓ Sale probability explicitly labeled as an estimate")
+
+    # ───────────────────────────────────────────────────────────────────────────
+    # STEP L: Capital governor evaluates eligibility but does not spend
+    # ───────────────────────────────────────────────────────────────────────────
+    if verbose:
+        print("\n[STEP L] Evaluating acquisition against capital governor...")
+
+    spend_proposal, capital_evaluation = inbox.evaluate_capital(
+        opp_gh.opportunity_id
+    )
+
+    assert spend_proposal.requested_spend_usd == 5.0
+    assert spend_proposal.requires_creator_approval
+    assert capital_evaluation.decision == CapitalDecision.PROPOSE_SPEND
+
+    if verbose:
+        print(f"  ✓ Proposed Acquisition:   ${spend_proposal.requested_spend_usd:.2f}")
+        print(f"  ✓ Governor Decision:      {capital_evaluation.decision.value.upper()}")
+        print("  ✓ No spending authority granted")
+
+    # ───────────────────────────────────────────────────────────────────────────
+    # STEP M: Record simulated realized costs, then observe payment evidence
+    # ───────────────────────────────────────────────────────────────────────────
+    if verbose:
+        print("\n[STEP M] Recording SIMULATED realized costs and observing payment...")
+
+    simulated_time = datetime(2026, 8, 31, 18, 0, tzinfo=timezone.utc)
+    simulated_costs = (
+        ("demo_acq_1", ContributionKind.ACQUISITION_COST, 5.0, "demo:simulated:acquisition"),
+        ("demo_fulfill_1", ContributionKind.FULFILLMENT_COST, 4.0, "demo:simulated:fulfillment"),
+        ("demo_api_1", ContributionKind.MODEL_API_COST, 2.0, "demo:simulated:model_api"),
+        ("demo_fee_1", ContributionKind.PAYMENT_PLATFORM_FEE, 1.0, "demo:simulated:payment_fee"),
+    )
+
+    for entry_id, kind, amount, evidence_ref in simulated_costs:
+        inbox.contribution_ledger.record_cost(
+            entry_id=entry_id,
+            opportunity_id=opp_gh.opportunity_id,
+            kind=kind,
+            amount_usd=amount,
+            evidence_ref=evidence_ref,
+            occurred_at=simulated_time,
+        )
+
+    before_payment = inbox.capital_snapshot()
+    assert before_payment.total_cost_usd == 12.0
+    assert before_payment.verified_customer_revenue_usd == 0.0
+    assert before_payment.unrecovered_loss_usd == 12.0
+
+    payment_adapter = SimulatedPaymentEvidenceAdapter(
+        mode=PaymentObservationMode.VERIFIED,
+        provider_name="simulated_profit_loop_provider",
+        observed_amount_usd=50.0,
+    )
+    payment_observation = inbox.observe_payment(
+        opportunity_id=opp_gh.opportunity_id,
+        payment_id="demo_payment_1",
+        adapter=payment_adapter,
+    )
+
+    # Observation alone MUST NOT alter accounting.
+    assert payment_observation.amount_usd == 50.0
+    assert inbox.capital_snapshot().verified_customer_revenue_usd == 0.0
+
+    if verbose:
+        print(f"  ✓ Simulated Costs:        ${before_payment.total_cost_usd:.2f}")
+        print(f"  ✓ Unrecovered Before Pay:${before_payment.unrecovered_loss_usd:.2f}")
+        print("  ✓ Payment observed, but accounting unchanged")
+
+    # ───────────────────────────────────────────────────────────────────────────
+    # STEP N: Verified payment becomes contribution evidence
+    # ───────────────────────────────────────────────────────────────────────────
+    if verbose:
+        print("\n[STEP N] Recording verified simulated customer payment...")
+
+    inbox.record_verified_payment(payment_observation)
+    after_payment = inbox.capital_snapshot()
+
+    assert after_payment.verified_customer_revenue_usd == 50.0
+    assert after_payment.total_cost_usd == 12.0
+    assert after_payment.net_contribution_usd == 38.0
+    assert after_payment.unrecovered_loss_usd == 0.0
+
+    if verbose:
+        print(f"  ✓ Verified Revenue:       ${after_payment.verified_customer_revenue_usd:.2f}")
+        print(f"  ✓ Total Simulated Costs:  ${after_payment.total_cost_usd:.2f}")
+        print(f"  ✓ Net Contribution:      ${after_payment.net_contribution_usd:.2f}")
+        print(f"  ✓ Unrecovered Loss:      ${after_payment.unrecovered_loss_usd:.2f}")
+
+    # ───────────────────────────────────────────────────────────────────────────
     # Print Phone-Friendly Revenue Bridge Status Report
     # ───────────────────────────────────────────────────────────────────────────
     if verbose:
@@ -293,7 +421,7 @@ def run_creator_test_drive(verbose: bool = True) -> bool:
         print("  CREATOR PHONE-FRIENDLY REVENUE STATUS REPORT")
         print("=" * 70)
         print(inbox.format_phone_status(opp_gh.opportunity_id))
-        print("\n[TEST DRIVE RESULT] ALL 10 STEPS A-J COMPLETED AND VERIFIED DETERMINISTICALLY.\n")
+        print("\n[TEST DRIVE RESULT] ALL 14 STEPS A-N COMPLETED AND VERIFIED DETERMINISTICALLY.\n")
 
     return True
 
