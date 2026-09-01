@@ -40,6 +40,7 @@ from revenue_bridge.contribution import (
 )
 from revenue_bridge.economics import OpportunityEconomics
 from revenue_bridge.events import AppEvent
+from revenue_bridge.payment import PaymentEvidenceAdapter
 from revenue_bridge.proposals import (
     ActionProposal,
     ActionProposalState,
@@ -144,6 +145,31 @@ class RevenueInbox:
 
     def get(self, opportunity_id: str) -> RevenueOpportunity | None:
         return self._opportunities.get(opportunity_id)
+
+    def observe_payment(
+        self,
+        *,
+        opportunity_id: str,
+        payment_id: str,
+        adapter: PaymentEvidenceAdapter,
+    ) -> PaymentObservation:
+        """Observe external payment evidence without changing accounting state."""
+        if opportunity_id not in self._opportunities:
+            raise KeyError(f"Opportunity {opportunity_id} not found in inbox")
+        if not isinstance(adapter, PaymentEvidenceAdapter):
+            raise TypeError("adapter must be a PaymentEvidenceAdapter")
+
+        observation = adapter.observe(
+            payment_id=payment_id,
+            opportunity_id=opportunity_id,
+        )
+
+        if observation.opportunity_id != opportunity_id:
+            raise ValueError(
+                "Payment observation opportunity_id does not match requested opportunity"
+            )
+
+        return observation
 
     def record_verified_payment(
         self,
