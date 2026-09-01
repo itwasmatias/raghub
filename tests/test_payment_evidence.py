@@ -15,7 +15,6 @@ def test_verified_mode_produces_verified_observation():
     observation = adapter.observe(
         payment_id="pay_1",
         opportunity_id="opp_1",
-        amount_usd=50,
     )
 
     assert observation.state == PaymentVerificationState.VERIFIED
@@ -30,7 +29,6 @@ def test_unverified_mode_stays_unverified():
     observation = adapter.observe(
         payment_id="pay_2",
         opportunity_id="opp_1",
-        amount_usd=50,
     )
 
     assert observation.state == PaymentVerificationState.UNVERIFIED
@@ -44,7 +42,6 @@ def test_indeterminate_mode_stays_indeterminate():
     observation = adapter.observe(
         payment_id="pay_3",
         opportunity_id="opp_1",
-        amount_usd=50,
     )
 
     assert observation.state == PaymentVerificationState.INDETERMINATE
@@ -58,7 +55,6 @@ def test_observation_contains_evidence_and_provider_reference():
     observation = adapter.observe(
         payment_id="pay_4",
         opportunity_id="opp_1",
-        amount_usd=50,
     )
 
     assert observation.evidence_ref.startswith("payev_")
@@ -66,13 +62,23 @@ def test_observation_contains_evidence_and_provider_reference():
 
 
 def test_negative_payment_amount_is_refused():
-    adapter = SimulatedPaymentEvidenceAdapter()
+    adapter = SimulatedPaymentEvidenceAdapter(observed_amount_usd=-1)
 
     with pytest.raises(ValueError, match="must be >= 0"):
         adapter.observe(
             payment_id="pay_5",
             opportunity_id="opp_1",
-            amount_usd=-1,
+        )
+
+
+def test_caller_cannot_inject_claimed_payment_amount():
+    adapter = SimulatedPaymentEvidenceAdapter(observed_amount_usd=50)
+
+    with pytest.raises(TypeError):
+        adapter.observe(
+            payment_id="pay_claim",
+            opportunity_id="opp_1",
+            amount_usd=5000,
         )
 
 
@@ -83,8 +89,7 @@ def test_blank_payment_id_is_refused():
         adapter.observe(
             payment_id="",
             opportunity_id="opp_1",
-            amount_usd=50,
-        )
+            )
 
 
 def test_adapter_mode_must_be_explicit_enum():

@@ -33,7 +33,6 @@ class PaymentEvidenceAdapter(ABC):
         *,
         payment_id: str,
         opportunity_id: str,
-        amount_usd: float,
     ) -> PaymentObservation:
         """Observe payment state without initiating any financial effect."""
         raise NotImplementedError
@@ -46,18 +45,19 @@ class SimulatedPaymentEvidenceAdapter(PaymentEvidenceAdapter):
         self,
         mode: PaymentObservationMode = PaymentObservationMode.VERIFIED,
         provider_name: str = "simulated_payment_provider",
+        observed_amount_usd: float = 50.0,
     ) -> None:
         if not isinstance(mode, PaymentObservationMode):
             raise TypeError("mode must be a PaymentObservationMode")
         self.mode = mode
         self.provider_name = _require_text(provider_name, "provider_name")
+        self.observed_amount_usd = observed_amount_usd
 
     def observe(
         self,
         *,
         payment_id: str,
         opportunity_id: str,
-        amount_usd: float,
     ) -> PaymentObservation:
         payment_id = _require_text(payment_id, "payment_id")
         opportunity_id = _require_text(opportunity_id, "opportunity_id")
@@ -69,7 +69,7 @@ class SimulatedPaymentEvidenceAdapter(PaymentEvidenceAdapter):
             "provider": self.provider_name,
             "payment_id": payment_id,
             "opportunity_id": opportunity_id,
-            "amount_usd": float(amount_usd),
+            "amount_usd": float(self.observed_amount_usd),
             "state": state.value,
             "observed_at": now.isoformat(),
         }
@@ -80,7 +80,7 @@ class SimulatedPaymentEvidenceAdapter(PaymentEvidenceAdapter):
         return PaymentObservation(
             payment_id=payment_id,
             opportunity_id=opportunity_id,
-            amount_usd=amount_usd,
+            amount_usd=self.observed_amount_usd,
             state=state,
             evidence_ref=f"payev_{evidence_hash[:16]}",
             observed_at=now,
