@@ -160,6 +160,19 @@ class ContributionEntry:
                 _require_text(self.source_ref, "source_ref"),
             )
 
+    @property
+    def fingerprint(self) -> str:
+        payload = {
+            "entry_id": self.entry_id,
+            "opportunity_id": self.opportunity_id,
+            "kind": self.kind.value,
+            "amount_usd": self.amount_usd,
+            "evidence_ref": self.evidence_ref,
+            "occurred_at": self.occurred_at.isoformat(),
+            "source_ref": self.source_ref,
+        }
+        return hashlib.sha256(_canonical_bytes(payload)).hexdigest()
+
 
 @dataclass
 class ContributionLedger:
