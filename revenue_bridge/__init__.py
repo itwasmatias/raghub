@@ -48,7 +48,6 @@ from revenue_bridge.effects import (
 from revenue_bridge.github import GitHubInboundNormalizer
 from revenue_bridge.email import EmailInboundNormalizer
 from revenue_bridge.inbox import RevenueInbox, RevenueOpportunity
-from revenue_bridge.demo import run_creator_test_drive
 
 __all__ = [
     "AppEvent",
@@ -80,5 +79,4 @@ __all__ = [
     "EmailInboundNormalizer",
     "RevenueInbox",
     "RevenueOpportunity",
-    "run_creator_test_drive",
 ]
